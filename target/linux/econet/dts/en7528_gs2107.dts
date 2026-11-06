@@ -199,7 +199,7 @@
 		};
 
 		/* 嵌套在 tclinux 内（与 DASAN/Jio 同模式）：kernel 段 + rootfs 段 */
-		partition@160b941 {
+		partition1@160b941 {
 			label = "tclinux_kernel";
 			reg = <0x0160b941 0x00400000>;
 			econet,enable-remap;
