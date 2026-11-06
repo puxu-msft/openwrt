@@ -36,10 +36,11 @@
 	memory@0 {
 		device_type = "memory";
 		/*
-		 * TODO(VMLINUX-RE): 运行时 MemTotal 410124kB。DDR 物理容量未定
-		 * （运行时值暗示 512MB 物理 + 约 100MB 厂商预留；构建配置却写 128M，
-		 * 以过期模板视之）。确认前保守声明 448MB（=JioFiber 同级，低于运行时
-		 * 值不会崩，高于实际会崩）。
+		 * 448MB 物理（VMLINUX-RE 实证：cal_qdma_init_buffer(448)；
+		 * 运行时 MemTotal 410124kB ≈ 448MB - 约 47MB 内核 BSS/预留，
+		 * 其中 BSS 0x80AE0000-0x81BB9B4C 达 17.9MB）。
+		 * 构建配置 profile.cfg 的 TCSUPPORT_SDRAM_128M=y 已证伪（过期模板）。
+		 * 与 JioFiber JCOW414 完全同值。
 		 */
 		reg = <0x00000000 0x1c000000>;
 	};
@@ -49,7 +50,8 @@
 		/*
 		 * free-bootbase：镜像解压占物理 0x2000-0x20000，vmlinuz 落在
 		 * 0x80020000。usable 从 0x20000 起（与 JioFiber 一致），尾部留 128KB。
-		 * TODO(VMLINUX-RE): 按厂商 memblock 预留区校核。
+		 * VMLINUX-RE：未定位到显式 "bootram" 命名保留区，最大保留块即内核
+		 * 巨型 BSS（约 17.9MB，位于解压区之后）。
 		 */
 		linux,usable-memory-range = <0x00020000 0x1bfe0000>;
 	};
