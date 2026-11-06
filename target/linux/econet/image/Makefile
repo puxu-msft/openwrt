@@ -74,3 +74,14 @@ endef
 include $(SUBTARGET).mk
 
 $(eval $(call BuildImage))
+
+# GS2107 本地步骤：用 Python 实现 tclinux-trx（HDR2 + CRC-32/JAMCRC），
+# 不依赖主机上的 zytrx（OpenWrt 树内没有该工具）。
+# 与厂商镜像往返验证字节级一致（2026-11-06，devices/gs2107/tools/hdr2.py 同算法）。
+define Build/tclinux-hdr2-trx
+	python3 $(BOARD_DIR)/image/tclinux-hdr2.py --kernel $@ \
+		--rootfs $(IMAGE_ROOTFS) --version $(VERSION_DIST)-$(REVISION) \
+		--endian $(TRX_ENDIAN) --loadaddr $(TRX_LOADADDR) \
+		$(if $(TRX_MODEL),--model $(TRX_MODEL)) > $@.new
+	mv $@.new $@
+endef

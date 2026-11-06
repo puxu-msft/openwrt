@@ -57,3 +57,23 @@ define Device/jiofiber_jcow407
   DEVICE_DTS := en7528_jiofiber_jcow407
 endef
 TARGET_DEVICES += jiofiber_jcow407
+
+# GS2107（中移杭研智能家庭网关）—— 自维护板级
+# 事实依据：devices/gs2107/{DEVICE-PROFILE,OPENWRT-FEASIBILITY,OPENWRT-PORT-PLAN}.md
+#  - bootloader 为 free bootbase 变体（解压目标 0x80002000），与 JioFiber 同模式
+#  - 镜像写到 tclinux 分区（24MB）：HDR2 头 + kernel(LZMA, 垫 4MB) + rootfs(squashfs)
+#  - WiFi: MT7603E(2.4G) + MT7663E(5G) 均 PCIe
+#  - mtd8(java) 严禁触碰 = CoAP RCE 回退通道
+define Device/chinamobile_gs2107
+	DEVICE_VENDOR := ChinaMobile
+	DEVICE_MODEL := GS2107
+	DEVICE_DTS := en7528_gs2107
+	TRX_LOADADDR := 0x80002000
+	TRX_MODEL := GS2107
+	KERNEL := kernel-bin | append-dtb | tclinux-free-bootbase-jump | lzma
+	KERNEL_INITRAMFS := kernel-bin | append-dtb
+	IMAGES := tclinux.trx
+	IMAGE/tclinux.trx := append-kernel | tclinux-hdr2-trx
+	DEVICE_PACKAGES := kmod-usb2 kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap
+endef
+TARGET_DEVICES += chinamobile_gs2107

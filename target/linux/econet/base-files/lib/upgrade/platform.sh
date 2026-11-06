@@ -2,7 +2,9 @@ platform_check_image() {
 	local board=$(board_name)
 
 	case "$board" in
+	chinamobile,gs2101|\
 	chinamobile,gs3101|\
+	chinamobile,gs2107|\
 	dasan,h660gm-a-airtel|\
 	dasan,h660gm-a-generic|\
 	jiofiber,jcow407|\
@@ -18,7 +20,9 @@ platform_do_upgrade() {
 	local board=$(board_name)
 
 	case "$board" in
+	chinamobile,gs2101|\
 	chinamobile,gs3101|\
+	chinamobile,gs2107|\
 	dasan,h660gm-a-airtel|\
 	dasan,h660gm-a-generic|\
 	jiofiber,jcow407|\

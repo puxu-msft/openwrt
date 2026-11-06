@@ -1,0 +1,244 @@
+// SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
+/*
+ * ChinaMobile GS2107（中移杭研智能家庭网关）— EcoNet EN7528
+ *
+ * 全部标注 [实测] 的事实来自 2026-11-06 亲验（devices/gs2107/ 下文档）：
+ *  - SoC: EcoNet EN7528，MIPS1004Kc V2.15 双核 4 VPE，小端 [实测]
+ *  - RAM: 运行时 MemTotal=410124kB；DDR 物理容量与厂商预留区待 VMLINUX-RE 确认
+ *  - Flash: 256MB SPI NAND，11 分区（本 DTS 与 /proc/mtd 实测逐字节对齐）[实测]
+ *  - WiFi: MT7603E(2.4G) + MT7663E(5G)，均 PCIe；
+ *          domain0(pcie0)=MT7663E、domain1(pcie1)=MT7603E [实测 /sys/bus/pci]
+ *  - 交换: EN7528 内置 GSW + 4 内部 GPHY [实测 eth.ko 的 macMT7530 API / EN7570]
+ *  - MAC: bootloader 分区 +0x3fe48（与 JioFiber 同偏移）[实测]
+ *  - Bootloader: ECNT tcboot，HDR2+LZMA 镜像，"free bootbase"（解压目标 0x80002000）[实测]
+ *  - EEPROM: 2.4G 512B / 5G 1536B 在 rootfs 文件里，不在 NAND 固定偏移 [实测]
+ *
+ * 模板来源：OpenWrt master target/linux/econet（en7528.dtsi + jiofiber/dasan 板级文件），
+ * JioFiber 与本机同 bootloader 变体（free bootbase / TRX_LOADADDR 0x80002000）。
+ */
+
+/dts-v1/;
+
+#include "en7528.dtsi"
+
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/input/input.h>
+#include <dt-bindings/leds/common.h>
+
+/ {
+	model = "ChinaMobile GS2107";
+	compatible = "chinamobile,gs2107", "econet,en7528";
+
+	aliases {
+		serial0 = &uart;
+	};
+
+	memory@0 {
+		device_type = "memory";
+		/*
+		 * TODO(VMLINUX-RE): 运行时 MemTotal 410124kB。DDR 物理容量未定
+		 * （运行时值暗示 512MB 物理 + 约 100MB 厂商预留；构建配置却写 128M，
+		 * 以过期模板视之）。确认前保守声明 448MB（=JioFiber 同级，低于运行时
+		 * 值不会崩，高于实际会崩）。
+		 */
+		reg = <0x00000000 0x1c000000>;
+	};
+
+	chosen {
+		stdout-path = "/serial@1fbf0000:115200";
+		/*
+		 * free-bootbase：镜像解压占物理 0x2000-0x20000，vmlinuz 落在
+		 * 0x80020000。usable 从 0x20000 起（与 JioFiber 一致），尾部留 128KB。
+		 * TODO(VMLINUX-RE): 按厂商 memblock 预留区校核。
+		 */
+		linux,usable-memory-range = <0x00020000 0x1bfe0000>;
+	};
+};
+
+&usb {
+	status = "okay";
+};
+
+/*
+ * 双 PCIe root complex [实测：/sys/bus/pci/devices]
+ *   0000:00:00.0 (0x14c3:0x0810, domain0) → 01:00.0 = MT7663E (5G)
+ *   0000:00:01.0 (0x14c3:0x0811, domain1) → 02:00.0 = MT7603E (2.4G)
+ */
+&pcie0 {
+	status = "okay";
+};
+
+&pcie1 {
+	status = "okay";
+};
+
+&slot0 {
+	status = "okay";
+
+	wifi@0,0 {
+		compatible = "mediatek,mt76";
+		reg = <0x0000 0 0 0 0>;
+		nvmem-cells = <&macaddr_bl 2>;
+		nvmem-cell-names = "mac-address";
+		ieee80211-freq-limit = <5000000 6000000>;
+		/*
+		 * TODO(EEPROM): 5G e2p（1536B，魔数 0x7663）在
+		 * /etc/Wireless/RT2860AP_AC/RT30xxEEPROM.bin（rootfs 文件）。
+		 * 首启不指 eeprom，验证芯片能否自报；若不能，把两颗 e2p 写进
+		 * rwfs 分区头部固定偏移后用 nvmem 指过去（备份文件在
+		 * firmware/runtime-config/tmp/etc/）。
+		 */
+	};
+};
+
+&slot1 {
+	status = "okay";
+
+	wifi@0,0 {
+		compatible = "mediatek,mt76";
+		reg = <0x0000 0 0 0 0>;
+		nvmem-cells = <&macaddr_bl 3>;
+		nvmem-cell-names = "mac-address";
+		ieee80211-freq-limit = <2400000 2500000>;
+		/* TODO(EEPROM): 2.4G eeprom 512B（/etc/RT30xxEEPROM.bin，魔数 0x7592） */
+	};
+};
+
+&gmac0 {
+	status = "okay";
+	nvmem-cells = <&macaddr_bl 1>;
+	nvmem-cell-names = "mac-address";
+};
+
+&switch {
+	status = "okay";
+};
+
+/*
+ * TODO(拆机/实测): WAN 口归属。ROMFILE 的 ONU 画像报 GEPortNum=1 + FEPortNum=3
+ * （1GE WAN + 3FE LAN），OMCI 报 4 桥端口，但 GSW 四口同构。
+ * 先全按 lan1-4 配（与 en7528_generic 一致），拆机看丝印/实测 VLAN 后再定 WAN。
+ */
+&gsw_port1 {
+	label = "lan1";
+	status = "okay";
+};
+
+&gsw_port2 {
+	label = "lan2";
+	status = "okay";
+};
+
+&gsw_port3 {
+	label = "lan3";
+	status = "okay";
+};
+
+&gsw_port4 {
+	label = "lan4";
+	status = "okay";
+};
+
+&nand {
+	status = "okay";
+	econet,bmt;
+	econet,bbt-table-size = <250>;
+
+	partitions {
+		compatible = "fixed-partitions";
+		#address-cells = <1>;
+		#size-cells = <1>;
+
+		/*
+		 * 分区表与 /proc/mtd 实测完全一致（含非 128K 对齐的怪尺寸，
+		 * 如 kernel 0x3eb941 = HDR2 镜像实际长度）——保证 bootloader 视图
+		 * 与内核视图一致。地址为 BMT 逻辑空间。
+		 */
+		partition@0 {			/* mtd0 256K */
+			label = "bootloader";
+			reg = <0x00000000 0x00040000>;
+			read-only;
+
+			nvmem-layout {
+				compatible = "fixed-layout";
+				#address-cells = <1>;
+				#size-cells = <1>;
+
+				/* [实测] MAC b4:ba:12:5c:41:a0 就在 0x3fe48，与 JioFiber 同偏移 */
+				macaddr_bl: macaddr@3fe48 {
+					compatible = "mac-base";
+					reg = <0x3fe48 0x6>;
+					#nvmem-cell-cells = <1>;
+				};
+			};
+		};
+
+		partition@40000 {		/* mtd1 256K：gzip(tar(ctromfile.cfg))，A/B 槽开关在此 */
+			label = "romfile";
+			reg = <0x00040000 0x00040000>;
+			read-only;
+		};
+
+		partition@80000 {		/* mtd2 3.9M：kernel 主槽（bootloader 固定从这里读） */
+			label = "kernel";
+			reg = <0x00080000 0x003eb941>;
+		};
+
+		partition@46b941 {		/* mtd3 17.6M：rootfs 主槽 */
+			label = "rootfs";
+			reg = <0x0046b941 0x011a0000>;
+			linux,rootfs;
+		};
+
+		partition@160b941 {		/* mtd4 24M：tclinux 整合镜像主槽 */
+			label = "tclinux";
+			reg = <0x0160b941 0x01800000>;
+			econet,enable-remap;
+		};
+
+		/* 嵌套在 tclinux 内（与 DASAN/Jio 同模式）：kernel 段 + rootfs 段 */
+		partition@160b941 {
+			label = "tclinux_kernel";
+			reg = <0x0160b941 0x00400000>;
+			econet,enable-remap;
+		};
+
+		rootA: partition@1a0b941 {
+			label = "tclinux_rootfs";
+			reg = <0x01a0b941 0x01400000>;
+		};
+
+		partition@2e0b941 {		/* mtd5 3.9M：kernel slave 槽 */
+			label = "kernel_slave";
+			reg = <0x02e0b941 0x003eb941>;
+		};
+
+		partition@31f7282 {		/* mtd6 17.6M：rootfs slave 槽 */
+			label = "rootfs_slave";
+			reg = <0x031f7282 0x011a0000>;
+		};
+
+		partition@4397282 {		/* mtd7 24M：tclinux slave 槽 */
+			label = "tclinux_slave";
+			reg = <0x04397282 0x01800000>;
+			econet,enable-remap;
+		};
+
+		partition@5b97282 {		/* mtd8 34M：java/JRE —— 严禁触碰（CoAP RCE 回退通道） */
+			label = "java";
+			reg = <0x05b97282 0x02200000>;
+			read-only;
+		};
+
+		partition@7d97282 {		/* mtd9 96M：原 yaffs(/usr/osgi) → OpenWrt 读写区 */
+			label = "rwfs";
+			reg = <0x07d97282 0x06000000>;
+		};
+
+		partition@dd97282 {		/* mtd10 2.25M：reservearea（bootloader 会写状态） */
+			label = "reservearea";
+			reg = <0x0dd97282 0x00240000>;
+			read-only;
+		};
+	};
+};
