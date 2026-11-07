@@ -1,0 +1,5 @@
+# GS2107 本地：上游 global "* -text" 会把 .dts 判成 binary，
+# 导致 DTS 改动只能以 GIT binary patch 形式进出，无法 review。
+# 这里在子树内显式清掉 binary/diff/merge 的 unset。
+*.dts -binary diff merge text eol=lf
+*.dtsi -binary diff merge text eol=lf

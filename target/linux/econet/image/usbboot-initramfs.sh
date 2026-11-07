@@ -49,7 +49,22 @@ INIT_SRC=${INIT_SRC:-$TOPDIR/target/linux/econet/other-files/gs2107-usbboot-init
 : "${RESCUE_SALT:?缺 RESCUE_SALT：口令哈希的盐，来源同 RESCUE_PW}"
 CPIO=${CPIO:-$TOPDIR/staging_dir/host/bin/cpio}
 [ -x "$CPIO" ] || CPIO=$(command -v cpio)
-MAX_KERNEL=${MAX_KERNEL:-5242624}
+
+# 体积上限的唯一真源 = image/Makefile 里 Build/tclinux-hdr2-initramfs-trx 的
+# `--pad 0x…`（HDR2 头 256B 要额外扣掉）。不在这里再写一份常量：改 pad 时
+# 若忘了同步，本脚本会给出与实际镜像不符的"余量"，那种乐观估算比没有更糟。
+# 注意跳过注释行：Makefile 的说明文字里也出现了 "--pad 0x500000"。
+MKFILE=$(dirname "$0")/Makefile
+PAD_OFFSET=$(grep -v '^[[:space:]]*#' "$MKFILE" \
+	| sed -n 's/.*--pad \(0x[0-9a-fA-F]*\).*/\1/p' | head -1)
+if [ -n "$PAD_OFFSET" ]; then
+	MAX_KERNEL=${MAX_KERNEL:-$((PAD_OFFSET - 0x100))}
+else
+	PAD_OFFSET=unknown
+	MAX_KERNEL=${MAX_KERNEL:-5242624}
+	echo "!! 警告：无法从 $MKFILE 解析 --pad，回退默认上限 ${MAX_KERNEL}B" >&2
+	echo "!!       请确认 Build/tclinux-hdr2-initramfs-trx 里仍有 --pad 0x…" >&2
+fi
 
 [ -d "$TARGET_DIR" ] || { echo "TARGET_DIR 不存在: $TARGET_DIR" >&2; exit 1; }
 [ -r "$INIT_SRC" ]   || { echo "init 脚本不存在: $INIT_SRC" >&2; exit 1; }
@@ -202,36 +217,41 @@ echo "   cpio      = $OUT ($_sz B)"
 du -sh "$STAGE" | sed 's/^/   staging   = /'
 ls -l "$STAGE/lib/modules/$KVER/" 2>/dev/null | sed 's/^/   module    = /'
 
-# ---- 体积门禁 -------------------------------------------------------------
-# 真正的约束是 **LZMA 后的整个 kernel 段**（内核本体 + 内嵌 initramfs），
-# 必须 < MAX_KERNEL。
-#
-# 两种量法，优先用精确的：
-#   ① 已有 vmlinuz.bin-initramfs（上次构建产物）= 上一轮真实的 LZMA 段大小。
-#      注意它**不含**本轮对 cpio 的改动，所以还要加上"本轮 cpio 压缩后
-#      与上轮 cpio 压缩后的差"。上轮 cpio 无法追溯时退而用 ②。
-#   ② vmlinuz.bin（内核本体，不含 initramfs）+ 本轮 cpio 的 xz 尺寸。
-#      实测偏差约 +1%（xz -9 的压缩率比内核 LZMA 略好），故加 2% 余量。
-#
-# 实测参考（2026-11-08，含 wget/tftp/insmod + econet-eth.ko）：
-#   vmlinuz.bin = 3780176，cpio = 1491968 → xz 556116
-#   估算 4337348 vs 实际 4374599（+0.86%）；实际余量 847.7 KiB（利用率 83.4%）
+# 内核本体（vmlinuz.bin：已 LZMA、不含 initramfs）——体积估算的被加数
 KERNEL_BODY=""
 for _c in "$TOPDIR"/build_dir/target-*/linux-*/vmlinuz.bin; do
 	[ -f "$_c" ] && { KERNEL_BODY=$_c; break; }
 done
+_kb=""
 if [ -n "$KERNEL_BODY" ]; then
 	_kb=$(wc -c <"$KERNEL_BODY")
+elif [ -n "${KERNEL_BODY_BYTES:-}" ]; then
+	_kb=$KERNEL_BODY_BYTES
 else
-	_kb=3900000
-	echo "   (未找到 vmlinuz.bin，内核本体按 ${_kb}B 保守估)"
+	# 不猜魔法数：拿不到内核本体就没法给出可信估算，"看起来还有余量"的
+	# 错误结论比直接说"跳过"危险得多。
+	echo "!! 找不到 vmlinuz.bin，无法估算 kernel 段体积（跳过门禁）" >&2
+	echo "!! 先 make target/linux/compile；或传 KERNEL_BODY_BYTES=<字节数>" >&2
 fi
-if command -v xz >/dev/null 2>&1; then
+
+# ---- 体积门禁 -------------------------------------------------------------
+# 真正的约束是 **LZMA 后的整个 kernel 段**（内核本体 + 内嵌 initramfs）。
+#
+# 估算式：kernel 本体尺寸（vmlinuz.bin，已 LZMA）+ 本轮 cpio 的 xz 尺寸，
+# 再 +2% 覆盖 xz -9 与内核 LZMA 压缩率的差异。
+#
+# 为什么必须加"内核本体"：只算 cpio 会得出"余量 4.6MB"的假象（内核本体
+# 3.78MB 才是大头）。实测：cpio 1491968B → xz 556116B，内核本体 3780176B，
+# 估算 4337348B vs 真正构建出的 4374599B（+0.86%），余量 847.7KiB。
+#
+# 注意这是**估算**。权威判定是构建产物本身：跑
+#   tools/gs2107-verify-trx.py <trx>
+# 它直接读 HDR2 头与真实 payload，并且校验 JAMCRC/loadaddr/padding。
+if command -v xz >/dev/null 2>&1 && [ -n "$_kb" ]; then
 	_packed=$(xz -9 -T1 -c "$OUT" 2>/dev/null | wc -c)
-	# +2% 覆盖 xz -9 与内核 LZMA 的压缩率差异（实测偏差约 1%）
 	_est=$(( _kb + (_packed * 102 + 99) / 100 ))
 	_left=$(( MAX_KERNEL - _est ))
-	echo "   kernel 本体   = $_kb B（$( [ -n "$KERNEL_BODY" ] && basename "$KERNEL_BODY" || echo 保守估）)"
+	echo "   kernel 本体   = $_kb B（$( [ -n "$KERNEL_BODY" ] && basename "$KERNEL_BODY" || echo 外部传入)）"
 	echo "   initramfs xz  = $_packed B  (cpio $_sz B → 压缩率 $(awk -v a="$_sz" -v b="$_packed" 'BEGIN{printf "%.1f%%", b*100/a}'))"
 	echo "   kernel 段估算 = $_est B（含 2% 压缩率余量）"
 	if [ "$_left" -lt 0 ]; then
@@ -239,10 +259,11 @@ if command -v xz >/dev/null 2>&1; then
 		echo "!! 处置：砍 applet / 去掉 tftp / 提高 image/Makefile 的 --pad" >&2
 		exit 1
 	fi
-	echo "   余量          = $_left B（上限 $MAX_KERNEL B = 0x500000 pad − 0x100 头）"
+	echo "   余量          = $_left B（上限 $MAX_KERNEL B = pad ${PAD_OFFSET} − 0x100 头）"
 	echo "   利用率        = $(awk -v a="$_est" -v b="$MAX_KERNEL" 'BEGIN{printf "%.1f%%", a*100/b}')"
+	echo "   权威判定请跑  = tools/gs2107-verify-trx.py <trx>（读真实 HDR2 头）"
 else
-	echo "   (无 xz，跳过体积估算；上限 $MAX_KERNEL B)"
+	echo "   (跳过体积估算：无 xz 或未拿到内核本体尺寸；上限 $MAX_KERNEL B)"
 fi
 
 echo "   把这一行写进 .config："

@@ -19,7 +19,10 @@
 #    gs_usbpoll=15         ① 的补轮询秒数
 #    gs_usbdev=/dev/sda1   只试这些块设备（可空格重复多个）
 #    gs_fs_order=squashfs,ext4    try_mount 的文件系统尝试顺序
-#    gs_rescue_ip=192.168.1.1     ④ 静态 IP（DHCP 失败时用；/=掩码位）
+#    gs_rescue_ip=192.168.1.1     ④ 静态 IP（DHCP 失败时用；掩码固定 /24）
+#                                 ⚠ 这是**救援兜底**地址，不是设备运行时的 LAN 网段
+#                                 （实机 LAN=192.168.21.7/24，见 HANDOFF §9.3）。
+#                                 救援时故意用 1.x，避免与目标系统网段撞址。
 #    gs_rescue_port=2323          ④ telnetd 端口
 #    gs_net_if=eth0        强制网络接口（默认自动枚举第一块非 lo 网卡）
 #    gs_net_no_dhcp=1      跳过 DHCP，直接用 gs_rescue_ip 静态
