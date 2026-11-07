@@ -1,0 +1,84 @@
+Subject: [PATCH] spi: airoha-snfi: initialize SFC clock environment on EcoNet EN7528
+
+勘误（2026-11-09 硬件实验，devices/gs2107/docs/14 §1、§4）：下面“时钟环境缺失是读 ID 全零的根因”的推断已被证伪——内核期 chip_scu[0x11c] 本来就是 0x501，补写是空操作；根因在 airoha_snand_exec_op() 的 FIFO 序列细节（双 cs_low、op=16、收尾 op=2/len=5）、DFIFO 残留与 DUMMY=0，修复在后续补丁里。本补丁的三写与原厂一致、无害，保留；SI_CK_SEL 与 MACMUX_SEL 两写是否必要未单独实测。以下为当时的原说明。
+
+Reading the SPI NAND ID on GS2107 (EcoNet EN7528) returns all zeros
+(spi-nand spi0.0: unknown raw ID 0000000000, probe failed -122), while tcboot
+and the stock 3.18 kernel read the same flash fine (mfr 0xbc dev 0xb2).
+
+Disassembly of both vendor implementations (docs/11-NAND-ROOTCAUSE.md, A-level)
+shows the ID-read FIFO sequence is byte-identical to airoha_snand_exec_op(),
+so the protocol is fine - the flash simply does not answer. Both vendor
+implementations write three registers before touching the flash, which this
+driver never does:
+  - chip_scu[0x11c] = (old & 0xffff) | 0x0501   (SFC clock divider + enable,
+    the net effect of the vendor spi_nor_set_clock_speed(40): 400M/2/5=40MHz)
+  - SFC SI_CK_SEL  = 9
+  - SFC MACMUX_SEL = 1   (written right before read_id)
+
+The SFC FSM does run (ID read returns in ~7ms, not the 250ms FIFO poll
+timeout), so the clock is present but the flash does not respond - pointing
+at a missing/incorrect clock environment rather than a FIFO issue.
+
+Gate on the EN7528 chip_scu syscon compatible so EN7523/EN7581/AN7583
+boards sharing this driver are unaffected.
+
+--- a/drivers/spi/spi-airoha-snfi.c	2026-11-08 03:21:03.615749896 +0800
++++ b/drivers/spi/spi-airoha-snfi.c	2026-11-08 03:21:15.328513407 +0800
+@@ -13,6 +13,7 @@
+ #include <linux/errno.h>
+ #include <linux/limits.h>
+ #include <linux/math.h>
++#include <linux/mfd/syscon.h>
+ #include <linux/minmax.h>
+ #include <linux/module.h>
+ #include <linux/mutex.h>
+@@ -1062,9 +1063,10 @@
+ 	struct airoha_snand_ctrl *as_ctrl;
+ 	struct device *dev = &pdev->dev;
+ 	struct spi_controller *ctrl;
++	struct regmap *scu;
+ 	bool dma_enable = true;
+ 	void __iomem *base;
+-	u32 sfc_strap;
++	u32 sfc_strap, val;
+ 	int err;
+ 
+ 	ctrl = devm_spi_alloc_host(dev, sizeof(*as_ctrl));
+@@ -1099,6 +1101,36 @@
+ 		return dev_err_probe(dev, PTR_ERR(as_ctrl->spi_clk),
+ 				     "unable to get spi clk\n");
+ 
++	/*
++	 * [econet bring-up] SFC 时钟环境写入（GS2107）
++	 *
++	 * 勘误（2026-11-09 硬件实验，devices/gs2107/docs/14 §1、§4）：
++	 * 当初按 docs/11 的反汇编推断“问题在 SFC 时钟环境而非协议”，
++	 * 已证伪——内核期 chip_scu[0x11c] 本来就是 0x501，补写是空
++	 * 操作。读 ID 全零的根因在 airoha_snand_exec_op() 的 FIFO
++	 * 序列细节（双 cs_low、op=16、收尾 op=2/len=5）、DFIFO 残留
++	 * 与 DUMMY=0，修复在后续补丁里。下面三写与原厂一致、无害，
++	 * 保留；SI_CK_SEL/MACMUX_SEL 两写是否必要未单独实测：
++	 *   1) chip_scu[0x11c] = (old & 0xffff) | 0x0501
++	 *      = 原厂 spi_nor_set_clock_speed(40) 的净效果
++	 *      （bit0 使能 + bits[15:8]=5 → 400M/2/5 = 40MHz）
++	 *   2) SFC SI_CK_SEL  = 9（原厂 NOR probe 同值）
++	 *   3) SFC MACMUX_SEL = 1（原厂 read_id 前一步写）
++	 * 门禁：仅 EN7528 系，不影响同驱动的 EN7523/EN7581/AN7583 板。
++	 */
++	scu = syscon_regmap_lookup_by_compatible("econet,en7528-chip-scu");
++	if (!IS_ERR(scu)) {
++		if (!regmap_read(scu, 0x11c, &val)) {
++			dev_info(dev, "chip_scu[0x11c]: %08x -> %08x\n",
++				 val, (val & 0xffff) | 0x0501);
++			regmap_write(scu, 0x11c, (val & 0xffff) | 0x0501);
++		}
++		regmap_write(as_ctrl->regmap_ctrl, REG_SPI_CTRL_SI_CK_SEL, 9);
++		regmap_write(as_ctrl->regmap_ctrl, REG_SPI_CTRL_MACMUX_SEL, 1);
++	} else {
++		dev_warn(dev, "no econet chip_scu syscon, skip SFC clock setup\n");
++	}
++
+ 	if (device_is_compatible(dev, "airoha,en7523-snand") ||
+ 	    device_is_compatible(dev, "airoha,en7581-snand")) {
+ 		err = regmap_read(as_ctrl->regmap_ctrl,

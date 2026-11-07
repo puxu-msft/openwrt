@@ -1,0 +1,39 @@
+Subject: [PATCH] spi: airoha-snfi: check SFC strap on EcoNet EN7528 as well
+
+The EN7528 (econet target) uses the same SNFI controller as EN7523/EN7581
+("identical register layouts", see 303-spi-airoha-snfi-enable-for-econet).
+The RESERVED-mode strap check (UART_TXD shorted to GND -> known incorrect
+DMA reading of some flashes) was gated on the EN7523 compatible string
+only, so on EN7528 boards the driver always used DMA even when the strap
+indicates the reserved mode.
+
+Extend the check to the EN7581/EN7528 compatible string and always print
+the raw strap value, so a failing flash probe can be diagnosed from the
+boot log:
+
+    airoha-snand 1fa10000.spi: SFC strap: 0x????????   <- bit2=0 => reserved mode
+
+Behaviour is unchanged when the strap bit is set (normal mode); in reserved
+mode the driver falls back to the slower but correct PIO path.
+
+Signed-off-by: ZCode <zcode@local>
+---
+--- a/drivers/spi/spi-airoha-snfi.c
++++ b/drivers/spi/spi-airoha-snfi.c
+@@ -1099,10 +1099,13 @@ static int airoha_snand_probe(struct platform_device *pdev)
+ 		return dev_err_probe(dev, PTR_ERR(as_ctrl->spi_clk),
+ 				     "unable to get spi clk\n");
+ 
+-	if (device_is_compatible(dev, "airoha,en7523-snand")) {
++	if (device_is_compatible(dev, "airoha,en7523-snand") ||
++	    device_is_compatible(dev, "airoha,en7581-snand")) {
+ 		err = regmap_read(as_ctrl->regmap_ctrl,
+ 				  REG_SPI_CTRL_SFC_STRAP, &sfc_strap);
+ 		if (err)
+ 			return err;
+ 
++		dev_info(dev, "SFC strap: 0x%08x\n", sfc_strap);
++
+ 		if (!(sfc_strap & 0x04)) {
+ 			dma_enable = false;
+ 			dev_warn(dev, "Detected booting in RESERVED mode (UART_TXD was short to GND).\n");
