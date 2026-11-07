@@ -14,6 +14,18 @@ econet_setup_interfaces()
 	jiofiber,jcow414)
 		ucidef_set_interface_lan "lan1 lan2 lan3 lan4"
 		;;
+	chinamobile,gs2107)
+		# GS2107：mt7530 DSA（lan1-4），原始设备树 &switch 节点存在。
+		# 不加这一项会落到下方 *) 分支生成 eth0 桥（非 DSA 布局），
+		# 连带默认 IP 变 192.168.1.1 —— 见 HANDOFF-20261108 §9.3。
+		#
+		# LAN 网段 = 192.168.21.0/24，设备自身为网关 .7（用户 11-08 定稿）。
+		# 注意必须直接调 ucidef_set_interface：ucidef_set_interface_lan 的
+		# 定义只透传 device 与 protocol 两个参数，多余的 ipaddr/netmask
+		# 会被静默丢弃（实测确认，别用那个包装函数传 IP）。
+		ucidef_set_interface "lan" device "lan1 lan2 lan3 lan4" \
+			protocol static ipaddr 192.168.21.7 netmask 255.255.255.0
+		;;
 	*)
 		# The remaining boards have no DSA switch driver yet.
 		ucidef_set_interface_lan "eth0"
