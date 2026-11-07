@@ -483,6 +483,37 @@ target_is_mounted() {
 	awk -v d="$1" '$1==d {found=1} END {exit !found}' /proc/mounts 2>/dev/null
 }
 
+# resolve_mtd_name <名字>：把 mtd 分区名（如 tclinux / rootfs）解析成设备节点。
+# 为什么需要：mtdblockN 的编号随 DTS 分区表调整而漂移（本板实测 tclinux
+# 主槽曾是 0x160b941 假设下的编号，后来修正为 0x480000），而**名字是稳定的**。
+# 名字支持子串匹配：`rootfs` 会命中 `rootfs`/`tclinux_rootfs`；
+# 多个命中时优先**精确相等**，否则取第一个并打印实际选择。
+resolve_mtd_name() {
+	_want=$1
+	_exact=""
+	_first=""
+	for _m in /sys/class/mtd/mtd*; do
+		[ -e "$_m/name" ] || continue
+		_nm=$(cat "$_m/name" 2>/dev/null)
+		[ -n "$_nm" ] || continue
+		case "$_nm" in
+			*"$_want"*)
+				_n=${_m##*/}
+				_dev=/dev/mtdblock${_n#mtd}
+				[ -b "$_dev" ] || continue
+				if [ "$_nm" = "$_want" ]; then
+					_exact=$_dev
+					break
+				fi
+				[ -z "$_first" ] && _first=$_dev
+				;;
+		esac
+	done
+	if [ -n "$_exact" ]; then echo "$_exact"; return 0; fi
+	if [ -n "$_first" ]; then say "  ! mtd 名 '$_want' 无精确匹配，用 $_first" >&2; echo "$_first"; return 0; fi
+	return 1
+}
+
 # pick_install_target：未指定 gs_install_target 时，挑第一块 U 盘分区
 pick_install_target() {
 	_t=$(list_usb_parts | head -1)
@@ -590,10 +621,24 @@ install_from_net() {
 	fi
 
 	# --- 3d. 目标 -------------------------------------------------------
+	# gs_install_target 接受两种写法：
+	#   ① 设备路径：/dev/sda1、/dev/mtdblock3
+	#   ② **mtd 分区名**：tclinux / rootfs / kernel_slave …
+	#      名字解析成节点，避免 mtdblock 编号随 DTS 调整漂移（本板踩过）。
 	_tgt=$INSTALL_TARGET
 	if [ -z "$_tgt" ]; then
 		_tgt=$(pick_install_target) || { install_fail "未找到可写目标分区"; return 1; }
 		say "  自动选择目标: $_tgt"
+	elif [ ! -e "$_tgt" ] && [ ! -b "$_tgt" ] && [ ! -f "$_tgt" ]; then
+		# 不是现存路径 → 当 mtd 分区名解析
+		if _r=$(resolve_mtd_name "$_tgt"); then
+			# /dev/mtdblock3 → /sys/class/mtd/mtd3/name（不写 ${v/a/b}，那是 bashism）
+			_n=${_r##*/}
+			_n=mtd${_n#mtdblock}
+			_actual_name=$(cat "/sys/class/mtd/$_n/name" 2>/dev/null)
+			say "  mtd 分区名 '$_tgt' → $_r${_actual_name:+（名字=$_actual_name）}"
+			_tgt=$_r
+		fi
 	fi
 	if [ ! -b "$_tgt" ] && [ ! -f "$_tgt" ]; then
 		install_fail "目标不存在或不是块设备: $_tgt"
