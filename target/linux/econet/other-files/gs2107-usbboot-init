@@ -31,6 +31,8 @@
 #    gs_install_target=/dev/sda1  ③ 写入目标块设备
 #    gs_install_noverify=1        ③ 显式放弃哈希校验（危险，日志会高声警告）
 #    gs_install_readback=0        ③ 关闭写后读回校验（默认开）
+#    gs_install_allow_unknown_size=1  ③ 目标容量读不到时仍允许写（默认拒绝）
+#                                  ⚠ 写 mtd 裸分区时尤其危险：越界会覆盖相邻分区
 #    gs_install_cmd="…"           ③ 完全自定义安装命令（替代内建 dd 流程）
 #    gs_install_reboot=0          ③ 安装后不重启（默认重启）
 #    gs_install_onfail=rescue|halt|reboot   ③ 安装失败后的去向
@@ -73,6 +75,7 @@ INSTALL_SHA256=""
 INSTALL_TARGET=""
 INSTALL_NOVERIFY=0
 INSTALL_READBACK=1
+INSTALL_ALLOW_UNKNOWN_SIZE=0
 INSTALL_CMD=""
 INSTALL_REBOOT=1
 INSTALL_ONFAIL=rescue
@@ -102,6 +105,7 @@ for _kv in $(cat /proc/cmdline 2>/dev/null); do
 		gs_install_target=*)  INSTALL_TARGET=${_kv#gs_install_target=} ;;
 		gs_install_noverify=*) INSTALL_NOVERIFY=${_kv#gs_install_noverify=} ;;
 		gs_install_readback=*) INSTALL_READBACK=${_kv#gs_install_readback=} ;;
+		gs_install_allow_unknown_size=*) INSTALL_ALLOW_UNKNOWN_SIZE=${_kv#gs_install_allow_unknown_size=} ;;
 		gs_install_cmd=*)     INSTALL_CMD=${_kv#gs_install_cmd=} ;;
 		gs_install_reboot=*)  INSTALL_REBOOT=${_kv#gs_install_reboot=} ;;
 		gs_install_onfail=*)  INSTALL_ONFAIL=${_kv#gs_install_onfail=} ;;
@@ -598,6 +602,52 @@ install_from_net() {
 	if target_is_mounted "$_tgt"; then
 		say "  $_tgt 已挂载，尝试卸载"
 		umount "$_tgt" 2>/dev/null || { install_fail "目标已挂载且卸载失败: $_tgt"; return 1; }
+	fi
+
+	# --- 3d-2. 容量边界（mtd 裸分区必查）--------------------------------
+	# USB 分区写超了只是坏 U 盘；**mtd 写超了会覆盖相邻分区**（GS2107 实测
+	# 分区表：tclinux 主槽 0x80000-0x1880000 = 24MB，紧邻 kernel_slave）。
+	# 所以写任何块设备前都先读它的真实容量，镜像大于容量就拒绝。
+	# 容量唯一来源 = sysfs（/sys/class/mtd/mtdN/size 为字节；
+	# /sys/class/block/<dev>/size 为 512B 扇区数）。内核只要把设备注册出来，
+	# 这两个属性就在，所以不需要再挂 blockdev（busybox 的 blockdev applet
+	# 默认未开，为它多一轮 busybox 重编+镜像重建不划算）。
+	# 拿不到容量时**不放行**（宁可拒绝，也不冒越界写的风险）。
+	_cap=""
+	case "$_tgt" in
+		/dev/mtdblock*)
+			# mtdblock 的容量看 /sys/class/mtd/mtdN/size（字节）
+			_n=${_tgt##*/}
+			_n=${_n#mtdblock}
+			if [ -r "/sys/class/mtd/mtd$_n/size" ]; then
+				_cap=$(cat "/sys/class/mtd/mtd$_n/size" 2>/dev/null)
+			fi
+			;;
+		/dev/*)
+			_n=${_tgt##*/}
+			if [ -r "/sys/class/block/$_n/size" ]; then
+				# sysfs size 单位是 512B 扇区
+				_sect=$(cat "/sys/class/block/$_n/size" 2>/dev/null)
+				case "$_sect" in
+					''|*[!0-9]*) _cap="" ;;
+					*) _cap=$((_sect * 512)) ;;
+				esac
+			fi
+			;;
+	esac
+	if [ -n "$_cap" ] && [ "$_cap" -gt 0 ]; then
+		if [ "$_sz" -gt "$_cap" ]; then
+			install_fail "镜像 ${_sz}B 大于目标容量 ${_cap}B: $_tgt（写入会越界）"
+			return 1
+		fi
+		say "  目标容量: ${_cap}B，镜像 ${_sz}B（占用 $((_sz * 100 / _cap))%）"
+	else
+		# 拿不到容量：只有显式确认过才允许继续
+		if [ "$INSTALL_ALLOW_UNKNOWN_SIZE" != 1 ]; then
+			install_fail "无法读取 $_tgt 的容量，拒绝写入（如确认安全，加 gs_install_allow_unknown_size=1）"
+			return 1
+		fi
+		say "  ! 警告：无法读取目标容量，按 gs_install_allow_unknown_size=1 继续"
 	fi
 
 	# --- 3e. 写入 -------------------------------------------------------
