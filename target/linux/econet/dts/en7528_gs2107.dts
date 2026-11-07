@@ -48,6 +48,19 @@
 	chosen {
 		stdout-path = "/serial@1fbf0000:115200";
 		/*
+		 * [v2 改] initramfs 引导内核：root 由 initramfs /init 在运行期探测
+		 * （U盘优先 → 板载回落 → 驻留救援），见 devices/gs2107/USB-BOOT-PLAN.md §0
+		 * 与 target/linux/econet/other-files/gs2107-usbboot-init。
+		 * bootargs 因此最简化：只要 console；root= 仅作双保险——
+		 * /init 正常驻留（永不退出）时内核根本不会去挂 root=。
+		 *
+		 * [实测根因·历史] free bootbase 给内核的 cmdline 为空（UART 日志
+		 * "Kernel command line:" 后无内容），原厂内核靠 DTS built-in bootargs
+		 * 启动；OpenWrt 镜像此前缺 bootargs → panic
+		 * "Unable to mount root fs on unknown-block(0,0)"。
+		 */
+		bootargs = "console=ttyS0,115200 root=/dev/sda1 rootwait";
+		/*
 		 * free-bootbase：镜像解压占物理 0x2000-0x20000，vmlinuz 落在
 		 * 0x80020000。usable 从 0x20000 起（与 JioFiber 一致），尾部留 128KB。
 		 * VMLINUX-RE：未定位到显式 "bootram" 命名保留区，最大保留块即内核
@@ -82,6 +95,16 @@
 		reg = <0x0000 0 0 0 0>;
 		nvmem-cells = <&macaddr_bl 2>;
 		nvmem-cell-names = "mac-address";
+		/*
+		 * [11-08 硬编码] nvmem 在 mtd0（bootloader 分区 +0x3fe48），
+		 * NAND 因 SFC strap 问题内核期不可见 → of_get_mac_address()
+		 * 对缺失 nvmem provider 返回 -EPROBE_DEFER → 整棵 probe 挂起
+		 * （ethernet/switch/两颗 wifi 全部 defer，devices_deferred 实证）。
+		 * mac-base 布局语义 = 基址 + index：基址 b4:ba:12:5c:41:a0
+		 * （mtd0+0x3fe48 实测 dump），index2 → …a2。
+		 * mac-address 属性优先于 nvmem，NAND 恢复后两者取值一致。
+		 */
+		mac-address = [b4 ba 12 5c 41 a2];
 		ieee80211-freq-limit = <5000000 6000000>;
 		/*
 		 * TODO(EEPROM): 5G e2p（1536B，魔数 0x7663）在
@@ -101,6 +124,8 @@
 		reg = <0x0000 0 0 0 0>;
 		nvmem-cells = <&macaddr_bl 3>;
 		nvmem-cell-names = "mac-address";
+		/* [11-08 硬编码] 同 slot0：基址+index3 → …a3 */
+		mac-address = [b4 ba 12 5c 41 a3];
 		ieee80211-freq-limit = <2400000 2500000>;
 		/* TODO(EEPROM): 2.4G eeprom 512B（/etc/RT30xxEEPROM.bin，魔数 0x7592） */
 	};
@@ -110,6 +135,13 @@
 	status = "okay";
 	nvmem-cells = <&macaddr_bl 1>;
 	nvmem-cell-names = "mac-address";
+	/*
+	 * [11-08 硬编码] 原厂 eth0 实测 MAC = 基址本身 b4:ba:12:5c:41:a0
+	 * （stock bootlog: "eth0: FE MAC Ethernet address: B4:BA:12:5C:41:A0"），
+	 * 故此处不用 macaddr_bl 1（基址+1=…a1）。理由同 slot0 注释：
+	 * 属性优先于 nvmem，绕开 NAND 不可见导致的 probe defer。
+	 */
+	mac-address = [b4 ba 12 5c 41 a0];
 };
 
 &switch {
@@ -205,9 +237,19 @@
 			econet,enable-remap;
 		};
 
-		rootA: partition@1a0b941 {
+		/*
+		 * [实测修正] OpenWrt 整合镜像实际写在 flash 0x80000（mtdwrite 4 =
+		 * 厂商系统 tclinux 主槽起点，bootloader 固定从 0x80000 读 HDR2）。
+		 * tclinux-hdr2.py 把 kernel 段垫到 4MB（0x100 + 0x3FFF00 = 0x400000），
+		 * 故 rootfs 段起始 = 0x80000 + 0x400000 = 0x480000。
+		 * 原 0x1a0b941 是按"镜像写在 0x160b941"的错误假设推出来的，与
+		 * 实际写入位置不符（UART 实测：厂商 /proc/mtd 的 tclinux 在
+		 * [0x80000,0x1880000)，与 kernel/rootfs 槽重叠而非顺序排列）。
+		 * 本分区保持节点顺序第 7 位 → mtd6，bootargs 用 root=/dev/mtdblock6。
+		 */
+		rootA: partition@480000 {
 			label = "tclinux_rootfs";
-			reg = <0x01a0b941 0x01400000>;
+			reg = <0x0480000 0x01400000>;
 		};
 
 		partition@2e0b941 {		/* mtd5 3.9M：kernel slave 槽 */
