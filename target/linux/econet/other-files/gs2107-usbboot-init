@@ -1,0 +1,697 @@
+#!/bin/sh
+# ============================================================================
+#  GS2107 通用引导 / 救援 / 网络安装 init —— initramfs /init
+#  ChinaMobile GS2107 · EcoNet EN7528 · OpenWrt target econet/en7528
+#
+#  设计依据：devices/gs2107/USB-BOOT-PLAN.md §0（v3 通用化）
+#            交接与实测：devices/gs2107/docs/HANDOFF-20261108.md
+#
+#  ---- 五种引导模式（bootargs: gs_boot=<mode>）----------------------------
+#    usb      ① 等 USB 枚举 → 逐分区试挂 → switch_root        【主路线：U盘优先】
+#    nand     ② 板载 /dev/mtdblock*（按 mtd 名字优先）→ switch_root 【回落1】
+#    install  ③ 起网 → 下载镜像 → sha256 校验 → dd 写目标 → reboot【网络安装】
+#    rescue   ④ 驻留 initramfs：起网 + telnetd(:2323) + 串口 shell 【回落2：保底】
+#    auto     默认。顺序 = usb → nand →（gs_install_url 非空时）install → rescue
+#
+#  ---- bootargs 覆盖表（内核 cmdline，空格分隔，全部可省略）---------------
+#    gs_boot=auto|usb|nand|install|rescue   强制走某一模式
+#    gs_usbwait=3          ① 的初始等待秒数
+#    gs_usbpoll=15         ① 的补轮询秒数
+#    gs_usbdev=/dev/sda1   只试这些块设备（可空格重复多个）
+#    gs_fs_order=squashfs,ext4    try_mount 的文件系统尝试顺序
+#    gs_rescue_ip=192.168.1.1     ④ 静态 IP（DHCP 失败时用；/=掩码位）
+#    gs_rescue_port=2323          ④ telnetd 端口
+#    gs_net_if=eth0        强制网络接口（默认自动枚举第一块非 lo 网卡）
+#    gs_net_no_dhcp=1      跳过 DHCP，直接用 gs_rescue_ip 静态
+#    gs_install_url=http://…      ③ 镜像 URL（支持 http:// 与 tftp://）
+#    gs_install_sha256=<hex>      ③ 期望 SHA-256（缺省则拒绝安装，见 gs_install_noverify）
+#    gs_install_target=/dev/sda1  ③ 写入目标块设备
+#    gs_install_noverify=1        ③ 显式放弃哈希校验（危险，日志会高声警告）
+#    gs_install_readback=0        ③ 关闭写后读回校验（默认开）
+#    gs_install_cmd="…"           ③ 完全自定义安装命令（替代内建 dd 流程）
+#    gs_install_reboot=0          ③ 安装后不重启（默认重启）
+#    gs_install_onfail=rescue|halt|reboot   ③ 安装失败后的去向
+#
+#  实现约束（本机 busybox 1.38 实证）
+#    - 救援/安装的网络能力来自 busybox 内建 applet：udhcpc / wget(http) / tftp /
+#      telnetd / ip / ifconfig。**无 curl、无 https**（busybox wget 的 https 需要
+#      TLS 库，体积不允许）；镜像源请用 http 或 tftp。
+#    - eth 驱动 `econet-eth` 是**模块**（不在内核内建里）。initramfs 没有
+#      /lib/modules，所以 usbboot-initramfs.sh 会把它单独打进
+#      /lib/modules/$(uname -r)/econet-eth.ko，本脚本在起网前 insmod 它。
+#      没有这个模块 = 有网卡硬件也没 eth0（HANDOFF-20261108 §4.2 的第 4 个缺失）。
+#    - 块设备节点：优先 devtmpfs；缺失时从 /sys/class/block/*/dev 手工 mknod
+#    - 全文只用 POSIX sh / busybox ash 语法（无 bashisms）
+#
+#  调试：全流程日志双写 控制台 + /tmp/gs2107-init.log；救援模式下可通过
+#        telnet 2323 登录后 `cat /tmp/gs2107-init.log` 回看。
+# ============================================================================
+
+PATH=/bin:/sbin:/usr/bin:/usr/sbin
+export PATH
+
+TAG="gs2107-init"
+LOG=/tmp/gs2107-init.log
+NEWROOT=/mnt
+MODDIR="/lib/modules/$(uname -r 2>/dev/null)"
+
+# ------------------------------------------------------------ 默认参数 ------
+BOOT_MODE=auto
+USB_WAIT=3
+USB_POLL=15
+USB_DEV=""
+FS_ORDER="squashfs ext4"
+RESCUE_IP=192.168.1.1
+RESCUE_PORT=2323
+NET_IF=""
+NET_NO_DHCP=0
+INSTALL_URL=""
+INSTALL_SHA256=""
+INSTALL_TARGET=""
+INSTALL_NOVERIFY=0
+INSTALL_READBACK=1
+INSTALL_CMD=""
+INSTALL_REBOOT=1
+INSTALL_ONFAIL=rescue
+INSTALL_FILE=/tmp/gs2107-install.img
+# （无 NET_READY 全局量：net_up 的返回值就是唯一真源）
+
+# ------------------------------------------------------------ 输出辅助 ------
+say() {
+	echo "$TAG: $*"
+	echo "$TAG: $*" >>"$LOG" 2>/dev/null
+}
+
+# ------------------------------------------------- 从 /proc/cmdline 取参数 --
+for _kv in $(cat /proc/cmdline 2>/dev/null); do
+	case "$_kv" in
+		gs_boot=*)            BOOT_MODE=${_kv#gs_boot=} ;;
+		gs_usbwait=*)         USB_WAIT=${_kv#gs_usbwait=} ;;
+		gs_usbpoll=*)         USB_POLL=${_kv#gs_usbpoll=} ;;
+		gs_usbdev=*)          USB_DEV=${_kv#gs_usbdev=} ;;
+		gs_fs_order=*)        FS_ORDER=$(printf '%s' "${_kv#gs_fs_order=}" | tr ',' ' ') ;;
+		gs_rescue_ip=*)       RESCUE_IP=${_kv#gs_rescue_ip=} ;;
+		gs_rescue_port=*)     RESCUE_PORT=${_kv#gs_rescue_port=} ;;
+		gs_net_if=*)          NET_IF=${_kv#gs_net_if=} ;;
+		gs_net_no_dhcp=*)     NET_NO_DHCP=${_kv#gs_net_no_dhcp=} ;;
+		gs_install_url=*)     INSTALL_URL=${_kv#gs_install_url=} ;;
+		gs_install_sha256=*)  INSTALL_SHA256=${_kv#gs_install_sha256=} ;;
+		gs_install_target=*)  INSTALL_TARGET=${_kv#gs_install_target=} ;;
+		gs_install_noverify=*) INSTALL_NOVERIFY=${_kv#gs_install_noverify=} ;;
+		gs_install_readback=*) INSTALL_READBACK=${_kv#gs_install_readback=} ;;
+		gs_install_cmd=*)     INSTALL_CMD=${_kv#gs_install_cmd=} ;;
+		gs_install_reboot=*)  INSTALL_REBOOT=${_kv#gs_install_reboot=} ;;
+		gs_install_onfail=*)  INSTALL_ONFAIL=${_kv#gs_install_onfail=} ;;
+	esac
+done
+case "$BOOT_MODE" in
+	auto|usb|nand|install|rescue) ;;
+	*) say "未知 gs_boot=$BOOT_MODE，回退 auto"; BOOT_MODE=auto ;;
+esac
+[ -n "$FS_ORDER" ] || FS_ORDER="squashfs ext4"
+
+say "==============================================================="
+say " GS2107 boot/rescue/install init  (boot mode = $BOOT_MODE)"
+say " kernel: $(uname -r 2>/dev/null)   cmdline: $(cat /proc/cmdline 2>/dev/null)"
+say " fs order: $FS_ORDER"
+say "==============================================================="
+
+# ------------------------------------------- 0. 最小内核文件系统 / 设备节点 --
+mkdir -p /proc /sys /dev /run /tmp "$NEWROOT" /new_root
+mount -t proc     proc     /proc    2>/dev/null
+mount -t sysfs    sysfs    /sys     2>/dev/null
+mount -t devtmpfs devtmpfs /dev     2>/dev/null
+mkdir -p /dev/pts /dev/shm
+mount -t devpts   devpts   /dev/pts 2>/dev/null
+mount -t tmpfs    tmpfs    /run     2>/dev/null
+mount -t tmpfs    tmpfs    /tmp     2>/dev/null
+ip link set lo up 2>/dev/null
+: >"$LOG" 2>/dev/null
+
+# devtmpfs 不可用时，从 sysfs 补建块设备节点（USB storage 必需）
+mknod_blocks_from_sys() {
+	_p=
+	for _p in /sys/class/block/*; do
+		[ -e "$_p/dev" ] || continue
+		_n=${_p##*/}
+		_mm=$(cat "$_p/dev" 2>/dev/null)
+		case "$_mm" in
+			*:*) ;;
+			*) continue ;;
+		esac
+		_maj=${_mm%%:*}
+		_min=${_mm##*:}
+		[ -e "/dev/$_n" ] || mknod "/dev/$_n" b "$_maj" "$_min" 2>/dev/null
+	done
+}
+mknod_blocks_from_sys
+
+# ------------------------------------------------------ 挂载探测公共逻辑 ----
+# is_rootfs <dir>：目录里有没有像样的用户空间入口
+is_rootfs() {
+	[ -x "$1/sbin/init" ] || [ -x "$1/init" ] || [ -x "$1/etc/init.d/rcS" ]
+}
+
+# try_mount <blkdev>：按 $FS_ORDER 依次试挂；
+# 挂上且判定为 rootfs 返回 0，否则卸掉返回 1
+try_mount() {
+	_dev=$1
+	for _fs in $FS_ORDER; do
+		umount "$NEWROOT" 2>/dev/null
+		if mount -t "$_fs" "$_dev" "$NEWROOT" 2>/dev/null; then
+			if is_rootfs "$NEWROOT"; then
+				say "  可挂载: $_dev ($_fs) -> $NEWROOT"
+				return 0
+			fi
+			say "  $_dev ($_fs) 能挂但无 /sbin/init，跳过"
+			umount "$NEWROOT" 2>/dev/null
+		fi
+	done
+	return 1
+}
+
+# do_switch_root <what>：切换到当前挂在 $NEWROOT 上的根文件系统
+# 注意：busybox switch_root 强制要求自己是 PID 1（getpid()!=1 直接退用法），
+# 且失败时是 bb_perror_msg_and_die——会带走 PID 1 → 内核 panic。
+# 所以调用前先用 /proc/mounts 确认 $NEWROOT 真是个挂载点，把失败路径掐掉。
+do_switch_root() {
+	_what=$1
+	_mp=$NEWROOT
+	_init=/sbin/init
+	if [ -x "$_mp/init" ] && [ ! -x "$_mp/sbin/init" ]; then
+		_init=/init
+	fi
+
+	if ! grep -q " $_mp " /proc/mounts 2>/dev/null; then
+		say "  $_mp 不是挂载点，放弃 switch_root，继续下一个回落"
+		umount "$_mp" 2>/dev/null
+		return 1
+	fi
+
+	say "switch_root -> $_mp ($_what)，exec $_init"
+	umount /run 2>/dev/null
+	umount /tmp 2>/dev/null
+	cd "$_mp" 2>/dev/null || cd /
+	# switch_root 内部会 exec 新 init 并就地替换本进程；成功就不再回来。
+	# 万一失败（PID 1 被杀）会进 panic 重启循环，重启后重新走本探测脚本。
+	exec switch_root "$_mp" "$_init"
+}
+
+# --------------------------------------------------- 块设备枚举（通用） -----
+# list_usb_parts：输出候选 USB 分区路径，一行一个，稳定路径优先。
+#   ① /dev/disk/by-id/usb-*  （设备上有 udev 时才存在；initramfs 通常没有）
+#   ② /sys/class/block/sd* 里带 partition 属性的（即 sda1/sdb2/…）
+# 额外参数 $1 非空时只输出该集合（gs_usbdev 覆盖）。
+list_usb_parts() {
+	_seen=" "
+	# ① by-id 稳定路径优先（同一 U 盘换口/sd 字母漂移时仍能定位）
+	for _l in /dev/disk/by-id/* /dev/disk/by-path/*; do
+		[ -e "$_l" ] || continue
+		case "$_l" in
+			*usb*|*scsi*) ;;
+			*) continue ;;
+		esac
+		_rt=$(readlink -f "$_l" 2>/dev/null) || continue
+		case "$_rt" in
+			/dev/sd*[0-9]) ;;
+			*) continue ;;
+		esac
+		case "$_seen" in
+			*" $_rt "*) continue ;;
+		esac
+		_seen="$_seen$_rt "
+		echo "$_rt"
+	done
+	# ② sysfs 枚举（devtmpfs 下块节点可能还没建全，故以 sysfs 为准逐个补）
+	for _p in /sys/class/block/sd*; do
+		[ -e "$_p/partition" ] || continue
+		_n=${_p##*/}
+		[ -b "/dev/$_n" ] || mknod_blocks_from_sys
+		[ -b "/dev/$_n" ] || continue
+		case "$_seen" in
+			*" /dev/$_n "*) continue ;;
+		esac
+		_seen="$_seen/dev/$_n "
+		echo "/dev/$_n"
+	done
+}
+
+# ------------------------------------------------------------- ① 等 USB ----
+wait_for_usb() {
+	_w=${USB_WAIT:-3}
+	say "① 等待 USB 枚举 ${_w}s ..."
+	sleep "$_w"
+	mknod_blocks_from_sys
+	_i=0
+	while [ "$_i" -lt "${USB_POLL:-0}" ]; do
+		_hit=0
+		for _d in /dev/sd? /dev/sd??; do
+			[ -b "$_d" ] && _hit=1
+		done
+		[ "$_hit" = 1 ] && return 0
+		sleep 1
+		_i=$((_i + 1))
+		mknod_blocks_from_sys
+	done
+	return 1
+}
+
+# -------------------------------------------------------- ② U 盘优先 --------
+boot_from_usb() {
+	say "② 尝试 U 盘 rootfs（U盘优先，fs 顺序: $FS_ORDER）"
+	_cands=""
+	if [ -n "$USB_DEV" ]; then
+		_cands=$USB_DEV
+	else
+		_cands=$(list_usb_parts)
+	fi
+	if [ -z "$_cands" ]; then
+		say "  未枚举到任何 USB 分区（无 U 盘 / 无 usb-storage / 未分区）"
+		return 1
+	fi
+	for _d in $_cands; do
+		[ -b "$_d" ] || { say "  $_d 不存在，跳过"; continue; }
+		say "  探测 $_d ..."
+		if try_mount "$_d"; then
+			do_switch_root "USB $_d"
+			return $?
+		fi
+	done
+	say "  未找到可用的 U 盘 rootfs"
+	return 1
+}
+
+# --------------------------------------------------- ③ 板载存储回落 --------
+# mtd 名字匹配优先（分区表重排时 /dev/mtdblockN 编号会变，名字不会）
+list_mtd_candidates() {
+	_seen=" "
+	# ① 按名字找（rootfs / rootfs_data / ubi / tclinux_rootfs …）
+	for _m in /sys/class/mtd/mtd*; do
+		[ -e "$_m/name" ] || continue
+		_nm=$(cat "$_m/name" 2>/dev/null)
+		case "$_nm" in
+			*rootfs*|*tclinux*|*ubi*) ;;
+			*) continue ;;
+		esac
+		_n=${_m##*/}
+		# mtd0 → mtdblock0（不用 ${var/a/b}：那是 bashism）
+		_dev=/dev/mtdblock${_n#mtd}
+		[ -b "$_dev" ] || continue
+		case "$_seen" in
+			*" $_dev "*) continue ;;
+		esac
+		_seen="$_seen$_dev "
+		echo "$_dev"
+	done
+	# ② 已知编号兜底（DTS 分区表：mtd3=rootfs / mtd6=tclinux_rootfs / mtd8=slave）
+	for _dev in /dev/mtdblock3 /dev/mtdblock6 /dev/mtdblock8 /dev/mtdblock*; do
+		[ -b "$_dev" ] || continue
+		case "$_seen" in
+			*" $_dev "*) continue ;;
+		esac
+		_seen="$_seen$_dev "
+		echo "$_dev"
+	done
+}
+
+boot_from_onboard() {
+	say "③ 尝试板载 rootfs（回落1：mtdblock*）"
+	_cands=$(list_mtd_candidates)
+	if [ -z "$_cands" ]; then
+		say "  无 mtdblock 设备（NAND 未探测成功时 /proc/mtd 为空，属已知现象）"
+		return 1
+	fi
+	for _d in $_cands; do
+		[ -b "$_d" ] || continue
+		say "  探测 $_d ..."
+		if try_mount "$_d"; then
+			do_switch_root "板载 $_d"
+			return $?
+		fi
+	done
+	say "  板载无可用 rootfs（NAND/strap 未恢复时此处必然全失败）"
+	return 1
+}
+
+# ============================================================ 网络 =========
+# load_eth_module：insmod 出 econet-eth（模块，不在内核内建里）。
+# 已内建的情况下这里静默跳过；无论成败都不阻断后续（无网卡也要能进救援 shell）。
+load_eth_module() {
+	[ -d /sys/class/net ] || return 1
+	for _i in /sys/class/net/*; do
+		# 空 glob 守卫：目录为空时 _i 是字面 "/sys/class/net/*"，
+		# 不判 -e 会把它当成"已有一块网卡"，从而跳过 insmod。
+		[ -e "$_i" ] || continue
+		[ "${_i##*/}" = lo ] && continue
+		return 0
+	done
+	_ko=""
+	for _c in "$MODDIR"/econet-eth.ko "$MODDIR"/econet_eth.ko \
+	          /lib/modules/*/econet-eth.ko; do
+		[ -f "$_c" ] && { _ko=$_c; break; }
+	done
+	if [ -z "$_ko" ]; then
+		say "  ! 无 /lib/modules/*/econet-eth.ko —— 本内核没有内建 eth 驱动，起网必然失败"
+		return 1
+	fi
+	if command -v insmod >/dev/null 2>&1; then
+		say "  insmod $_ko"
+		insmod "$_ko" 2>&1 | while read -r _l; do say "    $_l"; done
+		sleep 1
+		return 0
+	fi
+	say "  ! busybox 无 insmod applet，无法加载 $_ko"
+	return 1
+}
+
+# pick_iface：返回第一块非 lo、非虚拟的网卡名
+# 注意空 glob：/sys/class/net 为空时 `for _i in /sys/class/net/*` 会把字面量
+# "/sys/class/net/*" 当成一项，于是 _n="*"。这里先判目录里有几个条目，
+# 避免把 `*` 当网卡名传出去（实测踩坑：无网卡时 ip 收到 "dev *"）。
+pick_iface() {
+	[ -n "$NET_IF" ] && { echo "$NET_IF"; return 0; }
+	[ -d /sys/class/net ] || return 1
+	for _i in /sys/class/net/*; do
+		[ -e "$_i" ] || continue
+		_n=${_i##*/}
+		case "$_n" in lo|sit*|ip6*|gre*|bond*) continue ;; esac
+		echo "$_n"
+		return 0
+	done
+	return 1
+}
+
+net_up() {
+	load_eth_module
+
+	_iface=$(pick_iface)
+	if [ -z "$_iface" ]; then
+		say "  ! 没有任何网络接口（eth 驱动未加载成功 / 硬件未 probe）"
+		return 1
+	fi
+	say "  网络接口: $_iface"
+	ip link set "$_iface" up 2>/dev/null
+
+	_got=0
+	if [ "$NET_NO_DHCP" = 0 ] && command -v udhcpc >/dev/null 2>&1; then
+		_s=/usr/share/udhcpc/default.script
+		[ -x "$_s" ] || _s=/etc/udhcpc/default.script
+		say "  udhcpc -i $_iface ..."
+		if [ -x "$_s" ]; then
+			udhcpc -i "$_iface" -q -n -t 3 -T 3 -s "$_s" >/dev/null 2>&1 && _got=1
+		else
+			# 没有 udhcpc 脚本时用 busybox 的默认行为（只设地址，不写 resolv.conf）
+			udhcpc -i "$_iface" -q -n -t 3 -T 3 >/dev/null 2>&1 && _got=1
+		fi
+		[ "$_got" = 1 ] && say "  DHCP 成功"
+	fi
+	if [ "$_got" = 0 ]; then
+		say "  DHCP 未拿到租约，改用静态 IP ${RESCUE_IP}"
+		ip addr flush dev "$_iface" 2>/dev/null
+		ip addr add "$RESCUE_IP"/24 dev "$_iface" 2>/dev/null
+		ip link set "$_iface" up 2>/dev/null
+		ip route add default dev "$_iface" 2>/dev/null
+	fi
+	[ -f /etc/resolv.conf ] || echo "nameserver 8.8.8.8" >/etc/resolv.conf 2>/dev/null
+
+	_addr=$(ip -4 -o addr show dev "$_iface" 2>/dev/null | head -1)
+	say "  网络: $_iface ${_addr:-（无地址）}"
+
+	return 0
+}
+
+# ======================================================= ③ 网络安装 ========
+# run_logged <cmd…>：执行命令，把它的输出逐行转发到 say()，并**返回命令本身
+# 的退出码**。不能写成 `cmd 2>&1 | while read …; done`——管道退出码取最后一段
+# （while 恒 0），wget 失败会被吞掉，上层只看到"成功但文件为空"，错误信息误导。
+# 实测踩坑：URL 拒连时日志报"下载结果为空文件"而不是"下载失败"。
+run_logged() {
+	_o=/tmp/.gs-cmd.out
+	"$@" >"$_o" 2>&1
+	_rc=$?
+	[ -s "$_o" ] && while IFS= read -r _l; do say "    $_l"; done <"$_o"
+	rm -f "$_o"
+	return $_rc
+}
+
+# download <url> <dst>：busybox wget(http/ftp) 或 tftp。
+download() {
+	_url=$1
+	_dst=$2
+	case "$_url" in
+		http://*|ftp://*)
+			command -v wget >/dev/null 2>&1 || {
+				say "  ! busybox 无 wget applet"; return 1; }
+			say "  wget -O $_dst $_url"
+			run_logged wget -O "$_dst" "$_url"
+			;;
+		tftp://*)
+			command -v tftp >/dev/null 2>&1 || {
+				say "  ! busybox 无 tftp applet"; return 1; }
+			_rest=${_url#tftp://}
+			_host=${_rest%%/*}
+			_path=${_rest#*/}
+			[ "$_path" = "$_rest" ] && { say "  ! tftp URL 缺路径: $_url"; return 1; }
+			say "  tftp -g $_host:$_path -> $_dst"
+			run_logged tftp -g -l "$_dst" -r "$_path" "$_host"
+			;;
+		file://*)
+			_src=${_url#file://}
+			say "  cp $_src $_dst"
+			cp -f "$_src" "$_dst" 2>/dev/null || return 1
+			;;
+		*)
+			say "  ! 不支持的 URL 协议: $_url（只支持 http:// ftp:// tftp:// file://）"
+			return 1
+			;;
+	esac
+}
+
+sha256_of() {
+	sha256sum "$1" 2>/dev/null | cut -d' ' -f1
+}
+
+# target_is_mounted <dev>：目标是否已挂载（已挂载时写它会毁数据）
+target_is_mounted() {
+	awk -v d="$1" '$1==d {found=1} END {exit !found}' /proc/mounts 2>/dev/null
+}
+
+# pick_install_target：未指定 gs_install_target 时，挑第一块 U 盘分区
+pick_install_target() {
+	_t=$(list_usb_parts | head -1)
+	[ -n "$_t" ] && { echo "$_t"; return 0; }
+	return 1
+}
+
+install_fail() {
+	say "!! 安装失败：$*"
+	say "   日志: $LOG"
+	case "$INSTALL_ONFAIL" in
+		halt)
+			say "   gs_install_onfail=halt → 关机（不断电，可重上电再试）"
+			sync; poweroff -f
+			;;
+		reboot)
+			say "   gs_install_onfail=reboot → 重启"
+			sync; reboot -f
+			;;
+		fail)
+			# 明确"失败即停"：不重启、不进救援，直接让 PID 1 退出。
+			# 只用于自动化/产线确认失败语义；普通使用应留 rescue 兜底。
+			say "   gs_install_onfail=fail → 不做任何恢复动作，进程退出"
+			exit 1
+			;;
+		*)
+			say "   gs_install_onfail=rescue → 进入救援 shell（可手工重试）"
+			;;
+	esac
+	return 1
+}
+
+install_from_net() {
+	say "③ 网络安装模式（download → verify → write → reboot）"
+	say "   URL    : ${INSTALL_URL:-（未设置）}"
+	say "   期望哈希: ${INSTALL_SHA256:-（未设置）}"
+	say "   目标    : ${INSTALL_TARGET:-（自动挑第一块 USB 分区）}"
+
+	if [ -n "$INSTALL_CMD" ]; then
+		# 注意：内核 cmdline **没有引号语义**——`gs_install_cmd="a b"` 会被
+		# 空格切成两个 token，脚本只能拿到第一个词。所以两条可用路径：
+		#   ① 单 token 命令（无空格）：gs_install_cmd=/bin/my-installer
+		#   ② 放到 U 盘/镜像里的脚本，用 gs_install_cmd=/mnt/x/install.sh
+		# 需要参数的复杂命令请写进脚本文件，而不是塞进 bootargs。
+		say "  使用自定义安装命令 gs_install_cmd: $INSTALL_CMD"
+		net_up || say "  ! 网络未就绪，仍按 gs_install_cmd 执行（命令可能自带网络配置）"
+		case "$INSTALL_CMD" in
+			*" "*)
+				# 含空格：cmdline 只会传出第一段，后面已丢失 —— 明确告知，
+				# 不假装执行了一个残缺命令。
+				say "  ! gs_install_cmd 含空格（内核 cmdline 无引号语义，参数已丢失）"
+				say "  ! 请把命令写进脚本文件，再 gs_install_cmd=<脚本绝对路径>"
+				install_fail "gs_install_cmd 无法表达带空格的命令"
+				return 1
+				;;
+		esac
+		if [ -x "$INSTALL_CMD" ]; then
+			"$INSTALL_CMD"
+		else
+			command -v "$INSTALL_CMD" >/dev/null 2>&1 || {
+				install_fail "gs_install_cmd 找不到可执行文件: $INSTALL_CMD"
+				return 1
+			}
+			"$INSTALL_CMD"
+		fi
+		_rc=$?
+		[ "$_rc" = 0 ] || { install_fail "gs_install_cmd 退出码 $_rc"; return 1; }
+		say "  自定义安装命令成功"
+		[ "$INSTALL_REBOOT" = 0 ] || { sync; say "  reboot -f"; reboot -f; }
+		return 0
+	fi
+
+	[ -n "$INSTALL_URL" ] || { install_fail "未设置 gs_install_url"; return 1; }
+
+	# --- 3a. 起网 -------------------------------------------------------
+	if ! net_up; then
+		install_fail "网络未就绪（无网卡或驱动未加载）"
+		return 1
+	fi
+
+	# --- 3b. 下载 -------------------------------------------------------
+	say "  下载镜像 ..."
+	rm -f "$INSTALL_FILE"
+	if ! download "$INSTALL_URL" "$INSTALL_FILE"; then
+		install_fail "下载失败: $INSTALL_URL"
+		return 1
+	fi
+	[ -s "$INSTALL_FILE" ] || { install_fail "下载结果为空文件"; return 1; }
+	_sz=$(wc -c <"$INSTALL_FILE" 2>/dev/null)
+	say "  下载完成: $_sz B"
+
+	# --- 3c. 校验 -------------------------------------------------------
+	if [ -n "$INSTALL_SHA256" ]; then
+		_actual=$(sha256_of "$INSTALL_FILE")
+		if [ "$_actual" != "$INSTALL_SHA256" ]; then
+			install_fail "SHA-256 不符（期望 $INSTALL_SHA256 / 实际 ${_actual:-计算失败}）"
+			return 1
+		fi
+		say "  SHA-256 校验通过: $_actual"
+	elif [ "$INSTALL_NOVERIFY" = 1 ]; then
+		say "  !!! 警告：gs_install_noverify=1，跳过完整性校验（镜像来源不可信时勿用）"
+	else
+		install_fail "未设置 gs_install_sha256（如确认要跳过校验，加 gs_install_noverify=1）"
+		return 1
+	fi
+
+	# --- 3d. 目标 -------------------------------------------------------
+	_tgt=$INSTALL_TARGET
+	if [ -z "$_tgt" ]; then
+		_tgt=$(pick_install_target) || { install_fail "未找到可写目标分区"; return 1; }
+		say "  自动选择目标: $_tgt"
+	fi
+	if [ ! -b "$_tgt" ] && [ ! -f "$_tgt" ]; then
+		install_fail "目标不存在或不是块设备: $_tgt"
+		return 1
+	fi
+	if target_is_mounted "$_tgt"; then
+		say "  $_tgt 已挂载，尝试卸载"
+		umount "$_tgt" 2>/dev/null || { install_fail "目标已挂载且卸载失败: $_tgt"; return 1; }
+	fi
+
+	# --- 3e. 写入 -------------------------------------------------------
+	say "  写入 $_tgt （$_sz B）..."
+	if ! dd if="$INSTALL_FILE" of="$_tgt" bs=1M 2>>"$LOG"; then
+		install_fail "dd 写入失败: $_tgt"
+		return 1
+	fi
+	sync
+	say "  写入完成"
+
+	# --- 3f. 读回校验（块设备才做；file:// 目标自身就是源文件的场景跳过）----
+	if [ "$INSTALL_READBACK" != 0 ] && [ -b "$_tgt" ] && [ -n "$INSTALL_SHA256" ]; then
+		_bs=512
+		_cnt=$(( (_sz + _bs - 1) / _bs ))
+		say "  读回校验（dd count=$_cnt）..."
+		_rb=$(dd if="$_tgt" bs=$_bs count="$_cnt" 2>/dev/null | sha256sum | cut -d' ' -f1)
+		if [ "$_rb" != "$INSTALL_SHA256" ]; then
+			install_fail "读回 SHA-256 不符（写入 ${_actual:-?} / 读回 ${_rb:-?}）"
+			return 1
+		fi
+		say "  读回校验通过"
+	fi
+
+	# --- 3g. 重启 -------------------------------------------------------
+	rm -f "$INSTALL_FILE"
+	if [ "$INSTALL_REBOOT" = 0 ]; then
+		say "  安装成功（gs_install_reboot=0，不重启）"
+		return 0
+	fi
+	say "★ 安装成功，reboot -f 重启进入新系统"
+	sync
+	reboot -f
+	return 0
+}
+
+# ------------------------------------------- ④ initramfs 驻留救援兜底 ------
+rescue_shell() {
+	say "④ initramfs 驻留救援模式（回落2：保底，内核能起就有 shell）"
+
+	net_up || say "  ! 网络不可用（仅剩串口 shell；如已插 U 盘可手工 switch_root）"
+
+	# telnetd（busybox 内置；救援口令 = root/<RESCUE_PW>）
+	# -f = issue/banner 文件；-F = 前台跑（/init 是 PID 1，不能让它 daemon 后变孤儿）
+	if [ -x /bin/telnetd ] || command -v telnetd >/dev/null 2>&1; then
+		say "  启动 telnetd :${RESCUE_PORT}（用户 root，口令见 /etc/shadow）"
+		telnetd -p "${RESCUE_PORT}" -f /etc/banner -F 2>/dev/null &
+		_TELNETD_PID=$!
+		sleep 1
+		kill -0 "$_TELNETD_PID" 2>/dev/null \
+			|| say "  telnetd 启动失败（仅剩串口 shell）"
+	else
+		say "  initramfs 内无 telnetd，仅剩串口 shell"
+	fi
+
+	say "  提示：本机日志 $LOG；插好 U 盘后可用"
+	say "        mkdir -p /mnt && mount -t squashfs /dev/sda1 /mnt && switch_root /mnt /sbin/init"
+
+	# 串口 shell（pid1 不能退出；Ctrl-D 也重开）
+	while :; do
+		/bin/sh -i </dev/console >/dev/console 2>&1
+		say "shell 退出，1s 后重开"
+		sleep 1
+	done
+}
+
+# ============================================================== 主流程 ======
+# 强制模式失败一律落到救援 shell（而非 exit → PID1 退出 → panic → 无限重启）。
+_forced_fail() {
+	say "!! gs_boot=$BOOT_MODE 为强制模式，本分支失败；进入救援 shell（不重启循环）"
+}
+
+case "$BOOT_MODE" in
+usb)
+	wait_for_usb
+	boot_from_usb && exit 0
+	_forced_fail
+	;;
+nand)
+	boot_from_onboard && exit 0
+	_forced_fail
+	;;
+install)
+	install_from_net && [ "$INSTALL_REBOOT" = 0 ] && exit 0
+	[ "$INSTALL_ONFAIL" = rescue ] || exit 1
+	;;
+rescue)
+	;;
+auto)
+	wait_for_usb
+	boot_from_usb && exit 0
+	boot_from_onboard && exit 0
+	if [ -n "$INSTALL_URL" ] || [ -n "$INSTALL_CMD" ]; then
+		install_from_net && [ "$INSTALL_REBOOT" = 0 ] && exit 0
+	fi
+	;;
+esac
+
+rescue_shell
+exit 0

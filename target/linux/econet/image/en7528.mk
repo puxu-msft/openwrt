@@ -64,6 +64,14 @@ TARGET_DEVICES += jiofiber_jcow407
 #  - 镜像写到 tclinux 分区（24MB）：HDR2 头 + kernel(LZMA, 垫 4MB) + rootfs(squashfs)
 #  - WiFi: MT7603E(2.4G) + MT7663E(5G) 均 PCIe
 #  - mtd8(java) 严禁触碰 = CoAP RCE 回退通道
+#
+# [v2] 两种镜像（USB-BOOT-PLAN.md §0）：
+#   tclinux.trx                    —— 常规镜像（kernel + squashfs rootfs 段）
+#   tclinux-usbboot-initramfs.trx  —— U 盘优先引导内核：kernel 段里内嵌 initramfs
+#                                     （/init 探测脚本：U盘→板载→驻留救援），
+#                                     **无 rootfs 段**（rootfs 运行期才定）。
+#                                     内核由 CONFIG_EXTERNAL_CPIO 指定，
+#                                     见 target/linux/econet/image/usbboot-initramfs.sh
 define Device/chinamobile_gs2107
 	DEVICE_VENDOR := ChinaMobile
 	DEVICE_MODEL := GS2107
@@ -71,9 +79,10 @@ define Device/chinamobile_gs2107
 	TRX_LOADADDR := 0x80002000
 	TRX_MODEL := GS2107
 	KERNEL := kernel-bin | append-dtb | tclinux-free-bootbase-jump | lzma
-	KERNEL_INITRAMFS := kernel-bin | append-dtb
-	IMAGES := tclinux.trx
+	KERNEL_INITRAMFS := kernel-bin | append-dtb | tclinux-free-bootbase-jump | lzma
+	IMAGES := tclinux.trx tclinux-usbboot-initramfs.trx
 	IMAGE/tclinux.trx := append-kernel | tclinux-hdr2-trx
+	IMAGE/tclinux-usbboot-initramfs.trx := tclinux-hdr2-initramfs-trx
 	DEVICE_PACKAGES := kmod-usb2 kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap
 endef
 TARGET_DEVICES += chinamobile_gs2107
