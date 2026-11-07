@@ -1461,12 +1461,14 @@ config BUSYBOX_DEFAULT_MODPROBE_SMALL
 config BUSYBOX_DEFAULT_DEPMOD
 	bool
 	default n
+# GS2107 引导/救援 initramfs 需要在起网前加载 econet-eth.ko（该驱动是模块、
+# 不在内核内建里），故开 insmod/lsmod。体积约 24KB，见 usbboot-initramfs.sh。
 config BUSYBOX_DEFAULT_INSMOD
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_LSMOD
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_LSMOD_PRETTY_2_6_OUTPUT
 	bool
 	default n
@@ -2626,24 +2628,30 @@ config BUSYBOX_DEFAULT_FEATURE_TELNET_AUTOLOGIN
 config BUSYBOX_DEFAULT_FEATURE_TELNET_WIDTH
 	bool
 	default n
+# GS2107 USB-boot 引导内核的 initramfs 救援兜底需要 telnetd：
+# mtd4 的 HDR2 kernel 段被 tclinux-hdr2.py 垫到 4MB，initramfs 里
+# 放不下 dropbear(269KB)+libgcc(131KB)；telnetd 只占 busybox 内部 ~13KB。
+# 见 target/linux/econet/other-files/gs2107-usbboot-init 的回落2。
 config BUSYBOX_DEFAULT_TELNETD
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_TELNETD_SELFTEST_DEBUG
 	bool
 	default n
 config BUSYBOX_DEFAULT_FEATURE_TELNETD_STANDALONE
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_TELNETD_PORT_DEFAULT
 	int
 	default 23
 config BUSYBOX_DEFAULT_FEATURE_TELNETD_INETD_WAIT
 	bool
 	default n
+# GS2107 网络安装的第二条下载通道（tftp:// 源，如 dnsmasq --enable-tftp）。
+# 与 wget 并存：http 走 wget，tftp 走本 applet，见 /init 的 download()。
 config BUSYBOX_DEFAULT_TFTP
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_TFTP_PROGRESS_BAR
 	bool
 	default n
@@ -2655,7 +2663,7 @@ config BUSYBOX_DEFAULT_TFTPD
 	default n
 config BUSYBOX_DEFAULT_FEATURE_TFTP_GET
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_TFTP_PUT
 	bool
 	default n
@@ -2689,9 +2697,13 @@ config BUSYBOX_DEFAULT_FEATURE_TUNCTL_UG
 config BUSYBOX_DEFAULT_VCONFIG
 	bool
 	default n
+# GS2107 救援/网络安装模式（gs_boot=install）的下载工具：busybox wget 是唯一
+# 能在 4MB/5MB kernel 段预算内提供 HTTP 下载的选择（curl ~200KB 不可行）。
+# 只开 http/ftp + timeout；HTTPS 需要 TLS 库，体积不允许（用 http:// 或 tftp://）。
+# 见 target/linux/econet/other-files/gs2107-usbboot-init 的 download()。
 config BUSYBOX_DEFAULT_WGET
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_WGET_LONG_OPTIONS
 	bool
 	default n
@@ -2700,13 +2712,13 @@ config BUSYBOX_DEFAULT_FEATURE_WGET_STATUSBAR
 	default n
 config BUSYBOX_DEFAULT_FEATURE_WGET_FTP
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_WGET_AUTHENTICATION
 	bool
 	default n
 config BUSYBOX_DEFAULT_FEATURE_WGET_TIMEOUT
 	bool
-	default n
+	default y
 config BUSYBOX_DEFAULT_FEATURE_WGET_HTTPS
 	bool
 	default n

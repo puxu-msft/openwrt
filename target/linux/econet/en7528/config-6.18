@@ -266,3 +266,41 @@ CONFIG_ZLIB_INFLATE=y
 CONFIG_ZSTD_COMMON=y
 CONFIG_ZSTD_COMPRESS=y
 CONFIG_ZSTD_DECOMPRESS=y
+
+# ---------------------------------------------------------------------------
+# GS2107 "U 盘优先启动" 引导内核内置项（2026-11-07，USB-BOOT-PLAN.md §0/§3.1）
+# 该内核与 initramfs 一起刷进 mtd4，rootfs 由 initramfs /init 在运行期探测，
+# 因此 USB 存储 / 块设备 / ext4 / devtmpfs 必须全部内置（不能依赖模块：
+# 模块在 rootfs 里，而 rootfs 正是我们要找的东西）。
+# ---------------------------------------------------------------------------
+# USB storage（U 盘 rootfs 主路线）
+CONFIG_BLK_DEV_SD=y
+CONFIG_USB_STORAGE=y
+# ext4（U 盘方案A：ext4 目录树；ext2/ext3 也走 ext4 驱动）
+CONFIG_EXT4_FS=y
+# devtmpfs：让 /dev/sda1 自动出现（/init 里另有 /sys mknod 兜底）
+CONFIG_DEVTMPFS=y
+# ---------------------------------------------------------------------------
+# bootargs 双保险：DTS chosen{bootargs} 为主（CONFIG_MIPS_CMDLINE_FROM_DTB=y
+# 在上面已设），这里再兜一层。initramfs 场景 root 由 /init 管，故只给
+# console；root=/dev/sda1 rootwait 作双保险（/init 正常时内核根本不看它）。
+# ---------------------------------------------------------------------------
+CONFIG_CMDLINE_BOOL=y
+CONFIG_CMDLINE="console=ttyS0,115200 root=/dev/sda1 rootwait"
+# CMDLINE_BOOL=y 会让 MIPS_CMDLINE_BUILTIN_EXTEND 变成"可见但无值"的新符号，
+# kconfig syncconfig 会因此进入 "Restart config..." 交互提问（stdin EOF 即失败）。
+# 显式写死它 = n，choice 保持 MIPS_CMDLINE_FROM_DTB：
+#   arch/mips/kernel/setup.c bootcmdline_init() 在 CMDLINE_BOOL=y 且非
+#   BUILTIN_EXTEND 时，把 builtin_cmdline **追加** 到 DTS bootargs 之后——
+#   DTS 与内核 config 两层同时生效（真双保险，不是二选一）。
+# CONFIG_MIPS_CMDLINE_BUILTIN_EXTEND is not set
+# 同上：CMDLINE_BOOL=y 会让 CMDLINE_OVERRIDE 变成"可见但无值"的新符号，
+# 同样必须显式写死 = n（否则 syncconfig 交互提问失败）。
+# CONFIG_CMDLINE_OVERRIDE is not set
+
+# USB storage 的硬依赖：USB_STORAGE / BLK_DEV_SD 都 depends on SCSI
+# （drivers/usb/storage/Kconfig:8、drivers/scsi/Kconfig:82）。
+# 少了 CONFIG_SCSI 时 kconfig 会静默把上面两项丢掉——已实测踩坑：
+# 内核 .config 里 USB_STORAGE/BLK_DEV_SD 整行消失，内核镜像里
+# 搜不到 "usb-storage"/"scsi_mod" 字符串 → U 盘根本不会被识别。
+CONFIG_SCSI=y
