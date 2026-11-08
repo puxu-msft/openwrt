@@ -1,0 +1,25 @@
+#!/bin/sh /etc/rc.common
+# Clear the U-Boot boot counter after a successful OpenWrt boot. The env partition is found by label so the mtd number can move without editing this script.
+START=99
+STOP=10
+
+boot() {
+	sleep 10
+	mtdnum=""
+	while read -r line; do
+		case "$line" in
+			*\"uboot_env\"*)
+				mtdnum=$(printf '%s\n' "$line" | sed -n 's/^mtd\([0-9][0-9]*\):.*/\1/p')
+				;;
+		esac
+	done < /proc/mtd
+	[ -n "$mtdnum" ] || { logger -t gs2107-bootok "uboot_env partition not found"; return 0; }
+	cat > /etc/fw_env.config <<EOF
+/dev/mtd$mtdnum 0x0 0x20000 0x20000
+/dev/mtd$mtdnum 0x20000 0x20000 0x20000
+EOF
+	/usr/sbin/fw_setenv bootcount 0
+	/usr/sbin/fw_setenv recovery 0
+	/usr/sbin/fw_setenv bootok 1
+	logger -t gs2107-bootok "bootcount cleared (mtd$mtdnum)"
+}

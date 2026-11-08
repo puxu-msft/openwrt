@@ -1,0 +1,20 @@
+#!/bin/sh
+# Small UART-free recovery helper for GS2107 single-slot U-Boot. 'reboot' asks U-Boot to enter its network recovery loop on the next boot.
+case "$1" in
+	reboot)
+		/usr/sbin/fw_setenv recovery 1
+		sync
+		reboot
+		;;
+	clear)
+		/usr/sbin/fw_setenv recovery 0
+		/usr/sbin/fw_setenv bootcount 0
+		;;
+	status)
+		/usr/sbin/fw_printenv recovery bootcount bootok 2>/dev/null
+		;;
+	*)
+		echo "usage: $0 reboot|clear|status" >&2
+		exit 1
+		;;
+esac

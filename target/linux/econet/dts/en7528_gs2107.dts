@@ -48,18 +48,30 @@
 	chosen {
 		stdout-path = "/serial@1fbf0000:115200";
 		/*
-		 * [v2 改] initramfs 引导内核：root 由 initramfs /init 在运行期探测
-		 * （U盘优先 → 板载回落 → 驻留救援），见 devices/gs2107/USB-BOOT-PLAN.md §0
-		 * 与 target/linux/econet/other-files/gs2107-usbboot-init。
-		 * bootargs 因此最简化：只要 console；root= 仅作双保险——
-		 * /init 正常驻留（永不退出）时内核根本不会去挂 root=。
+		 * [v4 改·11-09] ★ 删掉 init=/etc/preinit 与 PREINIT=1 —— 这两个参数
+		 * 是 11-08 那次 "Attempted to kill init! exitcode=0x00000100" 的直接
+		 * 根因。机制（源码实证 openwrt/package/system/procd/src/initd/）：
+		 *   1) /sbin/init(=procd) 的 early_mounts()（early.c:75）负责 mount
+		 *      /proc /sys、**把 /dev 挂 tmpfs 并 mkdev + mknod /dev/null**、
+		 *      /tmp 挂 tmpfs、建 /tmp/run /tmp/lock /tmp/state；
+		 *   2) 随后 preinit()（preinit.c:124）**自己 setenv("PREINIT","1",1)**
+		 *      再 fork /bin/sh /etc/preinit；
+		 *   3) /etc/preinit 第 3 行 [ -z "$PREINIT" ] && exec /sbin/init，
+		 *      PREINIT 已置位故继续跑 do_mount_root → mount_root；
+		 *   4) mount_root.c:48 的 getenv("PREINIT") 检查同样由 procd 保证。
+		 * 即 preinit 与 mount_root 的触发条件 procd 全都自备，cmdline 上
+		 * **不需要也不应该**出现 init= 或 PREINIT=。
 		 *
-		 * [实测根因·历史] free bootbase 给内核的 cmdline 为空（UART 日志
-		 * "Kernel command line:" 后无内容），原厂内核靠 DTS built-in bootargs
-		 * 启动；OpenWrt 镜像此前缺 bootargs → panic
-		 * "Unable to mount root fs on unknown-block(0,0)"。
+		 * 一旦写了 init=/etc/preinit，preinit 被提成 1 号进程、early_mounts()
+		 * 整段跳过 → /dev/null 不存在、根分区只读 → diag.sh:50 "can't create
+		 * /dev/null"、preinit "can't open /dev/null" → 退出 1 → 内核 panic。
+		 * 11-09 实测 boot log 完整记录该链。
+		 *
+		 * root= 仍须显式给：DTB bootargs 与 CONFIG_CMDLINE 会被内核拼接
+		 * （boot log 里同一条出现两次即此故），两处必须写同一组值，
+		 * 详见 en7528/config-6.18 同值注释。
 		 */
-		bootargs = "console=ttyS0,115200 root=/dev/sda1 rootwait";
+		bootargs = "console=ttyS0,115200 root=/dev/mtdblock4 rootfstype=squashfs rootwait";
 		/*
 		 * free-bootbase：镜像解压占物理 0x2000-0x20000，vmlinuz 落在
 		 * 0x80020000。usable 从 0x20000 起（与 JioFiber 一致），尾部留 128KB。
@@ -184,9 +196,26 @@
 		#size-cells = <1>;
 
 		/*
-		 * 分区表与 /proc/mtd 实测完全一致（含非 128K 对齐的怪尺寸，
-		 * 如 kernel 0x3eb941 = HDR2 镜像实际长度）——保证 bootloader 视图
-		 * 与内核视图一致。地址为 BMT 逻辑空间。
+		 * [11-08 重划 v5] 全 128KB 块对齐、无重叠视图。
+		 *
+		 * 设计前提（用户 11-08 定稿）：
+		 *   - squashfs 只读根 + UBIFS overlay；支持 ext4/vfat/exfat，**不支持 btrfs**
+		 *     （btrfs 面向有 FTL 的块设备；裸 NAND 上无磨损均衡/坏块管理，COW 写放大
+		 *      直接烧 NAND，且 btrfs.ko 一个就 1.6MB）
+		 *   - **不死 u-boot 链路**：内置 bootbase(mtd0) → 不死 u-boot(mtd2) →
+		 *     kernel(mtd3) → rootfs(mtd4)，从而实现 uart-free 管理。
+		 *     bootbase 固定从 0x80000 读 HDR2，故 4MB uboot 槽必须落在 0x80000。
+		 *     现阶段该槽放一个最简链式跳转 stub（tools/cross/uboot_stub.c）：
+		 *     bootbase 解压它 → 它把 0x480000 的内核搬到 RAM 0x80020000 → 跳过去。
+		 *   - **不保留原厂 A/B backup 与 java**（无 Android 了）。原厂 11 个分区已
+		 *     全量 dump 到 devices/gs2107/firmware/，设备端 SHA256 **8/8 字节级一致**；
+		 *     需要时从 host 备份经串口 console + flash 裸原语重刷即可。
+		 *   - bootloader / romfile / reservearea 三个分区**永不写入**：
+		 *       · bootloader(mtd0)  = tcboot stage1+2，唯一启动入口
+		 *       · romfile(mtd1)     = bootbase 读它（A/B 开关不在这里，见 docs/09）
+		 *       · reservearea(mtd7) = A/B flag 在 +0x200000（芯片偏移 0xDFC0000）
+		 *
+		 * 空间账：0x80000 起共 0xDD40000（221.25MB）= uboot 4M + kernel 8M + rootfs 32M + uboot_env 256K + overlay 177M，严丝合缝到 reservearea 前一刻。
 		 */
 		partition@0 {			/* mtd0 256K */
 			label = "bootloader";
@@ -207,81 +236,75 @@
 			};
 		};
 
-		partition@40000 {		/* mtd1 256K：gzip(tar(ctromfile.cfg))，A/B 槽开关在此 */
+		partition@40000 {			/* mtd1 256K */
 			label = "romfile";
 			reg = <0x00040000 0x00040000>;
 			read-only;
 		};
 
-		partition@80000 {		/* mtd2 3.9M：kernel 主槽（bootloader 固定从这里读） */
-			label = "kernel";
-			reg = <0x00080000 0x003eb941>;
-		};
-
-		partition@46b941 {		/* mtd3 17.6M：rootfs 主槽 */
-			label = "rootfs";
-			reg = <0x0046b941 0x011a0000>;
-			linux,rootfs;
-		};
-
-		partition@160b941 {		/* mtd4 24M：tclinux 整合镜像主槽 */
-			label = "tclinux";
-			reg = <0x0160b941 0x01800000>;
-			econet,enable-remap;
-		};
-
-		/* 嵌套在 tclinux 内（与 DASAN/Jio 同模式）：kernel 段 + rootfs 段 */
-		partition1@160b941 {
-			label = "tclinux_kernel";
-			reg = <0x0160b941 0x00400000>;
-			econet,enable-remap;
+		/*
+		 * uboot：不死 u-boot 槽。bootbase 固定从 0x80000 读 HDR2 并解压到
+		 * 0x80002000，故本槽必须从 0x80000 起。4MB。
+		 * 现居者 = 链式跳转 stub（见上方设计前提）。
+		 */
+		partition@80000 {			/* mtd2 4M */
+			label = "uboot";
+			reg = <0x00080000 0x00400000>;
 		};
 
 		/*
-		 * [实测修正] OpenWrt 整合镜像实际写在 flash 0x80000（mtdwrite 4 =
-		 * 厂商系统 tclinux 主槽起点，bootloader 固定从 0x80000 读 HDR2）。
-		 * tclinux-hdr2.py 把 kernel 段垫到 4MB（0x100 + 0x3FFF00 = 0x400000），
-		 * 故 rootfs 段起始 = 0x80000 + 0x400000 = 0x480000。
-		 * 原 0x1a0b941 是按"镜像写在 0x160b941"的错误假设推出来的，与
-		 * 实际写入位置不符（UART 实测：厂商 /proc/mtd 的 tclinux 在
-		 * [0x80000,0x1880000)，与 kernel/rootfs 槽重叠而非顺序排列）。
-		 * 本分区保持节点顺序第 7 位 → mtd6，bootargs 用 root=/dev/mtdblock6。
+		 * kernel：8MB。LZMA 流约 3.83MB，余 4.17MB 给后续加驱动。
+		 * 由 uboot 槽里的 stub 搬移并跳入，不由 bootbase 直接读。
 		 */
-		rootA: partition@480000 {
-			label = "tclinux_rootfs";
-			reg = <0x0480000 0x01400000>;
+		partition@480000 {			/* mtd3 8M */
+			label = "kernel";
+			reg = <0x0480000 0x00800000>;
 		};
 
-		partition@2e0b941 {		/* mtd5 3.9M：kernel slave 槽 */
-			label = "kernel_slave";
-			reg = <0x02e0b941 0x003eb941>;
+		/*
+		 * rootfs：squashfs 只读根。32MB（当前占用 4.55MB，余 27.45MB）。
+		 * bootargs / CONFIG_CMDLINE：root=/dev/mtdblock4 rootfstype=squashfs
+		 * （mtd4 = 本表第 5 个分区；改表必须同步改 cmdline）。
+		 */
+		partition@c80000 {			/* mtd4 32M */
+			label = "rootfs";
+			reg = <0x0c80000 0x02000000>;
+			linux,rootfs;
 		};
 
-		partition@31f7282 {		/* mtd6 17.6M：rootfs slave 槽 */
-			label = "rootfs_slave";
-			reg = <0x031f7282 0x011a0000>;
+		/* uboot_env: two 128KB redundant U-Boot env copies; rootfs_data: shared UBIFS overlay. */
+		partition@2c80000 {		/* mtd5 256K */
+			label = "uboot_env";
+			reg = <0x02c80000 0x00040000>;
 		};
 
-		partition@4397282 {		/* mtd7 24M：tclinux slave 槽 */
-			label = "tclinux_slave";
-			reg = <0x04397282 0x01800000>;
-			econet,enable-remap;
+		partition@2cc0000 {		/* mtd6 177M */
+			label = "rootfs_data";
+			reg = <0x02cc0000 0x0b100000>;
+			/*
+			 * overlay：UBIFS 卷。`linux,ubi` 让内核 ubi_notify_add()
+			 * 在注册这个 MTD 分区时自动 ubiattach，否则要用户在
+			 * preinit 里手工 ubiattach + ubimkvol，而 fstools 的
+			 * mount_root 找不到卷就静默退化成 tmpfs overlay
+			 * （配置重启即丢）。卷本身在首次安装时用 ubiformat +
+			 * ubimkvol 建好，之后由内核每次启动自动 attach。
+			 */
+			compatible = "linux,ubi";
+
+			volumes {
+				ubi-volume-rootfs-data {
+					volname = "rootfs_data";
+				};
+			};
 		};
 
-		partition@5b97282 {		/* mtd8 34M：java/JRE —— 严禁触碰（CoAP RCE 回退通道） */
-			label = "java";
-			reg = <0x05b97282 0x02200000>;
-			read-only;
-		};
-
-		partition@7d97282 {		/* mtd9 96M：原 yaffs(/usr/osgi) → OpenWrt 读写区 */
-			label = "rwfs";
-			reg = <0x07d97282 0x06000000>;
-		};
-
-		partition@dd97282 {		/* mtd10 2.25M：reservearea（bootloader 会写状态） */
+		/*
+		 * reservearea：A/B flag 在 +0x200000（芯片偏移 0xDFC0000，单字节 ASCII
+		 * '0'=主 / '1'=slave）。bootbase 每轮启动都会写它——永不写入。
+		 */
+		partition@ddc0000 {		/* mtd7 2.25M */
 			label = "reservearea";
-			reg = <0x0dd97282 0x00240000>;
+			reg = <0x0ddc0000 0x00240000>;
 			read-only;
 		};
 	};

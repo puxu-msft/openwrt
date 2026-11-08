@@ -83,6 +83,12 @@ define Device/chinamobile_gs2107
 	IMAGES := tclinux.trx tclinux-usbboot-initramfs.trx
 	IMAGE/tclinux.trx := append-kernel | tclinux-hdr2-trx
 	IMAGE/tclinux-usbboot-initramfs.trx := tclinux-hdr2-initramfs-trx
-	DEVICE_PACKAGES := kmod-usb2 kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap
+	# ★ 11-08 加 block-mount：没有它 rootfs 里就没有 `block` 命令、也没有
+	#   /etc/config/fstab，fstools 的 mount_root 找不到 rootfs_data 分区 →
+	#   退回 tmpfs overlay（/tmp/root），配置每次重启全丢。
+	#   DTS 里 rootfs_data（mtd7 @0x980000，15MB）和内核 CONFIG_MTD_UBI=y
+	#   都已就位，缺的只是用户态这一环。
+	DEVICE_PACKAGES := kmod-usb2 kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap \
+		block-mount uboot-envtools
 endef
 TARGET_DEVICES += chinamobile_gs2107
