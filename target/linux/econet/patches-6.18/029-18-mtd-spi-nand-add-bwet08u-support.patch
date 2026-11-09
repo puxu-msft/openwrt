@@ -1,0 +1,176 @@
+Subject: [PATCH] mtd: spi-nand: add support for the BWET08U (0xBC/0xB2) SPI NAND
+
+The ChinaMobile GS2107 (EcoNet EN7528) uses a 256MB SPI NAND that the stock
+3.18 kernel identifies as _SPI_NAND_DEVICE_ID_BWET08U (manufacturer 0xBC,
+device 0xB2). The generic spi-nand core has no entry for manufacturer 0xBC,
+so even with a working low-level driver the probe fails at the ID match
+stage ("unknown raw ID").
+
+All parameters were reverse-engineered from the stock kernel's NAND table
+(scan_spi_nand_table@0x802cfa50, entry 43) and are documented with evidence
+levels in devices/gs2107/docs/11-NAND-ROOTCAUSE.md §12:
+- geometry: 2048B pages, 64 pages/block, 2048 blocks/LUN, SLC, OOB 64
+- on-die ECC enabled via SET_FEATURE(0xB0, bit4) in configure_chip
+- block unlock via SET_FEATURE(0xA0, & ~0x38)
+- ID read method OPCODE_ADDR (the clean ID read on this board)
+
+ECC strength/step and the exact OOB ECC byte layout are placeholders
+pending datasheet confirmation (docs/11 §12.8).
+
+--- /dev/null	2026-11-04 21:30:38.310994673 +0800
++++ b/drivers/mtd/nand/spi/bwet.c	2026-11-08 07:31:56.948964209 +0800
+@@ -0,0 +1,128 @@
++// SPDX-License-Identifier: GPL-2.0
++/*
++ * Support for the SPI NAND found in the ChinaMobile GS2107 (EcoNet EN7528),
++ * identified by the stock 3.18 kernel as _SPI_NAND_DEVICE_ID_BWET08U
++ * (manufacturer 0xBC, device 0xB2, 256MB, SLC, on-die ECC).
++ *
++ * All parameters were reverse-engineered from the stock kernel's NAND table
++ * (scan_spi_nand_table@0x802cfa50, entry 43 @0x807ef304) and are documented
++ * with evidence levels in devices/gs2107/docs/11-NAND-ROOTCAUSE.md §12.
++ */
++
++#include <linux/device.h>
++#include <linux/kernel.h>
++#include <linux/mtd/spinand.h>
++
++#define SPINAND_MFR_BWET			0xbc
++
++/* Feature registers and bitfields (vendor init sequence, docs/11 §12) */
++#define BWET_FR_BLOCK_LOCK			0xa0
++#define BWET_FR_BLOCK_LOCK_UNLOCK_MASK		0x38
++#define BWET_FR_ECC				0xb0
++#define BWET_FR_ECC_ON_DIE			BIT(4)
++
++static SPINAND_OP_VARIANTS(read_cache_variants,
++		SPINAND_PAGE_READ_FROM_CACHE_1S_1S_1S_OP(0, 1, NULL, 0, 0),
++		SPINAND_PAGE_READ_FROM_CACHE_FAST_1S_1S_1S_OP(0, 1, NULL, 0, 0));
++
++static SPINAND_OP_VARIANTS(write_cache_variants,
++		SPINAND_PROG_LOAD_1S_1S_1S_OP(true, 0, NULL, 0));
++
++static SPINAND_OP_VARIANTS(update_cache_variants,
++		SPINAND_PROG_LOAD_1S_1S_1S_OP(false, 0, NULL, 0));
++
++/*
++ * Vendor init order (fixed): on-die ECC (feature 0xB0 bit4) -> unlock all
++ * blocks (feature 0xA0 & ~0x38). The ECC is on-die, so no host-side ECC
++ * engine is needed; the ECC strength/step below are placeholders pending
++ * datasheet confirmation (docs/11 §12.8).
++ */
++static int bwet08u_cfg(struct spinand_device *spinand,
++		       enum spinand_bus_interface iface)
++{
++	u8 val;
++	int ret;
++
++	if (iface != SSDR)
++		return -EOPNOTSUPP;
++
++	ret = spinand_read_reg_op(spinand, BWET_FR_ECC, &val);
++	if (ret)
++		return ret;
++
++	ret = spinand_write_reg_op(spinand, BWET_FR_ECC,
++				   val | BWET_FR_ECC_ON_DIE);
++	if (ret)
++		return ret;
++
++	ret = spinand_read_reg_op(spinand, BWET_FR_BLOCK_LOCK, &val);
++	if (ret)
++		return ret;
++
++	ret = spinand_write_reg_op(spinand, BWET_FR_BLOCK_LOCK,
++				   val & ~BWET_FR_BLOCK_LOCK_UNLOCK_MASK);
++	if (ret)
++		return ret;
++
++	return 0;
++}
++
++/*
++ * OOB layout: 64 bytes (page>>5, the value the stock kernel reports to the
++ * MTD layer -- NOT the 128 "page+spare" field of the vendor table). The ECC
++ * is on-die, so the whole OOB is exposed as free; the exact ECC byte
++ * positions inside the OOB are not known (docs/11 §12.8).
++ */
++static int bwet_ooblayout_ecc(struct mtd_info *mtd, int section,
++			      struct mtd_oob_region *region)
++{
++	return -ERANGE;
++}
++
++static int bwet_ooblayout_free(struct mtd_info *mtd, int section,
++			       struct mtd_oob_region *region)
++{
++	if (section > 0)
++		return -ERANGE;
++
++	region->offset = 0;
++	region->length = 64;
++	return 0;
++}
++
++static const struct mtd_ooblayout_ops bwet_ooblayout = {
++	.ecc = bwet_ooblayout_ecc,
++	.free = bwet_ooblayout_free,
++};
++
++static const struct spinand_info bwet_spinand_table[] = {
++	SPINAND_INFO("BWET08U",
++		     /*
++		      * ID method OPCODE_ADDR: the clean ID read on this board
++		      * is the variant with one address byte after RDID
++		      * (debug boot log: "read 5B: bcb2bcb2bc"); the plain
++		      * variant still returns one residual leading byte.
++		      * devid = 0xB2 only: the manufacturer byte (0xBC) is
++		      * provided by the manufacturer entry below.
++		      */
++		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_ADDR, 0xb2),
++		     NAND_MEMORG(1, 2048, 64, 64, 2048, 20, 1, 1, 1),
++		     NAND_ECCREQ(8, 512),
++		     SPINAND_INFO_OP_VARIANTS(&read_cache_variants,
++					      &write_cache_variants,
++					      &update_cache_variants),
++		     0,
++		     SPINAND_CONFIGURE_CHIP(bwet08u_cfg),
++		     SPINAND_ECCINFO(&bwet_ooblayout, NULL)),
++};
++
++static const struct spinand_manufacturer_ops bwet_spinand_manuf_ops = {
++};
++
++const struct spinand_manufacturer bwet_spinand_manufacturer = {
++	.id = SPINAND_MFR_BWET,
++	.name = "BWET",
++	.chips = bwet_spinand_table,
++	.nchips = ARRAY_SIZE(bwet_spinand_table),
++	.ops = &bwet_spinand_manuf_ops,
++};
+--- a/drivers/mtd/nand/spi/core.c	2026-11-08 07:32:29.958411722 +0800
++++ b/drivers/mtd/nand/spi/core.c	2026-11-08 07:32:29.958617940 +0800
+@@ -1243,9 +1243,12 @@
+ 	.isbad = spinand_isbad,
+ };
+ 
++extern const struct spinand_manufacturer bwet_spinand_manufacturer;
++
+ static const struct spinand_manufacturer *spinand_manufacturers[] = {
+ 	&alliancememory_spinand_manufacturer,
+ 	&ato_spinand_manufacturer,
++	&bwet_spinand_manufacturer,
+ 	&esmt_8c_spinand_manufacturer,
+ 	&esmt_c8_spinand_manufacturer,
+ 	&etron_spinand_manufacturer,
+--- a/drivers/mtd/nand/spi/Makefile	2026-11-08 07:32:29.958708110 +0800
++++ b/drivers/mtd/nand/spi/Makefile	2026-11-08 07:32:29.958782883 +0800
+@@ -1,5 +1,5 @@
+ # SPDX-License-Identifier: GPL-2.0
+ spinand-objs := core.o otp.o
+-spinand-objs += alliancememory.o ato.o esmt.o etron.o fmsh.o foresee.o gigadevice.o heyangtek.o
++spinand-objs += alliancememory.o ato.o bwet.o esmt.o etron.o fmsh.o foresee.o gigadevice.o heyangtek.o
+ spinand-objs += macronix.o micron.o paragon.o skyhigh.o toshiba.o winbond.o xtx.o
+ obj-$(CONFIG_MTD_SPI_NAND) += spinand.o
+-- 
+2.43.0
