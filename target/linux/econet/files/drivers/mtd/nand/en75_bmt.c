@@ -998,6 +998,22 @@ static int try_parse_bmt(struct bmt_table *out, u8 *buf, int len)
 	return 0;
 }
 
+/* The BMT is the authority for which reserve blocks are in use. The OOB
+ * "mapped" marker is vendor-compatible metadata, but it can be lost or
+ * unreadable; relying on it alone lets find_available_block() hand out a
+ * spare that is already mapped to another user block, and the next copy
+ * overwrites that block's data.
+ */
+static bool bmt_has_mapping_to(const struct en75_bmt_m *ctx, u16 block)
+{
+	if (!ctx->bmt.header.version)
+		return false;
+	for (int i = 0; i < ctx->bmt.header.size; i++)
+		if (ctx->bmt.table[i].to == block)
+			return true;
+	return false;
+}
+
 static int r_scan_reserve(struct en75_bmt_m *ctx)
 {
 	u16 total_blks = ctx->mtk->total_blks;
@@ -1044,9 +1060,13 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 		} else if (!try_parse_bbt(&ctx->bbt, data_buf, pg_size, ctx->bbt_table_size)) {
 			pr_info("%s: found BBT in block %d\n", log_pfx, cursor);
 			bif.status = BS_BBT;
-		} else if (!try_parse_bmt(&ctx->bmt, data_buf, pg_size)) {
+		} else if (!ctx->bmt.header.version &&
+			   !try_parse_bmt(&ctx->bmt, data_buf, pg_size)) {
 			pr_info("%s: found BMT in block %d\n", log_pfx, cursor);
 			bif.status = BS_BMT;
+		} else if (bmt_has_mapping_to(ctx, cursor)) {
+			pr_debug("%s: found BMT-mapped block %d\n", log_pfx, cursor);
+			bif.status = BS_MAPPED;
 		} else if (block_is_erased(data_buf, pg_size, fdm, sizeof(fdm))) {
 			pr_debug("%s: found available block %d\n", log_pfx, cursor);
 			bif.status = BS_AVAILABLE;
