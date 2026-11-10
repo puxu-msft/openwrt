@@ -328,3 +328,7 @@ CONFIG_CMDLINE="console=ttyS0,115200 root=/dev/mtdblock4 rootfstype=squashfs roo
 CONFIG_SCSI=y
 # The GS2107 layout declares its own rootfs_data partition; the squashfs splitter would create a second partition with the same name inside rootfs.
 # CONFIG_MTD_SPLIT_SQUASHFS_ROOT is not set
+
+# EN7528 timer-block hardware watchdog (drivers/watchdog/en7528_wdt.c)
+CONFIG_WATCHDOG_CORE=y
+CONFIG_ECONET_EN7528_WDT=y

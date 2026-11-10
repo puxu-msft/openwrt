@@ -1,0 +1,31 @@
+--- a/drivers/watchdog/Kconfig
++++ b/drivers/watchdog/Kconfig
+@@ -2008,6 +2008,18 @@
+ 	help
+ 	  Hardware driver for the Mediatek/Ralink MT7621/8 SoC Watchdog Timer.
+ 
++config ECONET_EN7528_WDT
++	tristate "EcoNet EN7528 hardware watchdog"
++	depends on ECONET
++	select WATCHDOG_CORE
++	help
++	  Hardware watchdog timer found in the EcoNet EN7528 SoC. This
++	  watchdog is a plain 32-bit down-counter exposed through
++	  /dev/watchdog.
++
++	  To compile this driver as a module, choose M here: the module
++	  will be called en7528_wdt.
++
+ config PIC32_WDT
+ 	tristate "Microchip PIC32 hardware watchdog"
+ 	select WATCHDOG_CORE
+--- a/drivers/watchdog/Makefile
++++ b/drivers/watchdog/Makefile
+@@ -182,6 +182,7 @@
+ obj-$(CONFIG_RALINK_WDT) += rt2880_wdt.o
+ obj-$(CONFIG_IMGPDC_WDT) += imgpdc_wdt.o
+ obj-$(CONFIG_MT7621_WDT) += mt7621_wdt.o
++obj-$(CONFIG_ECONET_EN7528_WDT) += en7528_wdt.o
+ obj-$(CONFIG_PIC32_WDT) += pic32-wdt.o
+ obj-$(CONFIG_PIC32_DMT) += pic32-dmt.o
+ obj-$(CONFIG_REALTEK_OTTO_WDT) += realtek_otto_wdt.o
