@@ -31,6 +31,10 @@
 
 	aliases {
 		serial0 = &uart;
+		led-boot = &led_power;
+		led-failsafe = &led_power;
+		led-running = &led_power;
+		led-upgrade = &led_power;
 	};
 
 	memory@0 {
@@ -79,6 +83,44 @@
 		 * 巨型 BSS（约 17.9MB，位于解压区之后）。
 		 */
 		linux,usable-memory-range = <0x00020000 0x1bfe0000>;
+	};
+
+	/*
+	 * 面板灯（2026-11-11 固件分析结论）：
+	 *  - 电源：GPIO8，低电平点亮。tcboot 启动时已把它拉低（实测 GPIO
+	 *    寄存器：OE0 bit8=1、DATA0 bit8=0），所以 OpenWrt 不配也会常亮；
+	 *    这里登记成 LED 设备，统一走 led-boot/led-running。
+	 *  - PON/LOS：原厂 /userfs/led.conf 的 LED 64/65 -> GPIO6、66/67 ->
+	 *    GPIO7（xpon.ko 的 change_alarm_led_status 实测传 0x40..0x43）。
+	 *    注意：本机 GPIO6/7 的 mux 位本来就是 0，寄存器级实测可正常拉低/
+	 *    拉高，但面板没有反应；这两颗灯很可能挂在 EN7571 PON PHY 的 LED
+	 *    控制器上，只有 PON 驱动初始化后才可用。这里保留节点，等 PON 侧
+	 *    有能力时直接接管，不让 GPIO 悬空。
+	 *  - 网络：原厂 led.conf 的 INTERNET 行全为 0，xpon/tcledctrl 没有给出
+	 *    任何 GPIO；没有可写的硬件映射，暂不建节点。
+	 *  - 无线：MT7603E/MT7663E 自己的 LED 引脚，驱动已注册
+	 *    /sys/class/leds/mt76-phy0|phy1，默认触发器 phy0tpt/phy1tpt。
+	 */
+	leds {
+		compatible = "gpio-leds";
+
+		led_power: power {
+			label = "green:power";
+			gpios = <&pinctrl 8 GPIO_ACTIVE_LOW>;
+			default-state = "on";
+		};
+
+		led_pon: pon {
+			label = "green:pon";
+			gpios = <&pinctrl 6 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
+
+		led_los: los {
+			label = "red:los";
+			gpios = <&pinctrl 7 GPIO_ACTIVE_LOW>;
+			default-state = "off";
+		};
 	};
 };
 
@@ -284,6 +326,99 @@
 
 &gsw_port4 {
 	label = "lan4";
+	status = "okay";
+};
+
+/*
+ * LAN1-4 面板灯：EN7528 的 GSW PHY LED1 通过 GPIO31/33/35/37 的
+ * LAN0..3_LED1 复用功能引出。tcboot 启动时已经把 0x1fa2015c 的
+ * bit5/7/9/11 置位（实测该寄存器 = 0x2aa0），并把 0x1fa201b0/1b4
+ * 的映射写成 0x43210；这里用 pinctrl 状态把同一组 mux 再声明一次，
+ * 让 mtk-ge-soc 的 "gbe-led" 路径在 probe 时显式选中它。
+ */
+&pinctrl {
+	gswp1_led1_pins: gswp1-led1-pins {
+		mux {
+			function = "phy1_led1";
+			groups = "gpio31";
+		};
+	};
+
+	gswp2_led1_pins: gswp2-led1-pins {
+		mux {
+			function = "phy2_led1";
+			groups = "gpio33";
+		};
+	};
+
+	gswp3_led1_pins: gswp3-led1-pins {
+		mux {
+			function = "phy3_led1";
+			groups = "gpio35";
+		};
+	};
+
+	gswp4_led1_pins: gswp4-led1-pins {
+		mux {
+			function = "phy4_led1";
+			groups = "gpio37";
+		};
+	};
+};
+
+&gsw_phy1 {
+	pinctrl-names = "gbe-led";
+	pinctrl-0 = <&gswp1_led1_pins>;
+};
+
+&gsw_phy2 {
+	pinctrl-names = "gbe-led";
+	pinctrl-0 = <&gswp2_led1_pins>;
+};
+
+&gsw_phy3 {
+	pinctrl-names = "gbe-led";
+	pinctrl-0 = <&gswp3_led1_pins>;
+};
+
+&gsw_phy4 {
+	pinctrl-names = "gbe-led";
+	pinctrl-0 = <&gswp4_led1_pins>;
+};
+
+&gsw_phy1_led1 {
+	color = <LED_COLOR_ID_GREEN>;
+	function = LED_FUNCTION_LAN;
+	function-enumerator = <1>;
+	linux,default-trigger = "netdev";
+	active-low;
+	status = "okay";
+};
+
+&gsw_phy2_led1 {
+	color = <LED_COLOR_ID_GREEN>;
+	function = LED_FUNCTION_LAN;
+	function-enumerator = <2>;
+	linux,default-trigger = "netdev";
+	active-low;
+	status = "okay";
+};
+
+&gsw_phy3_led1 {
+	color = <LED_COLOR_ID_GREEN>;
+	function = LED_FUNCTION_LAN;
+	function-enumerator = <3>;
+	linux,default-trigger = "netdev";
+	active-low;
+	status = "okay";
+};
+
+&gsw_phy4_led1 {
+	color = <LED_COLOR_ID_GREEN>;
+	function = LED_FUNCTION_LAN;
+	function-enumerator = <4>;
+	linux,default-trigger = "netdev";
+	active-low;
 	status = "okay";
 };
 
