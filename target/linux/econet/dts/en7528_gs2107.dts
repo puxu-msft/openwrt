@@ -283,7 +283,82 @@
 		/* [11-08 硬编码] 同 slot0：基址+index3 → …a3 */
 		mac-address = [b4 ba 12 5c 41 a3];
 		ieee80211-freq-limit = <2400000 2500000>;
-		/* TODO(EEPROM): 2.4G eeprom 512B（/etc/RT30xxEEPROM.bin，魔数 0x7592） */
+		/*
+		 * [11-11 2.4G 校准] 原厂运行期 eeprom（512B，magic 0x7592）载荷；
+		 * mt76 MT7603 要求 0x000 = 0x7603/0x7628/0x7600，故把首 2B
+		 * 规范为 0x7603，并按 MT7603_EEPROM_SIZE=1024 补零到 1024B。
+		 * 源：firmware/runtime-config/tmp/etc/RT30xxEEPROM.bin
+		 * 源 sha256 e8fd5884cfabfb5d2d4cfaa927307d6cb6317da7372c2493045865dd5a0e38b8
+		 * 转换后 1024B sha256 49010abcada5a92e42f1a0aeb782e6ff6060c71d066b1ee3ae282319627b50a9
+		 * 所有 mt7603 消费字段 <0x13e，上半 512B 不被读取；DT
+		 * mac-address 仍覆盖 eeprom 内 MAC（00:0c:43:26:60:40）。
+		 */
+		mediatek,eeprom-data = [
+			03 76 0f 00 00 0c 43 26 60 40 03 76 c3 14 ff ff
+			ff ff 03 76 c3 14 00 00 00 00 00 00 00 00 00 00
+			00 00 b0 07 80 00 60 7f fd 9b ff ff ff ff ff ff
+			ff ff ff ff 22 34 00 20 ff ff 00 01 00 00 00 00
+			00 00 22 00 00 00 00 00 00 00 00 00 00 00 e0 01
+			81 00 00 94 40 b8 40 c8 20 c1 c1 c1 40 c8 20 c2
+			c1 c1 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			c6 c6 c4 c4 c4 c0 c0 c4 c4 c4 c4 c0 c0 c0 00 00
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			05 00 00 00 ac 80 82 88 00 00 00 00 00 00 00 00
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 ff 20
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff ff
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
+		];
 	};
 };
 
