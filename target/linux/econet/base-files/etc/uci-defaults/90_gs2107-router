@@ -1,0 +1,32 @@
+. /lib/functions.sh
+
+case "$(board_name)" in
+chinamobile,gs2107)
+	# The marker holds the version of these defaults already applied: sysupgrade keeps /etc/config/system, so a later image only adds what a newer version introduces and never re-adds an option the user removed (LuCI disables flow offloading by deleting the option).
+	# Without a marker (first image carrying these defaults, or a config from before them) a removed option cannot be told from one never set, so version 1 sets any of its options that are absent.
+	applied="$(uci -q get system.@system[0].gs2107_router_defaults)"
+	applied="${applied:-0}"
+
+	if [ "$applied" -lt 1 ]; then
+		# econet-eth has one interrupt line per QDMA and feeds a DSA conduit: packet steering mode 2 spreads RPS over every CPU by flow, while the default mode cannot see the MIPS GIC interrupts or the qdma NAPI threads here and steers all eth0 receive work to a single CPU.
+		uci -q get network.globals.packet_steering >/dev/null ||
+			uci set network.globals.packet_steering='2'
+		# Software flow offloading: established flows skip the forward path.
+		uci -q get firewall.@defaults[0].flow_offloading >/dev/null ||
+			uci set firewall.@defaults[0].flow_offloading='1'
+	fi
+
+	if [ "$applied" -lt 2 ]; then
+		# Wi-Fi APs join br-lan after the firewall starts; the "phy*" prefix hooks them into the flowtable when they appear (firewall4 package patch 100).
+		uci -q get firewall.@defaults[0].flow_offloading_devices >/dev/null ||
+			uci add_list firewall.@defaults[0].flow_offloading_devices='phy*'
+	fi
+
+	uci set system.@system[0].gs2107_router_defaults='2'
+	uci commit network
+	uci commit firewall
+	uci commit system
+	;;
+esac
+
+exit 0
