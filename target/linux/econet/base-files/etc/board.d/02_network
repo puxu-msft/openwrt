@@ -37,6 +37,10 @@ econet_setup_macs()
 	local label_mac=""
 
 	case "$board" in
+	chinamobile,gs2107)
+		# Base MAC = gmac0 mac-address in the DTS, read from the device tree because board.d runs in preinit, before the econet-eth module creates eth0; WiFi uses +2/+3. Without its own address the WAN port inherits eth0's, the same as br-lan.
+		wan_mac="$(macaddr_add "$(get_mac_binary /sys/firmware/devicetree/base/ethernet@1fb50000/mac@0/mac-address 0)" 1)"
+		;;
 	chinamobile,gs3101)
 		wan_mac="$(get_mac_gs3101)"
 		[ -n "$wan_mac" ] && lan_mac="$(macaddr_add $wan_mac 1)"

@@ -379,11 +379,7 @@
 	status = "okay";
 };
 
-/*
- * TODO(拆机/实测): WAN 口归属。ROMFILE 的 ONU 画像报 GEPortNum=1 + FEPortNum=3
- * （1GE WAN + 3FE LAN），OMCI 报 4 桥端口，但 GSW 四口同构。
- * 先全按 lan1-4 配（与 en7528_generic 一致），拆机看丝印/实测 VLAN 后再定 WAN。
- */
+/* 四口同构（GSW 内置 PHY）；ROMFILE 的 ONU 画像报 GEPortNum=1 + FEPortNum=3，OMCI 报 4 桥端口。端口标签保持 lan1-4，lan4 由 board.d/02_network 配成 WAN（DHCP 客户端，用户定），lan1-3 进 LAN 桥。 */
 &gsw_port1 {
 	label = "lan1";
 	status = "okay";
