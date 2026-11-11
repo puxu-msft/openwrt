@@ -1,0 +1,53 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] fw4: hook bridge ports and configured devices for software flow offloading
+
+The flowtable path lookup resolves a bridged flow to its port (DSA user port or Wi-Fi interface) and gives up when that device is not hooked, so with only br-lan in the flowtable software offloading never applied to flows behind the LAN bridge. Hardware offloading already resolves lower devices; do the same for software offloading and keep the upper device. Interfaces that join a bridge after the firewall starts (Wi-Fi APs) are not lower devices yet at that point, so defaults.flow_offloading_devices adds extra names, where a trailing "*" is a prefix the kernel matches as devices appear. Names and prefixes covered by a different, shorter prefix are dropped because the kernel refuses overlapping hooks; without ubus each device is hooked as is.
+
+diff --git a/root/usr/share/ucode/fw4.uc b/root/usr/share/ucode/fw4.uc
+index c36f044..31781c6 100644
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -558,12 +558,34 @@ return {
+ 		let devices = this.resolve_hw_offload_devices();
+ 
+ 		if (!devices) {
++			// Without ubus the lower devices cannot be resolved and each device is hooked as is.
++			let devstatus = {};
++			let bus = ubus.connect();
++
++			if (bus) {
++				devstatus = bus.call("network.device", "status") || {};
++				bus.disconnect();
++			}
++
+ 			devices = [];
+ 
++			// The kernel resolves the real forwarding path (bridge -> port -> DSA conduit or Wi-Fi) and only offloads a flow whose resolved ingress device is hooked, so hook the lower devices of bridges and VLANs as well, as for hardware offloading.
+ 			for (let zone in this.zones())
+ 				for (let device in zone.related_physdevs)
+ 					if (fs.access(`/sys/class/net/${device}`))
+-						push(devices, device);
++						push(devices, device, ...resolve_lower_devices(devstatus, device));
++
++			// Extra flowtable devices from the defaults section; a trailing "*" is a name prefix (kernel 6.16+), so interfaces that join a bridge after the firewall starts, such as Wi-Fi APs, are hooked when they appear.
++			push(devices, ...(this.default_option("flow_offloading_devices") ?? []));
++
++			// The kernel refuses overlapping hooks in one flowtable, so drop every name or prefix that a different, shorter prefix already covers.
++			let prefixes = uniq(map(filter(devices, d => substr(d, -1) == "*"), d => substr(d, 0, -1)));
++			devices = filter(devices, d => {
++				let is_prefix = (substr(d, -1) == "*");
++				let stem = is_prefix ? substr(d, 0, -1) : d;
++
++				return !length(filter(prefixes, p => (!is_prefix || p != stem) && index(stem, p) === 0));
++			});
+ 
+ 			devices = sort(uniq(devices));
+ 		}
+@@ -2045,6 +2067,7 @@ return {
+ 			disable_ipv6: [ "bool", null, UNSUPPORTED ],
+ 			flow_offloading: [ "bool", "0" ],
+ 			flow_offloading_hw: [ "bool", "0" ],
++			flow_offloading_devices: [ "string", null, PARSE_LIST ],
+ 
+ 			auto_includes: [ "bool", "1" ]
+ 		});
