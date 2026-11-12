@@ -11,14 +11,15 @@ Subject: [PATCH] econet-eth: single TX queue, TX/RX path fixes and checksum/TSO 
 - RX buffers keep NET_SKB_PAD of headroom and the QDMA writes frames 2 bytes in (RX_2B_OFFSET). Frames used to start at the buffer start, so behind the 18-byte MediaTek-tagged header the IP header was only 2-byte aligned and MIPS emulated every unaligned load in the exception handler (about 17 emulations per packet, 825 million in an hour of benchmarks); forwarding also had no room to push headers. With the offset the emulation count stays at 0 and routed 4-flow TCP in the deployed configuration went from 370-500 to 761-925 Mb/s on GS2107 (same bridge-hairpin bench, 4 runs each, before/after builds). The MTU is capped at what one RX buffer holds (1708), so the GDM never passes a frame that would spill into a second descriptor.
 - 512 RX descriptors per chain (128 ran out under 1 Gb/s forwarding).
 - TX: IPv4 TCP/UDP checksum offload, scatter-gather and TSO, done as the vendor qdma_bm_transmit_packet_tso does them: one descriptor per buffer with NLS on all but the last (every descriptor completes on its own, the skb hangs off the last), ICO/TCO/UCO in the TX message, the TSO bit (bit 28, misnamed SCO before) with the MSS in the TCP checksum field. The hardware only parses the frames correctly once the DMA parses the MediaTek tag (CDMA_VLAN_CTRL bit 0, vendor macEN7512STagEnable); without it the checksums came out wrong and a TSO frame stalled the TX DMA. At boot DSA attaches before the conduit opens and the bit is set in ndo_open; when the driver is reloaded and the switch bound afterwards, it is set from ndo_features_check on the first frame. Checksum/GSO features are dropped for every frame while the bit is not set or the port is no DSA conduit, and for anything but plain IPv4/IPv6; on stop the bit is cleared only after the TX DMA is stopped. On GS2107 a single TCP stream sent by the router went from about 300 (offloads switched off with ethtool) to 360-440 Mb/s; forwarded TCP stays at the 1 Gb/s link limit of the bench (fraglist GRO leaves as the original segments).
-- RX checksum: received frames were all marked CHECKSUM_UNNECESSARY without any check, so frames with bad TCP/UDP/ICMP checksums were accepted by the router itself (and GRO could merge them into aggregates that are re-checksummed on the way out). The GDM checks checksums only when it parses the MediaTek tag (stag_en bit0, vendor GDMA1_VLAN_CHECK), and with that bit set every frame took about 7 ms round trip and TCP fell to a few Mb/s, every received frame carrying a CPU reason (crsn=30, ppe_entry=1 on the one decoded), which suggests a detour through the FE/PPE path the vendor sets up with hw_nat.ko. Received frames are now CHECKSUM_NONE and the stack verifies them.
+- RX checksum: received frames were all marked CHECKSUM_UNNECESSARY without any check, so frames with bad TCP/UDP/ICMP checksums were accepted by the router itself (and GRO could merge them into aggregates that are re-checksummed on the way out). The GDM checks checksums only when it parses the MediaTek tag (stag_en bit0, vendor GDMA1_VLAN_CHECK), which this patch leaves off (patch 002 sets it for the PPE). Received frames are now CHECKSUM_NONE and the stack verifies them.
 - TX checksum offload and TSO also for IPv6 TCP (TCO without ICO, TSO6), verified on GS2107 the same way; there is no vendor precedent. IPv6 UDP is checksummed in software because a computed zero has to go out as 0xffff there, which the hardware was not verified to do; a non-TCP/UDP IPv4 checksum request falls back to software as well.
 - TX doorbell rung once per batch (netdev_xmit_more()), whenever the ring cannot take another full skb, and when the last frame of a batch is dropped.
 - ndo_open no longer calls en75_qdma_use() (mutex, napi_enable) under the register spinlock.
 - NAPI completes with the work done, so napi_defer_hard_irqs and gro_flush_timeout (runtime module parameters) take effect; threaded_napi (default on, as before) selects the NAPI mode at load time.
+- debugfs econet_eth/fe_regs (0600): raw 32-bit access to the frame engine register window, the file offset being the register offset, for bringing up blocks the driver does not drive yet (the PPE).
 
 diff --git a/econet_eth.c b/econet_eth.c
-index 16ba1c0..927e9c4 100644
+index 16ba1c0..a07648c 100644
 --- a/econet_eth.c
 +++ b/econet_eth.c
 @@ -270,8 +270,9 @@ static void en75_prepare_qdma_cfg(struct en75_qdma_cfg *cfg,
@@ -32,8 +33,17 @@ index 16ba1c0..927e9c4 100644
  	for (int i = 0; i < QDMA_NUM_CHAINS; i++)
  		cfg->num_tx_descs[i] = 128;
  	for (int i = 0; i < QDMA_NUM_TX_DONE; i++)
+@@ -354,6 +355,8 @@ static int en75_probe(struct platform_device *pdev)
+ 		resource_size(regs_res) >= sizeof(struct en751221_regs);
+ 
+ 	eth->regs = regs;
++	debug_conf.fe_regs = regs;
++	debug_conf.fe_regs_len = resource_size(regs_res);
+ 
+ 	eth->reset = devm_reset_control_array_get_exclusive(&pdev->dev);
+ 	if (IS_ERR(eth->reset)) {
 diff --git a/econet_eth.h b/econet_eth.h
-index 187371b..f3b5eaa 100644
+index 187371b..4f107cb 100644
 --- a/econet_eth.h
 +++ b/econet_eth.h
 @@ -30,15 +30,20 @@ struct en75_soc_data {
@@ -61,7 +71,17 @@ index 187371b..f3b5eaa 100644
  /* A chain is 1 TX ring + 1 RX ring, each QDMA has 2 chains. */
  #define QDMA_NUM_CHAINS		2
  /* Each QDMA has one queue of TX-complete notifications. */
-@@ -199,7 +204,9 @@ int en75_qdma_use(struct en75_qdma *qdma);
+@@ -147,6 +152,9 @@ struct en75_debug_qdma_conf {
+ 
+ struct en75_debug_conf {
+ 	struct en75_debug_qdma_conf		qdma[EN75_NUM_QDMA];
++	/* The whole frame engine window as mapped by probe, for raw register access. */
++	void __iomem				*fe_regs;
++	resource_size_t				fe_regs_len;
+ };
+ 
+ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config);
+@@ -199,7 +207,9 @@ int en75_qdma_use(struct en75_qdma *qdma);
  int en75_qdma_unuse(struct en75_qdma *qdma);
  int en75_qdma_destroy(struct en75_qdma *qdma);
  int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
@@ -73,7 +93,7 @@ index 187371b..f3b5eaa 100644
  
  struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
 diff --git a/econet_eth_debug.c b/econet_eth_debug.c
-index a169b7a..9e750b4 100644
+index a169b7a..6679d87 100644
 --- a/econet_eth_debug.c
 +++ b/econet_eth_debug.c
 @@ -68,7 +68,7 @@ static void print_etx(struct seq_file *m, struct etx *etx)
@@ -85,6 +105,80 @@ index a169b7a..9e750b4 100644
  		is_etx_tco(etx) ? " TCO" : "",
  		is_etx_uco(etx) ? " UCO" : ""
  	);
+@@ -573,6 +573,62 @@ static int en75_init_qdma(struct en75_qdma_debug *qdma_debug)
+ 	return 0;
+ }
+ 
++/*
++ * fe_regs: raw access to the frame engine register window, for bringing up blocks the driver does not drive yet (the PPE). The file offset is the register offset; every transfer is whole, aligned 32-bit words in CPU byte order. Reads have the side effects of the registers read (clear-on-read counters).
++ */
++static ssize_t en75_fe_regs_xfer(struct file *file, char __user *ubuf,
++				 const char __user *wbuf, size_t len, loff_t *ppos)
++{
++	struct en75_debug *debug = file->private_data;
++	loff_t pos = *ppos;
++	size_t done;
++
++	if ((pos | len) & 3)
++		return -EINVAL;
++	if (pos >= debug->config.fe_regs_len)
++		return 0;
++	len = min_t(size_t, len, debug->config.fe_regs_len - pos);
++
++	for (done = 0; done < len; done += 4) {
++		void __iomem *reg = debug->config.fe_regs + pos + done;
++		u32 val;
++
++		if (wbuf) {
++			if (copy_from_user(&val, wbuf + done, 4))
++				break;
++			writel(val, reg);
++		} else {
++			val = readl(reg);
++			if (copy_to_user(ubuf + done, &val, 4))
++				break;
++		}
++	}
++	if (!done)
++		return -EFAULT;
++	*ppos = pos + done;
++	return done;
++}
++
++static ssize_t en75_fe_regs_read(struct file *file, char __user *buf,
++				 size_t len, loff_t *ppos)
++{
++	return en75_fe_regs_xfer(file, buf, NULL, len, ppos);
++}
++
++static ssize_t en75_fe_regs_write(struct file *file, const char __user *buf,
++				  size_t len, loff_t *ppos)
++{
++	return en75_fe_regs_xfer(file, NULL, buf, len, ppos);
++}
++
++static const struct file_operations en75_fe_regs_fops = {
++	.owner   = THIS_MODULE,
++	.open    = simple_open,
++	.read    = en75_fe_regs_read,
++	.write   = en75_fe_regs_write,
++	.llseek  = default_llseek,
++};
++
+ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config)
+ {
+ 	struct en75_debug *debug;
+@@ -591,6 +647,10 @@ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config)
+ 		goto err_dir;
+ 	}
+ 
++	if (config->fe_regs)
++		debugfs_create_file_size("fe_regs", 0600, debug->dir, debug,
++					 &en75_fe_regs_fops, config->fe_regs_len);
++
+ 	BUILD_BUG_ON(ARRAY_SIZE(debug->qdma) != ARRAY_SIZE(config->qdma));
+ 	for (int i = 0; i < ARRAY_SIZE(debug->qdma); i++) {
+ 		char qdma_dirname[8] = {0};
 diff --git a/econet_port.c b/econet_port.c
 index 9004073..660139a 100644
 --- a/econet_port.c

@@ -1,0 +1,1402 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: PPE hardware flow offload (IPv4)
+
+- On EN7528 the PPE is set up at probe (load parameter ppe=0 leaves it alone): a 16K x 80-byte FOE table in coherent DMA memory and the engine registers with the values and order of the vendor hw_nat.ko (recovered by disassembly), except that keepalive stays off as in mainline mtk_ppe (the stack would forward the copies a second time), only IPv4 learning is enabled (the driver binds nothing else), the default CPU port stays QDMA0 and the per-VLAN-layer MTU and FE EtherType tables keep their reset values. GDM1 then forwards every received frame through the engine and parses the MediaTek tag of received frames (stag_en, set with the DMA tag parsing), without which the engine cannot find the IP header; frames of flows that are not bound still reach the CPU, and the GDM now drops frames with bad TCP/UDP checksums.
+- nf_flowtable hardware offload (TC_SETUP_FT on GDM1, which DSA user ports delegate to): IPv4 TCP/UDP flows between MediaTek-tagged switch ports become HNAPT entries that leave through GDM1 directly, the switch port carried in the tag field (mtk_foe_entry_set_dsa()). A flow is bound when the engine reports its unbound entry past the bind rate (CPU reason 15 and entry index in the RX descriptor) on a plain IPv4 frame: the tuple read back from that entry selects the flow, so the hardware hash is never computed in software; flows with 802.1Q ingress are refused, and PPPoE ingress, which nf_flowtable does not describe to the driver, stays in software. The engine writes the TOS field of the entry into every packet it forwards, so the entry gets the TOS of the packet that asked for the binding, and a packet marked CE does not bind (the mark would stick to the whole flow). What the triggering packet carries becomes the flow's: per-packet DSCP collapses to one value, and CE marks added upstream after the binding are lost; the vendor driver writes the TOS the same way. Stats report the last use from the entry timestamp; a flow whose entry is no longer bound is rebound on the next request. Entries are written with the entry cache off and cleared, in the order of the vendor hwnat_delete_foe_entry; a clear that does not complete leaves the cache off. The flows offloaded through a flow block are released with the block, because nf_flowtable unbinds the block before it tears its flows down and those DESTROY commands never reach the driver. NETIF_F_HW_TC is fixed on. On GS2107 routed TCP (LAN to WAN through NAT, 1 Gb/s links) went from 656-758 Mb/s with two CPUs saturated in softirq to 934-941 Mb/s with the CPUs about 1% busy.
+- RX: frames that come through the engine report source ports other than GDM1 (9, 11 and 12 seen); they belong to GDM1 like everything but GDM2. They used to log one line each, which at console loglevel 7 on the 115200-baud serial console held every such frame for about 5.5 ms.
+- debugfs econet_eth/ppe (engine registers, block, flow and bind counters, entry counts per state and packet type, raw words of the first bound and other valid entries) and econet_eth/crsn (received frames per CPU reason); econet_eth/fe_regs returns 0 for an empty transfer.
+
+diff --git a/Kbuild b/Kbuild
+index 09cd408..937ea67 100644
+--- a/Kbuild
++++ b/Kbuild
+@@ -1,2 +1,2 @@
+ obj-m := econet-eth.o
+-econet-eth-y := econet_eth.o econet_eth_debug.o econet_qdma.o econet_port.o
+\ No newline at end of file
++econet-eth-y := econet_eth.o econet_eth_debug.o econet_qdma.o econet_port.o econet_ppe.o
+\ No newline at end of file
+diff --git a/econet_eth.c b/econet_eth.c
+index a07648c..fd817d5 100644
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -46,6 +46,11 @@
+ #include "qdma_desc.h"
+ #include "qdma_regs.h"
+ #include "econet_eth.h"
++#include "econet_ppe.h"
++
++static bool ppe = true;
++module_param(ppe, bool, 0444);
++MODULE_PARM_DESC(ppe, "Use the PPE for nf_flowtable hardware offload where the SoC has one (load time)");
+ 
+ /* MT7530 switch configuration */
+ #define  PMCR_FORCE_FDX			BIT(1)
+@@ -99,6 +104,9 @@ struct en75_eth_pvt {
+ 	struct en75_debug		*debug;
+ 	/* Whether our register window covers the on-die switch, see probe. */
+ 	bool				has_switch_regs;
++	struct en75_ppe			*ppe;
++	/* Received frames per CPU reason (debugfs crsn) */
++	unsigned long			crsn_count[32];
+ };
+ 
+ union gdm_regs {
+@@ -145,23 +153,27 @@ _Static_assert(sizeof(struct en751221_regs) == 0x10000, "en751221_regs size inco
+ static struct net_device *en75_get_sport_dev(struct en75_eth_pvt *eth,
+ 					     enum etx_fport sport)
+ {
+-	if (sport == ETX_FPORT_GDM2) {
++	/* Frames that come through the PPE report other source ports (9, 11 and 12 seen on GS2107); everything but GDM2 belongs to GDM1. */
++	if (sport == ETX_FPORT_GDM2 && eth->ports[1])
+ 		return eth->ports[1];
+-	} else {
+-		if (sport != ETX_FPORT_GDM1)
+-			dev_info(eth->pub.dev, "rx: on unexpected fport %d\n", sport);
+-		return eth->ports[0];
+-	}
++	return eth->ports[0];
+ }
+ 
+ int en75_rx_before_recv(struct en75_eth *eth, struct sk_buff *skb,
+-			enum etx_fport sport)
++			enum etx_fport sport, u8 crsn, u16 ppe_entry)
+ {
+ 	struct en75_eth_pvt *ep = (struct en75_eth_pvt *) eth;
+ 	struct net_device *port;
+ 
++	ep->crsn_count[crsn & 31]++;
+ 	port = en75_get_sport_dev(ep, sport);
+ 
++	/* the EtherType follows the 4-byte MediaTek tag on a DSA conduit */
++	if (ep->ppe)
++		en75_ppe_check_skb(ep->ppe, skb,
++				   netdev_uses_dsa(port) ? 2 * ETH_ALEN + 4 : 2 * ETH_ALEN,
++				   crsn, ppe_entry);
++
+ 	skb->dev = port;
+ 	skb->protocol = eth_type_trans(skb, port);
+ 
+@@ -249,13 +261,13 @@ static int en75_init_port(struct en75_eth_pvt *eth, struct device_node *np)
+ 					  &eth->regs->port0.regs,
+ 					  eth->qdma[0],
+ 					  ETX_FPORT_GDM1,
+-					  false);
++					  false, eth->ppe);
+ 	else if (id == 2)
+ 		dev = en75_alloc_gdm_port(&eth->pub, np,
+ 					  &eth->regs->port0.regs,
+ 					  eth->qdma[1],
+ 					  ETX_FPORT_GDM2,
+-					  true);
++					  true, NULL);
+ 	else
+ 		return -EINVAL;
+ 
+@@ -293,6 +305,13 @@ static void en75_remove(struct platform_device *pdev)
+ 
+ 	en75_debugfs_exit(eth->debug);
+ 
++	if (eth->ppe) {
++		for (i = 0; i < ARRAY_SIZE(eth->ports); i++)
++			if (eth->ports[i])
++				en75_port_ppe_detach(eth->ports[i]);
++		en75_ppe_deinit(eth->ppe);
++	}
++
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++)
+ 		if (eth->qdma[i])
+ 			en75_qdma_destroy(eth->qdma[i]);
+@@ -396,6 +415,16 @@ static int en75_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	/* Before the ports: their GDM forwards to the engine from ndo_init on. */
++	if (ppe && eth->soc->has_ppe) {
++		eth->ppe = en75_ppe_init(&pdev->dev, regs);
++		if (IS_ERR(eth->ppe)) {
++			dev_warn(&pdev->dev, "PPE setup failed: %pe\n", eth->ppe);
++			eth->ppe = NULL;
++		}
++		debug_conf.ppe = eth->ppe;
++	}
++
+ 	for_each_child_of_node(pdev->dev.of_node, np) {
+ 		if (!of_device_is_compatible(np, "econet,eth-mac"))
+ 			continue;
+@@ -410,6 +439,7 @@ static int en75_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	debug_conf.crsn_count = eth->crsn_count;
+ 	eth->debug = en75_debugfs_init(&debug_conf);
+ 
+ 	/* Configure the MT7530 as a dumb switch, unless it is managed by DSA */
+@@ -432,6 +462,7 @@ static const struct en75_soc_data en751221_soc_data = {
+ 
+ static const struct en75_soc_data en7528_soc_data = {
+ 	.dscp_byte_swap = false,
++	.has_ppe = true,
+ };
+ 
+ static const struct of_device_id of_en75_match[] = {
+diff --git a/econet_eth.h b/econet_eth.h
+index 4f107cb..14cccac 100644
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -13,9 +13,12 @@
+ #include "gdm_regs.h"
+ 
+ struct en75_debug;
++struct en75_ppe;
+ 
+ struct en75_soc_data {
+ 	bool dscp_byte_swap;
++	/* PPE at FE+0xe00 with the register layout econet_ppe.c drives (EN7528; verified on GS2107) */
++	bool has_ppe;
+ };
+ 
+ /* Number of QDMA engines in this ethernet device. */
+@@ -155,6 +158,8 @@ struct en75_debug_conf {
+ 	/* The whole frame engine window as mapped by probe, for raw register access. */
+ 	void __iomem				*fe_regs;
+ 	resource_size_t				fe_regs_len;
++	struct en75_ppe				*ppe;
++	unsigned long				*crsn_count;	/* [32] */
+ };
+ 
+ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config);
+@@ -177,7 +182,7 @@ struct en75_eth {
+ 
+ /* Called in softirq context */
+ int en75_rx_before_recv(struct en75_eth *eth, struct sk_buff *skb,
+-			enum etx_fport sport);
++			enum etx_fport sport, u8 crsn, u16 ppe_entry);
+ 
+ /* Called from the port driver to the main eth to notify the switch */
+ int en75_port_set_macaddr(struct en75_eth *eth, enum etx_fport portn,
+@@ -217,7 +222,10 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+ 				       struct gdm __iomem *regs,
+ 				       struct en75_qdma *qdma,
+ 				       enum etx_fport fport,
+-				       bool has_g2_stats);
++				       bool has_g2_stats,
++				       struct en75_ppe *ppe);
++/* Point the GDM of @dev back at the CPU, before the PPE goes away. */
++void en75_port_ppe_detach(struct net_device *dev);
+ 
+ #define en75_rreg(reg) __extension__({ \
+ 		BUILD_BUG_ON(sizeof(*(reg)) != sizeof(u32)); \
+diff --git a/econet_eth_debug.c b/econet_eth_debug.c
+index 6679d87..b5d2b35 100644
+--- a/econet_eth_debug.c
++++ b/econet_eth_debug.c
+@@ -3,6 +3,7 @@
+ #include <linux/seq_file.h>
+ 
+ #include "econet_eth.h"
++#include "econet_ppe.h"
+ #include "qdma_desc.h"
+ 
+ struct en75_qdma_chain_debug {
+@@ -583,6 +584,8 @@ static ssize_t en75_fe_regs_xfer(struct file *file, char __user *ubuf,
+ 	loff_t pos = *ppos;
+ 	size_t done;
+ 
++	if (!len)
++		return 0;
+ 	if ((pos | len) & 3)
+ 		return -EINVAL;
+ 	if (pos >= debug->config.fe_regs_len)
+@@ -629,6 +632,23 @@ static const struct file_operations en75_fe_regs_fops = {
+ 	.llseek  = default_llseek,
+ };
+ 
++static int en75_crsn_show(struct seq_file *m, void *v)
++{
++	unsigned long *count = m->private;
++
++	for (int i = 0; i < 32; i++)
++		if (READ_ONCE(count[i]))
++			seq_printf(m, "%2d %lu\n", i, READ_ONCE(count[i]));
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(en75_crsn);
++
++static int en75_ppe_show(struct seq_file *m, void *v)
++{
++	return en75_ppe_debugfs_show(m, m->private);
++}
++DEFINE_SHOW_ATTRIBUTE(en75_ppe);
++
+ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config)
+ {
+ 	struct en75_debug *debug;
+@@ -650,6 +670,12 @@ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config)
+ 	if (config->fe_regs)
+ 		debugfs_create_file_size("fe_regs", 0600, debug->dir, debug,
+ 					 &en75_fe_regs_fops, config->fe_regs_len);
++	if (config->ppe)
++		debugfs_create_file("ppe", 0400, debug->dir, config->ppe,
++				    &en75_ppe_fops);
++	if (config->crsn_count)
++		debugfs_create_file("crsn", 0400, debug->dir, config->crsn_count,
++				    &en75_crsn_fops);
+ 
+ 	BUILD_BUG_ON(ARRAY_SIZE(debug->qdma) != ARRAY_SIZE(config->qdma));
+ 	for (int i = 0; i < ARRAY_SIZE(debug->qdma); i++) {
+diff --git a/econet_port.c b/econet_port.c
+index 660139a..423e0a0 100644
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -13,11 +13,13 @@
+ #include <linux/etherdevice.h>
+ #include <linux/netdevice.h>
+ #include <net/dsa.h>
++#include <net/pkt_cls.h>
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/of_net.h>
+ 
+ #include "econet_eth.h"
++#include "econet_ppe.h"
+ #include "gdm_regs.h"
+ #include "qdma_desc.h"
+ 
+@@ -80,6 +82,9 @@ struct en75_hw_stats {
+ 	/* The DMA parses the MediaTek tag in the frames we send (en75_set_dsa_tag_parse()); TX checksum offload and TSO are only requested while this is set. */
+ 	bool stag_parse;
+ 
++	/* Flow table engine the GDM forwards received frames to, or NULL: frames go straight to the CPU. */
++	struct en75_ppe *ppe;
++
+ 	int qid;
+ };
+ 
+@@ -138,14 +143,13 @@ static int en75_dev_init(struct net_device *dev)
+ 	struct en75_gdm_port *port = netdev_priv(dev);
+ 
+ 	en75_set_macaddr(port, dev->dev_addr);
+-	/* TODO: When the PPE is setup, we will want to route
+-	         evetything to that */
+-	en75_set_gdm_port_fwd_cfg(port, ETX_FPORT_QDMA0_CPU);
++	/* Through the PPE every frame still reaches the CPU (default CPU port QDMA0) unless it belongs to a bound flow. */
++	en75_set_gdm_port_fwd_cfg(port, port->ppe ? ETX_FPORT_PPE : ETX_FPORT_QDMA0_CPU);
+ 
+ 	return 0;
+ }
+ 
+-/* Have the DMA parse the MediaTek special tag that DSA writes after the source MAC of the frames we send (vendor macEN7512STagEnable, GDM_VLAN_STAG_PARSE). TX checksum offload and TSO are requested only while it does, because without it the hardware gets the header offsets wrong (seen on GS2107: wrong checksums, and a TSO frame stalled the TX DMA). The receive side (stag_en) stays off, see gdm_regs.h. */
++/* Have the DMA parse the MediaTek special tag that DSA writes after the source MAC of the frames we send (vendor macEN7512STagEnable, GDM_VLAN_STAG_PARSE). TX checksum offload and TSO are requested only while it does, because without it the hardware gets the header offsets wrong (seen on GS2107: wrong checksums, and a TSO frame stalled the TX DMA). With the PPE the GDM parses the tag of received frames as well (stag_en), which the engine needs to find the IP header. */
+ static void en75_set_dsa_tag_parse(struct en75_gdm_port *port, bool on)
+ {
+ 	struct gdm_vlan vlan;
+@@ -154,6 +158,15 @@ static void en75_set_dsa_tag_parse(struct en75_gdm_port *port, bool on)
+ 	vlan = en75_rreg(&port->regs->vlan);
+ 	set_gdm_vlan_stag_parse(&vlan, on);
+ 	en75_wreg(vlan, &port->regs->vlan);
++	if (port->ppe) {
++		u32 stag = en75_rreg(&port->regs->stag_en);
++
++		if (on)
++			stag |= BIT(0);
++		else
++			stag &= ~BIT(0);
++		en75_wreg(stag, &port->regs->stag_en);
++	}
+ 	/* read back so the write has landed before a frame relies on it */
+ 	en75_rreg(&port->regs->vlan);
+ 	WRITE_ONCE(port->stag_parse, on);
+@@ -464,8 +477,33 @@ en75_ethtool_get_rmon_stats(struct net_device *dev,
+ 	} while (u64_stats_fetch_retry(&port->stats.syncp, start));
+ }
+ 
++static int en75_dev_setup_tc(struct net_device *dev, enum tc_setup_type type,
++			     void *type_data)
++{
++	struct en75_gdm_port *port = netdev_priv(dev);
++
++	if (!port->ppe)
++		return -EOPNOTSUPP;
++	return en75_ppe_setup_tc(port->ppe, dev, type, type_data);
++}
++
++void en75_port_ppe_detach(struct net_device *dev)
++{
++	en75_set_gdm_port_fwd_cfg(netdev_priv(dev), ETX_FPORT_QDMA0_CPU);
++}
++
++/* Also when register_netdev() fails after ndo_init: the GDM must not keep forwarding to an engine that is about to go away. */
++static void en75_dev_uninit(struct net_device *dev)
++{
++	struct en75_gdm_port *port = netdev_priv(dev);
++
++	if (port->ppe)
++		en75_port_ppe_detach(dev);
++}
++
+ static const struct net_device_ops en75_netdev_ops = {
+ 	.ndo_init		= en75_dev_init,
++	.ndo_uninit		= en75_dev_uninit,
+ 	.ndo_open		= en75_dev_open,
+ 	.ndo_stop		= en75_dev_stop,
+ 	.ndo_change_mtu		= en75_dev_change_mtu,
+@@ -473,6 +511,7 @@ static const struct net_device_ops en75_netdev_ops = {
+ 	.ndo_features_check	= en75_features_check,
+ 	.ndo_get_stats64        = en75_dev_get_stats64,
+ 	.ndo_set_mac_address	= en75_dev_set_macaddr,
++	.ndo_setup_tc		= en75_dev_setup_tc,
+ };
+ 
+ static const struct ethtool_ops en75_ethtool_ops = {
+@@ -486,7 +525,8 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+ 				       struct gdm __iomem *regs,
+ 				       struct en75_qdma *qdma,
+ 				       enum etx_fport fport,
+-				       bool has_g2_stats)
++				       bool has_g2_stats,
++				       struct en75_ppe *ppe)
+ {
+ 	struct en75_gdm_port *port;
+ 	struct net_device *ndev;
+@@ -506,8 +546,8 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+ 
+ 	/*
+ 	 * NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6: TCP/UDP checksums (ICO for the IPv4 header, TCO/UCO) and TSO (MSS in the TCP checksum field) as the vendor qdma_bm_transmit_packet_tso does them for IPv4, one descriptor per buffer; IPv6 has no vendor precedent and was verified on GS2107 like IPv4, behind the MediaTek tag. en75_features_check() leaves other traffic to the stack. They pay off for traffic the router sends itself; forwarded TCP arrives as fraglist GRO and leaves as the original segments.
+-	 * NETIF_F_RXCSUM: not offered, the GDM does not check checksums without stag_en (gdm_regs.h); received frames are CHECKSUM_NONE.
+-	 * NETIF_F_HW_TC: TODO: When we get the PPE working, we will enable this for TC_SETUP_BLOCK / TC_SETUP_FT for NAT flow-table offloading.
++	 * NETIF_F_RXCSUM: not offered: the GDM checks TCP/UDP checksums only with stag_en (gdm_regs.h), which is set only with the PPE, and that check is not relied on; received frames are CHECKSUM_NONE.
++	 * NETIF_F_HW_TC: with the PPE, fixed on, for nf_flowtable hardware offload (TC_SETUP_FT, econet_ppe.c).
+ 	 */
+ 	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG |
+ 			    NETIF_F_TSO | NETIF_F_TSO6;
+@@ -516,6 +556,9 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+ 
+ 	ndev->features |= ndev->hw_features;
+ 	ndev->vlan_features = ndev->hw_features;
++	/* Fixed: the offloaded flows are only cleaned up through the flow block, which the feature cannot take back. */
++	if (ppe)
++		ndev->features |= NETIF_F_HW_TC;
+ 	ndev->dev.of_node = np;
+ 	SET_NETDEV_DEV(ndev, eth->dev);
+ 
+@@ -538,6 +581,7 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+ 	port->regs = regs;
+ 	port->fport = fport;
+ 	port->qdma = qdma;
++	port->ppe = ppe;
+ 	port->eth = eth;
+ 
+ 	// TODO: This is pretty easy to enable
+diff --git a/econet_ppe.c b/econet_ppe.c
+new file mode 100644
+index 0000000..c58c40b
+--- /dev/null
++++ b/econet_ppe.c
+@@ -0,0 +1,936 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/*
++ * EN7528 PPE (packet processing engine): the hardware flow table that routes and NATs bound flows from GDM to GDM without the CPU.
++ *
++ * Register offsets, values and the init order are those of the vendor hw_nat.ko (3.18 kernel), recovered by disassembly; the block is the generation of the MT7621 PPE driven by mainline mtk_ppe (v1), with the same 80-byte FOE entry layout, a different cache control and one instance at FE+0xe00.
++ *
++ * Flows come from nf_flowtable hardware offload (TC_SETUP_FT on the DSA conduit, which DSA user ports delegate to). As in mtk_ppe, a flow is only bound once the engine asks for it: on a table miss it builds an unbound entry at the hash index of the frame and, past the bind rate, delivers frames of that entry with CPU reason HIT_UNBIND_RATE_REACHED and the index in the RX descriptor. en75_ppe_check_skb() then reads the tuple back from that entry and binds the matching flow in place, so the software never has to reproduce the hardware hash.
++ *
++ * Scope: IPv4 TCP/UDP (NAPT or plain routing) between ports behind the MediaTek-tagged switch on GDM1, leaving through GDM1 directly (no QDMA forwarding queue). Everything else stays in software.
++ */
++#include <linux/bitfield.h>
++#include <linux/device.h>
++#include <linux/dma-mapping.h>
++#include <linux/etherdevice.h>
++#include <linux/if_ether.h>
++#include <linux/io.h>
++#include <linux/iopoll.h>
++#include <linux/ip.h>
++#include <linux/jhash.h>
++#include <linux/rhashtable.h>
++#include <linux/seq_file.h>
++#include <linux/slab.h>
++#include <linux/unaligned.h>
++#include <net/dsa.h>
++#include <net/inet_ecn.h>
++#include <net/flow_offload.h>
++#include <net/pkt_cls.h>
++
++#include "econet_ppe.h"
++
++#define FE_FOE_TS		0x010	/* frame engine timestamp, seconds, relative to the FE base */
++
++#define PPE_GLO_CFG		0x000
++#define PPE_FLOW_CFG		0x004
++#define PPE_IP_PROT_CHK		0x008
++#define PPE_IP_PROT_0		0x00c
++#define PPE_IP_PROT_1		0x010
++#define PPE_IP_PROT_2		0x014
++#define PPE_IP_PROT_3		0x018
++#define PPE_TB_CFG		0x01c
++#define PPE_TB_BASE		0x020
++#define PPE_TB_USED		0x024
++#define PPE_BNDR		0x028
++#define PPE_BIND_LMT_0		0x02c
++#define PPE_BIND_LMT_1		0x030
++#define PPE_KA			0x034
++#define PPE_UNB_AGE		0x038
++#define PPE_BND_AGE_0		0x03c
++#define PPE_BND_AGE_1		0x040
++#define PPE_HASH_SEED		0x044
++#define PPE_DFP_CPORT		0x048
++#define PPE_HASH_CFG		0x088	/* unnamed by the vendor; written 0x77d */
++#define PPE_CAH_CTRL		0x120
++#define PPE_CAH_EN		0x134	/* EN7528 only: bit 0 enables the entry cache */
++
++#define PPE_GLO_CFG_EN		BIT(0)
++#define PPE_FLOW_CFG_NAT_FRAG	BIT(17)
++
++#define PPE_TB_CFG_ENTRY_NUM	GENMASK(2, 0)	/* 1024 << n entries */
++#define PPE_TB_CFG_ENTRY_80B	BIT(3)
++#define PPE_TB_CFG_SEARCH_MISS	GENMASK(5, 4)	/* 3: forward and build an unbound entry */
++#define PPE_TB_CFG_AGE		GENMASK(11, 7)	/* non-L4, unbound, TCP, UDP, TCP FIN */
++#define PPE_TB_CFG_KEEPALIVE	GENMASK(13, 12)
++#define PPE_TB_CFG_HASH_MODE	GENMASK(15, 14)
++
++#define PPE_CAH_CTRL_CLEAR	0x4100
++#define PPE_CAH_CTRL_BUSY	BIT(8)
++
++#define PPE_ENTRIES_SHIFT	4
++#define PPE_ENTRIES		(1024 << PPE_ENTRIES_SHIFT)
++
++#define FOE_IB1_UNBIND_TS	GENMASK(7, 0)
++#define FOE_IB1_BIND_TS		GENMASK(14, 0)
++#define FOE_IB1_BIND_VLAN_LAYER	GENMASK(18, 16)
++#define FOE_IB1_BIND_VLAN_TAG	BIT(20)
++#define FOE_IB1_BIND_CACHE	BIT(22)
++#define FOE_IB1_BIND_TTL	BIT(24)
++#define FOE_IB1_PACKET_TYPE	GENMASK(27, 25)
++#define FOE_IB1_STATE		GENMASK(29, 28)
++#define FOE_IB1_UDP		BIT(30)
++
++#define FOE_IB2_DEST_PORT	GENMASK(7, 5)
++#define FOE_IB2_MULTICAST	BIT(8)
++#define FOE_IB2_METER		GENMASK(17, 12)	/* 63: no meter */
++#define FOE_IB2_ACCOUNT		GENMASK(23, 18)	/* 63: no accounting group */
++#define FOE_IB2_TOS		GENMASK(31, 24)	/* written into the IPv4 TOS of every forwarded packet */
++
++enum {
++	FOE_STATE_INVALID,
++	FOE_STATE_UNBIND,
++	FOE_STATE_BIND,
++	FOE_STATE_FIN,
++};
++
++enum {
++	FOE_TYPE_IPV4_HNAPT = 0,
++	FOE_TYPE_IPV4_ROUTE = 1,
++};
++
++/* PSE port the frames of a bound flow leave through. */
++#define PSE_PORT_GDM1		1
++
++/* CPU reason (RX descriptor) of a frame whose unbound entry passed the bind rate. */
++#define PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED	0x0f
++
++struct en75_foe_mac_info {
++	u16 vlan1;
++	u16 etype;	/* the MediaTek tag towards the switch when bound (mtk_foe_entry_set_dsa()) */
++	u32 dest_mac_hi;
++	u16 vlan2;
++	u16 dest_mac_lo;
++	u32 src_mac_hi;
++	u16 pppoe_id;
++	u16 src_mac_lo;
++};
++
++struct en75_ipv4_tuple {
++	u32 src_ip;
++	u32 dest_ip;
++	union {
++		struct {
++			u16 dest_port;
++			u16 src_port;
++		};
++		u32 ports;
++	};
++};
++
++struct en75_foe_ipv4 {
++	struct en75_ipv4_tuple orig;
++	u32 ib2;
++	struct en75_ipv4_tuple new;
++	u16 timestamp;
++	u16 _rsv0[3];
++	u32 udf_tsid;
++	struct en75_foe_mac_info l2;
++};
++
++struct en75_foe_entry {
++	u32 ib1;
++	union {
++		struct en75_foe_ipv4 ipv4;
++		u32 data[19];
++	};
++};
++static_assert(sizeof(struct en75_foe_entry) == 80);
++
++/* The key a bind request is matched on: packet type and UDP bit of ib1, original tuple. */
++struct en75_flow_key {
++	u32 ib1;
++	struct en75_ipv4_tuple orig;
++};
++
++#define FOE_KEY_IB1		(FOE_IB1_PACKET_TYPE | FOE_IB1_UDP)
++#define PPE_FLOW_BUCKETS	1024
++
++struct en75_flow {
++	struct rhash_head node;		/* in its block's flows, by cookie */
++	unsigned long cookie;
++	struct hlist_node list;		/* in ppe->buckets, by key */
++	struct en75_flow_key key;
++	struct en75_foe_entry data;	/* the bound entry, without timestamp */
++	int index;			/* table index while bound, else -1 */
++};
++
++/* One per flow block (one flowtable) bound on the conduit. nf_flowtable unbinds a block before it tears its flows down, so the DESTROY commands for those flows never reach the driver: the flows of a block are released with it. */
++struct en75_ppe_block {
++	struct en75_ppe *ppe;
++	struct rhashtable flows;	/* by cookie */
++	struct list_head node;		/* in ppe->blocks */
++};
++
++static const struct rhashtable_params en75_flow_ht_params = {
++	.head_offset = offsetof(struct en75_flow, node),
++	.key_offset = offsetof(struct en75_flow, cookie),
++	.key_len = sizeof(unsigned long),
++	.automatic_shrinking = true,
++};
++
++struct en75_ppe {
++	struct device *dev;
++	void __iomem *fe;
++	void __iomem *regs;
++	struct net_device *conduit;	/* the GDM1 netdev, set when it binds the flow block */
++	struct en75_foe_entry *foe;
++	dma_addr_t foe_phys;
++
++	/* Serialises table writes and the bucket lists between the offload commands (process context) and bind requests (NAPI). */
++	spinlock_t lock;
++	/* Offload commands, block setup and release, teardown; protects blocks and dead. */
++	struct mutex cmd_lock;
++	struct list_head blocks;
++	bool dead;			/* torn down: offload commands are refused */
++	struct hlist_head buckets[PPE_FLOW_BUCKETS];
++	struct list_head block_cb_list;
++
++	unsigned long binds;
++	unsigned long bind_misses;
++	unsigned long cache_timeouts;	/* clear commands that did not complete; the cache then stays off */
++};
++
++static void ppe_w32(struct en75_ppe *ppe, u32 reg, u32 val)
++{
++	writel(val, ppe->regs + reg);
++}
++
++static u32 ppe_r32(struct en75_ppe *ppe, u32 reg)
++{
++	return readl(ppe->regs + reg);
++}
++
++static struct en75_foe_entry *ppe_entry(struct en75_ppe *ppe, unsigned int i)
++{
++	return &ppe->foe[i];
++}
++
++static u32 ppe_timestamp(struct en75_ppe *ppe)
++{
++	return readl(ppe->fe + FE_FOE_TS);
++}
++
++static struct hlist_head *ppe_bucket(struct en75_ppe *ppe,
++				     const struct en75_flow_key *key)
++{
++	return &ppe->buckets[jhash2((const u32 *)key, sizeof(*key) / 4, 0) %
++			     PPE_FLOW_BUCKETS];
++}
++
++/* Table entries are written between these two, in the order of the vendor hwnat_delete_foe_entry: with the cache off and cleared the engine can neither use nor write back a stale copy of the entry being changed. Caller holds ppe->lock. */
++static bool ppe_cache_idle(struct en75_ppe *ppe)
++{
++	u32 val;
++
++	/* the vendor polls up to about a second; a stuck command is reported, not waited out in softirq */
++	return !readl_poll_timeout_atomic(ppe->regs + PPE_CAH_CTRL, val,
++					  !(val & PPE_CAH_CTRL_BUSY), 1, 1000);
++}
++
++/* Returns whether the cache was cleared. If it was not, it is left off (a valid mode, the one the vendor tears down in) rather than re-enabled with stale copies in it. */
++static bool ppe_cache_off(struct en75_ppe *ppe)
++{
++	ppe_w32(ppe, PPE_CAH_EN, ppe_r32(ppe, PPE_CAH_EN) & ~BIT(0));
++	if (ppe_cache_idle(ppe)) {
++		ppe_w32(ppe, PPE_CAH_CTRL, PPE_CAH_CTRL_CLEAR);
++		if (ppe_cache_idle(ppe))
++			return true;
++	}
++	ppe->cache_timeouts++;
++	dev_warn_ratelimited(ppe->dev, "PPE cache clear timed out, cache left off\n");
++	return false;
++}
++
++static void ppe_cache_on(struct en75_ppe *ppe, bool cleared)
++{
++	wmb();
++	if (cleared)
++		ppe_w32(ppe, PPE_CAH_EN, ppe_r32(ppe, PPE_CAH_EN) | BIT(0));
++}
++
++static void ppe_hw_key(const struct en75_foe_entry *hwe, u32 ib1,
++		       struct en75_flow_key *key)
++{
++	key->ib1 = ib1 & FOE_KEY_IB1;
++	key->orig.src_ip = READ_ONCE(hwe->ipv4.orig.src_ip);
++	key->orig.dest_ip = READ_ONCE(hwe->ipv4.orig.dest_ip);
++	key->orig.ports = READ_ONCE(hwe->ipv4.orig.ports);
++}
++
++/* Caller holds ppe->lock. The entry body goes in first and ib1 (state BIND) last, so the engine never sees a bound entry with a stale body. @tos is that of the packet that asked for the binding: the engine writes the TOS field of ib2 into every packet it forwards (on GS2107 a flow marked 0xb8 left the engine with 0x00 while the field was 0). */
++static void ppe_bind(struct en75_ppe *ppe, struct en75_flow *flow, int index,
++		     u8 tos)
++{
++	const int ib2_word = offsetof(struct en75_foe_entry, ipv4.ib2) / 4 - 1;
++	struct en75_foe_entry *hwe = ppe_entry(ppe, index);
++	u32 ib1 = flow->data.ib1;
++	bool cleared;
++	int i;
++
++	ib1 |= FIELD_PREP(FOE_IB1_BIND_TS, ppe_timestamp(ppe));
++	cleared = ppe_cache_off(ppe);
++	for (i = 0; i < ARRAY_SIZE(hwe->data); i++) {
++		u32 val = flow->data.data[i];
++
++		if (i == ib2_word)
++			val = (val & ~FOE_IB2_TOS) | FIELD_PREP(FOE_IB2_TOS, tos);
++		WRITE_ONCE(hwe->data[i], val);
++	}
++	wmb();
++	WRITE_ONCE(hwe->ib1, ib1);
++	ppe_cache_on(ppe, cleared);
++	flow->index = index;
++	ppe->binds++;
++}
++
++/* Caller holds ppe->lock. Whether the entry at flow->index still carries this flow, bound. */
++static bool ppe_flow_bound(struct en75_ppe *ppe, struct en75_flow *flow,
++			   u32 *ib1p)
++{
++	struct en75_foe_entry *hwe;
++	struct en75_flow_key key;
++	u32 ib1;
++
++	if (flow->index < 0)
++		return false;
++
++	hwe = ppe_entry(ppe, flow->index);
++	ib1 = READ_ONCE(hwe->ib1);
++	if (FIELD_GET(FOE_IB1_STATE, ib1) != FOE_STATE_BIND)
++		return false;
++	ppe_hw_key(hwe, ib1, &key);
++	if (memcmp(&key, &flow->key, sizeof(key)))
++		return false;
++	if (ib1p)
++		*ib1p = ib1;
++	return true;
++}
++
++/* Caller holds ppe->lock. */
++static void ppe_unbind(struct en75_ppe *ppe, struct en75_flow *flow)
++{
++	struct en75_foe_entry *hwe;
++
++	if (ppe_flow_bound(ppe, flow, NULL)) {
++		bool cleared;
++
++		hwe = ppe_entry(ppe, flow->index);
++		cleared = ppe_cache_off(ppe);
++		WRITE_ONCE(hwe->ib1, FIELD_PREP(FOE_IB1_STATE, FOE_STATE_INVALID));
++		ppe_cache_on(ppe, cleared);
++	}
++	flow->index = -1;
++}
++
++void en75_ppe_check_skb(struct en75_ppe *ppe, struct sk_buff *skb,
++			 unsigned int proto_off, u8 crsn, u16 index)
++{
++	struct en75_foe_entry *hwe;
++	struct en75_flow_key key;
++	struct en75_flow *flow;
++	u32 ib1;
++	u8 tos;
++
++	if (crsn != PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED || index >= PPE_ENTRIES)
++		return;
++	/* Bound entries are written for plain IPv4 behind the tag: a flow that arrives with PPPoE (which nf_flowtable does not describe to the driver) or 802.1Q (refused by the offload already) stays in software. */
++	if (skb_headlen(skb) < proto_off + 2 + sizeof(struct iphdr) ||
++	    get_unaligned_be16(skb->data + proto_off) != ETH_P_IP)
++		return;
++	/* The TOS of this packet is written into every packet of the bound flow, ECN field included; a CE mark would then stick to the whole flow, so such a packet does not bind (the next one asks again). What the packet carries becomes the flow's: per-packet DSCP within one flow collapses to one value, a Not-ECT trigger (a retransmission, a window probe) turns the flow Not-ECT, an ECT trigger puts ECT on its later retransmissions too, and CE marks added upstream of the engine are lost. The vendor driver writes the TOS the same way; no switch that keeps the packet's own TOS is known. */
++	tos = ((struct iphdr *)(skb->data + proto_off + 2))->tos;
++	if ((tos & INET_ECN_MASK) == INET_ECN_CE)
++		return;
++
++	hwe = ppe_entry(ppe, index);
++	spin_lock(&ppe->lock);
++	ib1 = READ_ONCE(hwe->ib1);
++	if (FIELD_GET(FOE_IB1_STATE, ib1) != FOE_STATE_UNBIND ||
++	    FIELD_GET(FOE_IB1_PACKET_TYPE, ib1) != FOE_TYPE_IPV4_HNAPT)
++		goto out;
++
++	ppe_hw_key(hwe, ib1, &key);
++	hlist_for_each_entry(flow, ppe_bucket(ppe, &key), list) {
++		if (memcmp(&key, &flow->key, sizeof(key)))
++			continue;
++		if (flow->index >= 0 && flow->index != index)
++			ppe_unbind(ppe, flow);
++		ppe_bind(ppe, flow, index, tos);
++		goto out;
++	}
++	ppe->bind_misses++;
++out:
++	spin_unlock(&ppe->lock);
++}
++
++struct en75_flow_data {
++	struct ethhdr eth;
++	__be32 src_addr;
++	__be32 dst_addr;
++	__be16 src_port;
++	__be16 dst_port;
++};
++
++static void en75_flow_mangle_eth(const struct flow_action_entry *act, void *eth)
++{
++	void *dest = eth + act->mangle.offset;
++	const void *src = &act->mangle.val;
++
++	if (act->mangle.offset > 8)
++		return;
++
++	if (act->mangle.mask == 0xffff) {
++		src += 2;
++		dest += 2;
++	}
++
++	memcpy(dest, src, act->mangle.mask ? 2 : 4);
++}
++
++static int en75_flow_mangle_ports(const struct flow_action_entry *act,
++				  struct en75_flow_data *data)
++{
++	u32 val = ntohl(act->mangle.val);
++
++	switch (act->mangle.offset) {
++	case 0:
++		if (act->mangle.mask == ~htonl(0xffff))
++			data->dst_port = cpu_to_be16(val);
++		else
++			data->src_port = cpu_to_be16(val >> 16);
++		break;
++	case 2:
++		data->dst_port = cpu_to_be16(val);
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++static int en75_flow_mangle_ipv4(const struct flow_action_entry *act,
++				 struct en75_flow_data *data)
++{
++	switch (act->mangle.offset) {
++	case offsetof(struct iphdr, saddr):
++		data->src_addr = (__force __be32)act->mangle.val;
++		break;
++	case offsetof(struct iphdr, daddr):
++		data->dst_addr = (__force __be32)act->mangle.val;
++		break;
++	default:
++		return -EINVAL;
++	}
++	return 0;
++}
++
++/* The switch port index when @dev is a MediaTek-tagged DSA user port behind @conduit, -1 when @dev is @conduit itself. */
++static int en75_flow_port(struct net_device *conduit, struct net_device *dev)
++{
++	struct dsa_port *dp;
++
++	if (!dev)
++		return -ENODEV;
++	if (dev == conduit)
++		return -1;
++
++	dp = dsa_port_from_netdev(dev);
++	if (IS_ERR(dp))
++		return -EOPNOTSUPP;
++	if (dsa_port_to_conduit(dp) != conduit ||
++	    dp->cpu_dp->tag_ops->proto != DSA_TAG_PROTO_MTK)
++		return -EOPNOTSUPP;
++	return dp->index;
++}
++
++static void en75_foe_set_tuple(struct en75_ipv4_tuple *t, __be32 src,
++			       __be16 sport, __be32 dst, __be16 dport)
++{
++	t->src_ip = be32_to_cpu(src);
++	t->dest_ip = be32_to_cpu(dst);
++	t->src_port = be16_to_cpu(sport);
++	t->dest_port = be16_to_cpu(dport);
++}
++
++static int en75_flow_offload_replace(struct en75_ppe_block *blk,
++				     struct net_device *conduit,
++				     struct flow_cls_offload *f)
++{
++	struct en75_ppe *ppe = blk->ppe;
++	struct flow_rule *rule = flow_cls_offload_flow_rule(f);
++	struct en75_flow_data data = {};
++	struct net_device *idev, *odev = NULL;
++	struct flow_action_entry *act;
++	struct flow_match_ipv4_addrs addrs;
++	struct flow_match_control control;
++	struct flow_match_ports ports;
++	struct flow_match_basic basic;
++	struct flow_match_meta meta;
++	struct en75_foe_mac_info *l2;
++	struct en75_foe_entry *foe;
++	struct en75_flow *flow;
++	int i, port, err;
++	u8 l4proto;
++
++	if (rhashtable_lookup_fast(&blk->flows, &f->cookie, en75_flow_ht_params))
++		return -EEXIST;
++
++	if (!flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_META) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CONTROL) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
++	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
++		return -EOPNOTSUPP;
++	/* ingress 802.1Q: the entries here are written for frames with only the MediaTek tag */
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
++	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN))
++		return -EOPNOTSUPP;
++
++	flow_rule_match_control(rule, &control);
++	if (control.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
++	    flow_rule_has_control_flags(control.mask->flags, f->common.extack))
++		return -EOPNOTSUPP;
++
++	flow_rule_match_basic(rule, &basic);
++	l4proto = basic.key->ip_proto;
++	if (l4proto != IPPROTO_TCP && l4proto != IPPROTO_UDP)
++		return -EOPNOTSUPP;
++
++	/* Only frames that arrive through the GDM pass the engine. */
++	flow_rule_match_meta(rule, &meta);
++	rcu_read_lock();
++	idev = dev_get_by_index_rcu(dev_net(conduit), meta.key->ingress_ifindex);
++	port = en75_flow_port(conduit, idev);
++	rcu_read_unlock();
++	if (port < -1)
++		return -EOPNOTSUPP;
++
++	flow_action_for_each(i, act, &rule->action) {
++		switch (act->id) {
++		case FLOW_ACTION_MANGLE:
++			if (act->mangle.htype == FLOW_ACT_MANGLE_HDR_TYPE_ETH)
++				en75_flow_mangle_eth(act, &data.eth);
++			break;
++		case FLOW_ACTION_REDIRECT:
++			odev = act->dev;
++			break;
++		case FLOW_ACTION_PRIORITY:
++		case FLOW_ACTION_CSUM:
++			break;
++		default:
++			/* VLAN and PPPoE encapsulation: not supported yet */
++			return -EOPNOTSUPP;
++		}
++	}
++
++	port = en75_flow_port(conduit, odev);
++	if (port < -1)
++		return -EOPNOTSUPP;
++
++	if (!is_valid_ether_addr(data.eth.h_source) ||
++	    !is_valid_ether_addr(data.eth.h_dest))
++		return -EINVAL;
++
++	flow_rule_match_ports(rule, &ports);
++	flow_rule_match_ipv4_addrs(rule, &addrs);
++
++	flow = kzalloc(sizeof(*flow), GFP_KERNEL);
++	if (!flow)
++		return -ENOMEM;
++	flow->cookie = f->cookie;
++	flow->index = -1;
++	foe = &flow->data;
++
++	en75_foe_set_tuple(&foe->ipv4.orig, addrs.key->src, ports.key->src,
++			   addrs.key->dst, ports.key->dst);
++
++	data.src_addr = addrs.key->src;
++	data.dst_addr = addrs.key->dst;
++	data.src_port = ports.key->src;
++	data.dst_port = ports.key->dst;
++	flow_action_for_each(i, act, &rule->action) {
++		if (act->id != FLOW_ACTION_MANGLE)
++			continue;
++		switch (act->mangle.htype) {
++		case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
++		case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
++			err = en75_flow_mangle_ports(act, &data);
++			break;
++		case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
++			err = en75_flow_mangle_ipv4(act, &data);
++			break;
++		case FLOW_ACT_MANGLE_HDR_TYPE_ETH:
++			err = 0;
++			break;
++		default:
++			err = -EOPNOTSUPP;
++		}
++		if (err)
++			goto free;
++	}
++	en75_foe_set_tuple(&foe->ipv4.new, data.src_addr, data.src_port,
++			   data.dst_addr, data.dst_port);
++
++	foe->ib1 = FIELD_PREP(FOE_IB1_STATE, FOE_STATE_BIND) |
++		   FIELD_PREP(FOE_IB1_PACKET_TYPE, FOE_TYPE_IPV4_HNAPT) |
++		   FIELD_PREP(FOE_IB1_UDP, l4proto == IPPROTO_UDP) |
++		   FOE_IB1_BIND_CACHE | FOE_IB1_BIND_TTL;
++	foe->ipv4.ib2 = FIELD_PREP(FOE_IB2_DEST_PORT, PSE_PORT_GDM1) |
++			FIELD_PREP(FOE_IB2_METER, 0x3f) |
++			FIELD_PREP(FOE_IB2_ACCOUNT, 0x3f);
++	if (is_multicast_ether_addr(data.eth.h_dest))
++		foe->ipv4.ib2 |= FOE_IB2_MULTICAST;
++
++	l2 = &foe->ipv4.l2;
++	l2->dest_mac_hi = get_unaligned_be32(data.eth.h_dest);
++	l2->dest_mac_lo = get_unaligned_be16(data.eth.h_dest + 4);
++	l2->src_mac_hi = get_unaligned_be32(data.eth.h_source);
++	l2->src_mac_lo = get_unaligned_be16(data.eth.h_source + 4);
++	l2->etype = ETH_P_IP;
++	if (port >= 0) {
++		/* The engine writes etype/vlan1 as the 4-byte MediaTek tag: no 802.1Q tag inside, destination port bitmap (net/dsa/tag_mtk.c). */
++		l2->etype = BIT(port);
++		foe->ib1 |= FIELD_PREP(FOE_IB1_BIND_VLAN_LAYER, 1);
++	}
++
++	flow->key.ib1 = foe->ib1 & FOE_KEY_IB1;
++	flow->key.orig = foe->ipv4.orig;
++
++	err = rhashtable_insert_fast(&blk->flows, &flow->node, en75_flow_ht_params);
++	if (err)
++		goto free;
++
++	spin_lock_bh(&ppe->lock);
++	hlist_add_head(&flow->list, ppe_bucket(ppe, &flow->key));
++	spin_unlock_bh(&ppe->lock);
++	return 0;
++
++free:
++	kfree(flow);
++	return err;
++}
++
++static void en75_flow_free(struct en75_ppe *ppe, struct en75_flow *flow)
++{
++	spin_lock_bh(&ppe->lock);
++	ppe_unbind(ppe, flow);
++	hlist_del(&flow->list);
++	spin_unlock_bh(&ppe->lock);
++	kfree(flow);
++}
++
++static int en75_flow_offload_destroy(struct en75_ppe_block *blk,
++				     struct flow_cls_offload *f)
++{
++	struct en75_flow *flow;
++
++	flow = rhashtable_lookup_fast(&blk->flows, &f->cookie, en75_flow_ht_params);
++	if (!flow)
++		return -ENOENT;
++
++	rhashtable_remove_fast(&blk->flows, &flow->node, en75_flow_ht_params);
++	en75_flow_free(blk->ppe, flow);
++	return 0;
++}
++
++/* The engine refreshes the timestamp of a bound entry on every hit; report the last use so nf_flowtable keeps the connection alive. An entry the engine aged out or replaced makes the flow unbound again, to be rebound on the next request. */
++static int en75_flow_offload_stats(struct en75_ppe_block *blk,
++				   struct flow_cls_offload *f)
++{
++	struct en75_ppe *ppe = blk->ppe;
++	struct en75_flow *flow;
++	u32 ib1, idle;
++	bool bound;
++
++	flow = rhashtable_lookup_fast(&blk->flows, &f->cookie, en75_flow_ht_params);
++	if (!flow)
++		return -ENOENT;
++
++	spin_lock_bh(&ppe->lock);
++	bound = ppe_flow_bound(ppe, flow, &ib1);
++	if (!bound)
++		flow->index = -1;
++	spin_unlock_bh(&ppe->lock);
++
++	if (bound) {
++		idle = (ppe_timestamp(ppe) - FIELD_GET(FOE_IB1_BIND_TS, ib1)) &
++		       FOE_IB1_BIND_TS;
++		f->stats.lastused = jiffies - idle * HZ;
++	}
++	return 0;
++}
++
++static int en75_ppe_setup_tc_block_cb(enum tc_setup_type type, void *type_data,
++				      void *cb_priv)
++{
++	struct flow_cls_offload *cls = type_data;
++	struct en75_ppe_block *blk = cb_priv;
++	struct en75_ppe *ppe = blk->ppe;
++	int err;
++
++	if (type != TC_SETUP_CLSFLOWER)
++		return -EOPNOTSUPP;
++
++	mutex_lock(&ppe->cmd_lock);
++	if (ppe->dead) {
++		err = -EOPNOTSUPP;
++		goto out;
++	}
++	switch (cls->command) {
++	case FLOW_CLS_REPLACE:
++		err = tc_can_offload(ppe->conduit) ?
++		      en75_flow_offload_replace(blk, ppe->conduit, cls) :
++		      -EOPNOTSUPP;
++		break;
++	case FLOW_CLS_DESTROY:
++		err = en75_flow_offload_destroy(blk, cls);
++		break;
++	case FLOW_CLS_STATS:
++		err = en75_flow_offload_stats(blk, cls);
++		break;
++	default:
++		err = -EOPNOTSUPP;
++	}
++out:
++	mutex_unlock(&ppe->cmd_lock);
++	return err;
++}
++
++static void en75_flow_free_one(void *ptr, void *arg)
++{
++	en75_flow_free(arg, ptr);
++}
++
++/* Caller holds ppe->cmd_lock. */
++static void en75_ppe_block_flush(struct en75_ppe_block *blk)
++{
++	rhashtable_free_and_destroy(&blk->flows, en75_flow_free_one, blk->ppe);
++	/* left valid and empty for later commands and the release */
++	WARN_ON(rhashtable_init(&blk->flows, &en75_flow_ht_params));
++}
++
++/* flow_block_cb_free(): the block is gone from the flowtable, and so are its flows. */
++static void en75_ppe_block_release(void *cb_priv)
++{
++	struct en75_ppe_block *blk = cb_priv;
++	struct en75_ppe *ppe = blk->ppe;
++
++	mutex_lock(&ppe->cmd_lock);
++	rhashtable_free_and_destroy(&blk->flows, en75_flow_free_one, ppe);
++	list_del(&blk->node);
++	mutex_unlock(&ppe->cmd_lock);
++	kfree(blk);
++}
++
++int en75_ppe_setup_tc(struct en75_ppe *ppe, struct net_device *dev,
++		      enum tc_setup_type type, void *type_data)
++{
++	struct flow_block_offload *f = type_data;
++	flow_setup_cb_t *cb = en75_ppe_setup_tc_block_cb;
++	struct flow_block_cb *block_cb;
++	struct en75_ppe_block *blk;
++	int err;
++
++	if (type != TC_SETUP_BLOCK && type != TC_SETUP_FT)
++		return -EOPNOTSUPP;
++	if (f->binder_type != FLOW_BLOCK_BINDER_TYPE_CLSACT_INGRESS)
++		return -EOPNOTSUPP;
++
++	f->driver_block_list = &ppe->block_cb_list;
++
++	switch (f->command) {
++	case FLOW_BLOCK_BIND:
++		block_cb = flow_block_cb_lookup(f->block, cb, dev);
++		if (block_cb) {
++			flow_block_cb_incref(block_cb);
++			return 0;
++		}
++		blk = kzalloc(sizeof(*blk), GFP_KERNEL);
++		if (!blk)
++			return -ENOMEM;
++		blk->ppe = ppe;
++		err = rhashtable_init(&blk->flows, &en75_flow_ht_params);
++		if (err) {
++			kfree(blk);
++			return err;
++		}
++		block_cb = flow_block_cb_alloc(cb, dev, blk, en75_ppe_block_release);
++		if (IS_ERR(block_cb)) {
++			rhashtable_destroy(&blk->flows);
++			kfree(blk);
++			return PTR_ERR(block_cb);
++		}
++		mutex_lock(&ppe->cmd_lock);
++		ppe->conduit = dev;
++		list_add(&blk->node, &ppe->blocks);
++		mutex_unlock(&ppe->cmd_lock);
++		flow_block_cb_incref(block_cb);
++		flow_block_cb_add(block_cb, f);
++		list_add_tail(&block_cb->driver_list, &ppe->block_cb_list);
++		return 0;
++	case FLOW_BLOCK_UNBIND:
++		block_cb = flow_block_cb_lookup(f->block, cb, dev);
++		if (!block_cb)
++			return -ENOENT;
++		if (!flow_block_cb_decref(block_cb)) {
++			flow_block_cb_remove(block_cb, f);
++			list_del(&block_cb->driver_list);
++		}
++		return 0;
++	default:
++		return -EOPNOTSUPP;
++	}
++}
++
++struct en75_ppe *en75_ppe_init(struct device *dev, void __iomem *fe)
++{
++	struct en75_ppe *ppe;
++	u32 val;
++
++	ppe = devm_kzalloc(dev, sizeof(*ppe), GFP_KERNEL);
++	if (!ppe)
++		return ERR_PTR(-ENOMEM);
++
++	ppe->dev = dev;
++	ppe->fe = fe;
++	ppe->regs = fe + EN75_PPE_REGS;
++	spin_lock_init(&ppe->lock);
++	mutex_init(&ppe->cmd_lock);
++	INIT_LIST_HEAD(&ppe->blocks);
++	INIT_LIST_HEAD(&ppe->block_cb_list);
++
++	ppe->foe = dmam_alloc_coherent(dev, PPE_ENTRIES * sizeof(*ppe->foe),
++				       &ppe->foe_phys, GFP_KERNEL);
++	if (!ppe->foe)
++		return ERR_PTR(-ENOMEM);
++
++	/* L4 protocols the engine handles: TCP, UDP, IPv6-in-IPv4, IPIP; ICMP, ICMPv6. */
++	ppe_w32(ppe, PPE_IP_PROT_CHK, 0x000f000f);
++	ppe_w32(ppe, PPE_IP_PROT_0, 0x04291106);
++	ppe_w32(ppe, PPE_IP_PROT_1, 0x00003a01);
++	ppe_w32(ppe, PPE_IP_PROT_2, 0);
++	ppe_w32(ppe, PPE_IP_PROT_3, 0);
++	ppe_w32(ppe, PPE_HASH_CFG, 0x77d);
++	ppe_w32(ppe, PPE_CAH_EN, 0x33);
++
++	/* IPv4 NAT/NAPT and fragments, the protocol blacklist and bits the vendor sets without a name; NAT fragments once enabled. The vendor also has the engine learn IPv6 routes, 6RD, DS-Lite and L2 bridging (0x06a1f7c0), which the driver does not bind: those would only take entries and learning rate. */
++	ppe_w32(ppe, PPE_FLOW_CFG, 0x06a130c0);
++
++	ppe_w32(ppe, PPE_TB_BASE, ppe->foe_phys);
++	/* Keepalive stays off (mainline does the same): the vendor copies keepalive frames of bound flows to the CPU and drops them in hw_nat, while the stack here would forward them a second time. */
++	val = FIELD_PREP(PPE_TB_CFG_ENTRY_NUM, PPE_ENTRIES_SHIFT) |
++	      PPE_TB_CFG_ENTRY_80B |
++	      FIELD_PREP(PPE_TB_CFG_SEARCH_MISS, 3) |
++	      PPE_TB_CFG_AGE |
++	      FIELD_PREP(PPE_TB_CFG_HASH_MODE, 0);
++	ppe_w32(ppe, PPE_TB_CFG, val);
++	ppe_w32(ppe, PPE_HASH_SEED, 0x12345678);
++
++	/* Ageing in seconds (FE timestamp unit): unbound after 3 s below 1000 packets; bound UDP and non-L4 15 s, TCP 15 s, TCP FIN 5 s. */
++	ppe_w32(ppe, PPE_UNB_AGE, 0x03e80003);
++	ppe_w32(ppe, PPE_BND_AGE_0, 0x000f000f);
++	ppe_w32(ppe, PPE_BND_AGE_1, 0x0005000f);
++	/* Bind after 30 packets per second; table fill limits for quarter/half/full. */
++	ppe_w32(ppe, PPE_BNDR, 0x001e001e);
++	ppe_w32(ppe, PPE_BIND_LMT_0, 0x0fa00fa0);
++	ppe_w32(ppe, PPE_BIND_LMT_1, 0x00011f40);
++	/* Frames sent to the CPU go to QDMA0 (CDM1) whatever GDM they came from: every GS2107 port is behind GDM1. */
++	ppe_w32(ppe, PPE_DFP_CPORT, 0);
++
++	ppe_w32(ppe, PPE_GLO_CFG, 0x0000b743);
++	ppe_w32(ppe, PPE_FLOW_CFG, ppe_r32(ppe, PPE_FLOW_CFG) | PPE_FLOW_CFG_NAT_FRAG);
++
++	dev_info(dev, "PPE: %u entries at %pad\n", PPE_ENTRIES, &ppe->foe_phys);
++	return ppe;
++}
++
++/* Vendor teardown order, once the GDM no longer forwards to the PPE: cache off, engine off, table detached. Offload commands are refused from here on; blocks still bound release their (already freed) flows when they are unbound. The table memory is device-managed. */
++void en75_ppe_deinit(struct en75_ppe *ppe)
++{
++	struct en75_ppe_block *blk;
++
++	if (IS_ERR_OR_NULL(ppe))
++		return;
++
++	mutex_lock(&ppe->cmd_lock);
++	ppe->dead = true;
++	list_for_each_entry(blk, &ppe->blocks, node)
++		en75_ppe_block_flush(blk);
++	mutex_unlock(&ppe->cmd_lock);
++
++	ppe_w32(ppe, PPE_CAH_EN, ppe_r32(ppe, PPE_CAH_EN) & ~BIT(0));
++	ppe_w32(ppe, PPE_GLO_CFG, ppe_r32(ppe, PPE_GLO_CFG) & ~PPE_GLO_CFG_EN);
++	ppe_w32(ppe, PPE_TB_CFG, ppe_r32(ppe, PPE_TB_CFG) & ~PPE_TB_CFG_AGE);
++	ppe_w32(ppe, PPE_TB_BASE, 0);
++}
++
++int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe)
++{
++	static const char * const state_name[] = { "invalid", "unbind", "bind", "fin" };
++	unsigned int count[4] = {}, type[8] = {}, shown = 0;
++	unsigned int i;
++
++	seq_printf(m, "glo_cfg=%08x flow_cfg=%08x tb_cfg=%08x tb_base=%08x tb_used=%08x\n",
++		   ppe_r32(ppe, PPE_GLO_CFG), ppe_r32(ppe, PPE_FLOW_CFG),
++		   ppe_r32(ppe, PPE_TB_CFG), ppe_r32(ppe, PPE_TB_BASE),
++		   ppe_r32(ppe, PPE_TB_USED));
++	seq_printf(m, "bndr=%08x unb_age=%08x dfp_cport=%08x cah_en=%08x cah_ctrl=%08x ts=%u\n",
++		   ppe_r32(ppe, PPE_BNDR), ppe_r32(ppe, PPE_UNB_AGE),
++		   ppe_r32(ppe, PPE_DFP_CPORT), ppe_r32(ppe, PPE_CAH_EN),
++		   ppe_r32(ppe, PPE_CAH_CTRL), ppe_timestamp(ppe));
++	{
++		struct en75_ppe_block *blk;
++		unsigned int flows = 0, blocks = 0;
++
++		mutex_lock(&ppe->cmd_lock);
++		list_for_each_entry(blk, &ppe->blocks, node) {
++			flows += atomic_read(&blk->flows.nelems);
++			blocks++;
++		}
++		mutex_unlock(&ppe->cmd_lock);
++		seq_printf(m, "blocks=%u flows=%u binds=%lu bind_misses=%lu cache_timeouts=%lu\n",
++			   blocks, flows, READ_ONCE(ppe->binds),
++			   READ_ONCE(ppe->bind_misses), READ_ONCE(ppe->cache_timeouts));
++	}
++
++	for (i = 0; i < PPE_ENTRIES; i++) {
++		u32 ib1 = READ_ONCE(ppe_entry(ppe, i)->ib1);
++
++		count[FIELD_GET(FOE_IB1_STATE, ib1)]++;
++		if (FIELD_GET(FOE_IB1_STATE, ib1))
++			type[FIELD_GET(FOE_IB1_PACKET_TYPE, ib1)]++;
++	}
++	for (i = 0; i < ARRAY_SIZE(count); i++)
++		seq_printf(m, "%s=%u ", state_name[i], count[i]);
++	seq_puts(m, "\ntypes:");
++	for (i = 0; i < ARRAY_SIZE(type); i++)
++		if (type[i])
++			seq_printf(m, " %u=%u", i, type[i]);
++	seq_putc(m, '\n');
++
++	/* Raw words of the first bound entries, then of the first other valid ones: ib1, original tuple, ib2, new tuple, then the L2 block. */
++	for (int pass = 0; pass < 2; pass++) {
++		for (i = 0; i < PPE_ENTRIES && shown < 32; i++) {
++			struct en75_foe_entry *e = ppe_entry(ppe, i);
++			u32 state = FIELD_GET(FOE_IB1_STATE, READ_ONCE(e->ib1));
++			int w;
++
++			if (!state || (state == FOE_STATE_BIND) != !pass)
++				continue;
++			seq_printf(m, "%5u: %08x", i, READ_ONCE(e->ib1));
++			for (w = 0; w < ARRAY_SIZE(e->data); w++)
++				seq_printf(m, " %08x", READ_ONCE(e->data[w]));
++			seq_putc(m, '\n');
++			shown++;
++		}
++	}
++	return 0;
++}
+diff --git a/econet_ppe.h b/econet_ppe.h
+new file mode 100644
+index 0000000..09d39d0
+--- /dev/null
++++ b/econet_ppe.h
+@@ -0,0 +1,26 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef ECONET_PPE_H
++#define ECONET_PPE_H
++
++#include <linux/netdevice.h>
++#include <linux/skbuff.h>
++#include <linux/types.h>
++
++struct device;
++struct seq_file;
++struct en75_ppe;
++
++/* PPE register block, relative to the frame engine base (the MT7621-generation layout: block at FE+0xc00, registers from +0x200). */
++#define EN75_PPE_REGS		0xe00
++
++struct en75_ppe *en75_ppe_init(struct device *dev, void __iomem *fe);
++void en75_ppe_deinit(struct en75_ppe *ppe);
++/* RX: CPU reason and table index from the descriptor of a frame that came through the engine, the frame and the offset of its EtherType (behind the MediaTek tag); binds the matching offloaded flow. Called in NAPI context. */
++void en75_ppe_check_skb(struct en75_ppe *ppe, struct sk_buff *skb,
++			unsigned int proto_off, u8 crsn, u16 index);
++/* ndo_setup_tc of the netdev whose GDM forwards to the engine (TC_SETUP_FT, also reached through DSA user ports). */
++int en75_ppe_setup_tc(struct en75_ppe *ppe, struct net_device *dev,
++		      enum tc_setup_type type, void *type_data);
++int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe);
++
++#endif
+diff --git a/econet_qdma.c b/econet_qdma.c
+index 63090d6..8dd1a1e 100644
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -241,15 +241,14 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+ 	skb_reserve(skb, EN75_RX_HEADROOM);
+ 	__skb_put(skb, len);
+ 	skb_mark_for_recycle(skb);
+-	/* ip_summed stays CHECKSUM_NONE: the GDM only checks TCP/UDP checksums when it parses the MediaTek tag (stag_en, see gdm_regs.h), which the driver leaves off, so the stack verifies everything. */
++	/* ip_summed stays CHECKSUM_NONE: the GDM only checks TCP/UDP checksums when it parses the MediaTek tag (stag_en, see gdm_regs.h), which is set only with the PPE and not relied on, so the stack verifies everything. */
+ 
+-	/* skb->hash stays unset: while the PPE is off the PPE entry index is the same for every packet, and a constant L4 hash sends all flows to one RPS CPU. The flow dissector hashes through the DSA tag. */
+-
+-	/* TODO: When we begin supporting the PPE, we will handle
+-	 *       PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED here. */
++	/* skb->hash stays unset: the PPE entry index in the descriptor is the same for every frame the engine does not learn (all of them while it is off), and a constant L4 hash sends all flows to one RPS CPU. The flow dissector hashes through the DSA tag. */
+ 
+ 	sport = get_erx_sport(&desc.msg.erx);
+-	if (en75_rx_before_recv(q->qdma->eth, skb, sport))
++	if (en75_rx_before_recv(q->qdma->eth, skb, sport,
++				get_erx_crsn(&desc.msg.erx),
++				get_erx_ppe_entry(&desc.msg.erx)))
+ 		dev_kfree_skb(skb);
+ 	else
+ 		napi_gro_receive(&q->napi, skb);
+diff --git a/gdm_regs.h b/gdm_regs.h
+index 50e09df..e0d15ce 100644
+--- a/gdm_regs.h
++++ b/gdm_regs.h
+@@ -152,7 +152,7 @@ struct gdm {
+ 	 */
+ 	struct gdm_mymac_msb { u32 word; } mymac_msb;
+ 
+-	/** gdm_stag_en: bit0 makes the GDM parse the MediaTek special tag on frames from the switch (vendor GDMA1_VLAN_CHECK, written by macEN7512STagEnable; TPID 0x8100 in bits 31:16 after reset). Then it reports IPv4/IPv6 and drops bad TCP/UDP checksums, but on GS2107 every frame then took about 7 ms round trip (0.5 ms without), TCP fell to a few Mb/s and every received frame carried a CPU reason (last one decoded crsn=30, ppe_entry=1), which suggests a detour through the FE/PPE path that the vendor sets up with hw_nat.ko (not verified). The driver leaves it off. */
++	/** gdm_stag_en: bit0 makes the GDM parse the MediaTek special tag of frames from the switch (vendor GDMA1_VLAN_CHECK, which macEN7512STagEnable writes as the whole word 1; TPID 0x8100 in bits 31:16 after reset). The PPE only builds entries for frames behind the tag with it set; the GDM then also reports IPv4/IPv6 and drops bad TCP/UDP checksums, and frames that come through the PPE carry source ports other than GDM1 (9, 11, 12 seen) in the RX descriptor. Set together with the DMA tag parsing when the PPE is used (en75_set_dsa_tag_parse()). */
+ 	u32 stag_en;
+ 
+ 	/**

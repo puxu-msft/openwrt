@@ -1,0 +1,144 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] fw4: hardware flow offloading on the same devices as software offloading
+
+With flow_offloading_hw the flowtable used to hook only the lower devices of the zones, without the upper devices and the defaults.flow_offloading_devices names that software offloading hooks (patch 100), so turning hardware offloading on dropped the Wi-Fi APs from the flowtable altogether. Hardware offloading now hooks the same devices with the offload flag. The OpenWrt kernel binds the offload on each device whose driver takes it and keeps the others (bridges, Wi-Fi APs) on the software path of the same flowtable (target/linux/generic pending patch 701), so flows that involve a Wi-Fi AP stay offloaded in software and are offered to the hardware about once a second, which its driver turns down. A kernel that rejects such a device rejects the whole flowtable; then fw4 falls back to software offloading, as before. Tests: the hardware offload case hooks br-lan as well, with fs.access fixtures for the devices the software path checks.
+
+diff --git a/root/usr/share/ucode/fw4.uc b/root/usr/share/ucode/fw4.uc
+index 31781c6..74054a6 100644
+--- a/root/usr/share/ucode/fw4.uc
++++ b/root/usr/share/ucode/fw4.uc
+@@ -519,12 +519,12 @@ return {
+ 		return v;
+ 	},
+ 
+-	resolve_hw_offload_devices: function() {
+-		if (!this.default_option("flow_offloading_hw"))
+-			return null;
++	resolve_offload_devices: function() {
++		if (!this.default_option("flow_offloading"))
++			return [];
+ 
+-		let devstatus = null;
+-		let devices = null;
++		// Without ubus the lower devices cannot be resolved and each device is hooked as is.
++		let devstatus = {};
+ 		let bus = ubus.connect();
+ 
+ 		if (bus) {
+@@ -532,62 +532,32 @@ return {
+ 			bus.disconnect();
+ 		}
+ 
++		let devices = [];
++
++		// The kernel resolves the real forwarding path (bridge -> port -> DSA conduit or Wi-Fi) and only offloads a flow whose resolved ingress device is hooked, so hook the lower devices of bridges and VLANs as well as the upper devices.
+ 		for (let zone in this.zones())
+ 			for (let device in zone.related_physdevs)
+-				push(devices ||= [], ...resolve_lower_devices(devstatus, device));
++				if (fs.access(`/sys/class/net/${device}`))
++					push(devices, device, ...resolve_lower_devices(devstatus, device));
+ 
+-		if (!devices)
+-			return null;
++		// Extra flowtable devices from the defaults section; a trailing "*" is a name prefix (kernel 6.16+), so interfaces that join a bridge after the firewall starts, such as Wi-Fi APs, are hooked when they appear.
++		push(devices, ...(this.default_option("flow_offloading_devices") ?? []));
++
++		// The kernel refuses overlapping hooks in one flowtable, so drop every name or prefix that a different, shorter prefix already covers.
++		let prefixes = uniq(map(filter(devices, d => substr(d, -1) == "*"), d => substr(d, 0, -1)));
++		devices = filter(devices, d => {
++			let is_prefix = (substr(d, -1) == "*");
++			let stem = is_prefix ? substr(d, 0, -1) : d;
++
++			return !length(filter(prefixes, p => (!is_prefix || p != stem) && index(stem, p) === 0));
++		});
+ 
+ 		devices = sort(uniq(devices));
+ 
+-		if (!nft_try_hw_offload(devices)) {
++		// Hardware offloading hooks the same devices: an OpenWrt kernel binds the offload on every device whose driver takes it and keeps the others (bridges, Wi-Fi APs) on the software path of the same flowtable (pending patch 701), so flows between a switch port and a Wi-Fi AP stay offloaded in software. A kernel that rejects such a device rejects the whole flowtable; fall back to software offloading then.
++		if (this.default_option("flow_offloading_hw") && length(devices) && !nft_try_hw_offload(devices)) {
+ 			this.warn('Hardware flow offloading unavailable, falling back to software offloading');
+ 			this.state.defaults.flow_offloading_hw = false;
+-
+-			return null;
+-		}
+-
+-		return devices;
+-	},
+-
+-	resolve_offload_devices: function() {
+-		if (!this.default_option("flow_offloading"))
+-			return [];
+-
+-		let devices = this.resolve_hw_offload_devices();
+-
+-		if (!devices) {
+-			// Without ubus the lower devices cannot be resolved and each device is hooked as is.
+-			let devstatus = {};
+-			let bus = ubus.connect();
+-
+-			if (bus) {
+-				devstatus = bus.call("network.device", "status") || {};
+-				bus.disconnect();
+-			}
+-
+-			devices = [];
+-
+-			// The kernel resolves the real forwarding path (bridge -> port -> DSA conduit or Wi-Fi) and only offloads a flow whose resolved ingress device is hooked, so hook the lower devices of bridges and VLANs as well, as for hardware offloading.
+-			for (let zone in this.zones())
+-				for (let device in zone.related_physdevs)
+-					if (fs.access(`/sys/class/net/${device}`))
+-						push(devices, device, ...resolve_lower_devices(devstatus, device));
+-
+-			// Extra flowtable devices from the defaults section; a trailing "*" is a name prefix (kernel 6.16+), so interfaces that join a bridge after the firewall starts, such as Wi-Fi APs, are hooked when they appear.
+-			push(devices, ...(this.default_option("flow_offloading_devices") ?? []));
+-
+-			// The kernel refuses overlapping hooks in one flowtable, so drop every name or prefix that a different, shorter prefix already covers.
+-			let prefixes = uniq(map(filter(devices, d => substr(d, -1) == "*"), d => substr(d, 0, -1)));
+-			devices = filter(devices, d => {
+-				let is_prefix = (substr(d, -1) == "*");
+-				let stem = is_prefix ? substr(d, 0, -1) : d;
+-
+-				return !length(filter(prefixes, p => (!is_prefix || p != stem) && index(stem, p) === 0));
+-			});
+-
+-			devices = sort(uniq(devices));
+ 		}
+ 
+ 		return devices;
+diff --git a/tests/01_configuration/01_ruleset b/tests/01_configuration/01_ruleset
+index 108dff9..ed3152b 100644
+--- a/tests/01_configuration/01_ruleset
++++ b/tests/01_configuration/01_ruleset
+@@ -26,7 +26,7 @@ table inet fw4 {
+ 
+ 	flowtable ft {
+ 		hook ingress priority 0;
+-		devices = { "eth0", "eth1" };
++		devices = { "br-lan", "eth0", "eth1" };
+ 		counter;
+ 		flags offload;
+ 	}
+@@ -320,7 +320,7 @@ table inet fw4 {
+ 		add table inet fw4-hw-offload-test;
+ 		add flowtable inet fw4-hw-offload-test ft {
+ 			hook ingress priority 0;
+-			devices = { "eth0", "eth1" };
++			devices = { "br-lan", "eth0", "eth1" };
+ 			flags offload;
+ 		}
+ 	' 2>/dev/null> timeout <null>
+diff --git a/tests/mocks/fs/open~_sys_class_net_br-lan.txt b/tests/mocks/fs/open~_sys_class_net_br-lan.txt
+new file mode 100644
+index 0000000..e7f6134
+--- /dev/null
++++ b/tests/mocks/fs/open~_sys_class_net_br-lan.txt
+@@ -0,0 +1 @@
++present
+diff --git a/tests/mocks/fs/open~_sys_class_net_eth1.txt b/tests/mocks/fs/open~_sys_class_net_eth1.txt
+new file mode 100644
+index 0000000..e7f6134
+--- /dev/null
++++ b/tests/mocks/fs/open~_sys_class_net_eth1.txt
+@@ -0,0 +1 @@
++present
