@@ -1,0 +1,311 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: RX checksum result and fe_regs transfer limit
+
+- RX checksum: frames whose descriptor reports IPv4 or IPv6, L4VLD set and L4F/IP4F clear, from a source port other than the CPU ports, are passed up as CHECKSUM_UNNECESSARY (the vendor eth_rx rule bit for bit, eth.ko 0x11a4..0x11dc and 0x1410..0x1420), under NETIF_F_RXCSUM (ethtool -K eth0 rx off turns it off). On GS2107 (2026-11-14, stag_en on): TCP SYNs with a bad TCP checksum, ICMP echoes with a bad ICMP checksum and two-fragment UDP datagrams with a bad UDP checksum all go unanswered, the last two counted in Icmp/Udp InCsumErrors, and no ICMP frame or IPv4 fragment was among the frames marked. debugfs econet_eth/rx_csum counts marked frames and, among them, those that are not TCP/UDP or are IPv4 fragments.
+- fe_regs: one transfer covers at most 64 bytes. Some offsets in the frame engine window stall the bus when read and hang the SoC (a grep over the whole file did), so cat and grep get -EINVAL; registers are read with dd bs=4.
+
+diff --git a/econet_eth.c b/econet_eth.c
+index fd817d5..0295bab 100644
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -37,6 +37,9 @@
+ #include <linux/platform_device.h>
+ #include <linux/reset.h>
+ #include <linux/of_net.h>
++#include <net/ip.h>
++#include <linux/ipv6.h>
++#include <linux/unaligned.h>
+ 
+ #include "gdm_regs.h"
+ #include "linux/dev_printk.h"
+@@ -107,6 +110,7 @@ struct en75_eth_pvt {
+ 	struct en75_ppe			*ppe;
+ 	/* Received frames per CPU reason (debugfs crsn) */
+ 	unsigned long			crsn_count[32];
++	struct en75_rx_csum_stats	rx_csum;
+ };
+ 
+ union gdm_regs {
+@@ -159,20 +163,64 @@ static struct net_device *en75_get_sport_dev(struct en75_eth_pvt *eth,
+ 	return eth->ports[0];
+ }
+ 
++/* For a frame marked CHECKSUM_UNNECESSARY: count what the GDM rule let through (struct en75_rx_csum_stats). The fields read share the cache line that eth_type_trans() reads next. */
++static void en75_rx_csum_audit(struct en75_rx_csum_stats *st,
++			       const struct sk_buff *skb, unsigned int proto_off)
++{
++	const void *l3 = skb->data + proto_off + 2;
++	unsigned int len;
++	u8 proto;
++
++	st->marked++;
++	if (skb_headlen(skb) < proto_off + 2)
++		goto unparsed;
++	len = skb_headlen(skb) - (proto_off + 2);
++	switch (get_unaligned_be16(skb->data + proto_off)) {
++	case ETH_P_IP: {
++		const struct iphdr *iph = l3;
++
++		if (len < sizeof(*iph))
++			goto unparsed;
++		if (ip_is_fragment(iph))
++			st->ipv4_frag++;
++		proto = iph->protocol;
++		break;
++	}
++	case ETH_P_IPV6:
++		if (len < sizeof(struct ipv6hdr))
++			goto unparsed;
++		proto = ((const struct ipv6hdr *)l3)->nexthdr;
++		break;
++	default:
++		goto unparsed;
++	}
++	if (proto != IPPROTO_TCP && proto != IPPROTO_UDP)
++		st->not_tcp_udp++;
++	return;
++unparsed:
++	st->unparsed++;
++}
++
+ int en75_rx_before_recv(struct en75_eth *eth, struct sk_buff *skb,
+-			enum etx_fport sport, u8 crsn, u16 ppe_entry)
++			enum etx_fport sport, u8 crsn, u16 ppe_entry,
++			bool l4_csum_ok)
+ {
+ 	struct en75_eth_pvt *ep = (struct en75_eth_pvt *) eth;
+ 	struct net_device *port;
++	unsigned int proto_off;
+ 
+ 	ep->crsn_count[crsn & 31]++;
+ 	port = en75_get_sport_dev(ep, sport);
+-
+ 	/* the EtherType follows the 4-byte MediaTek tag on a DSA conduit */
++	proto_off = netdev_uses_dsa(port) ? 2 * ETH_ALEN + 4 : 2 * ETH_ALEN;
++
++	if (l4_csum_ok && (port->features & NETIF_F_RXCSUM)) {
++		skb->ip_summed = CHECKSUM_UNNECESSARY;
++		en75_rx_csum_audit(&ep->rx_csum, skb, proto_off);
++	}
++
+ 	if (ep->ppe)
+-		en75_ppe_check_skb(ep->ppe, skb,
+-				   netdev_uses_dsa(port) ? 2 * ETH_ALEN + 4 : 2 * ETH_ALEN,
+-				   crsn, ppe_entry);
++		en75_ppe_check_skb(ep->ppe, skb, proto_off, crsn, ppe_entry);
+ 
+ 	skb->dev = port;
+ 	skb->protocol = eth_type_trans(skb, port);
+@@ -440,6 +488,7 @@ static int en75_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	debug_conf.crsn_count = eth->crsn_count;
++	debug_conf.rx_csum = &eth->rx_csum;
+ 	eth->debug = en75_debugfs_init(&debug_conf);
+ 
+ 	/* Configure the MT7530 as a dumb switch, unless it is managed by DSA */
+diff --git a/econet_eth.h b/econet_eth.h
+index 14cccac..fe4249f 100644
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -153,6 +153,14 @@ struct en75_debug_qdma_conf {
+ 	struct en75_debug_qdma_irq_conf		irqs[QDMA_NUM_IRQS];
+ };
+ 
++/* Received frames marked CHECKSUM_UNNECESSARY (debugfs rx_csum), and among them those whose IP protocol is not TCP or UDP (IPv6 extension and fragment headers included), IPv4 fragments, and frames without an IPv4/IPv6 header right behind the Ethernet header or tag (802.1Q). Counted only. */
++struct en75_rx_csum_stats {
++	unsigned long marked;
++	unsigned long not_tcp_udp;
++	unsigned long ipv4_frag;
++	unsigned long unparsed;
++};
++
+ struct en75_debug_conf {
+ 	struct en75_debug_qdma_conf		qdma[EN75_NUM_QDMA];
+ 	/* The whole frame engine window as mapped by probe, for raw register access. */
+@@ -160,6 +168,7 @@ struct en75_debug_conf {
+ 	resource_size_t				fe_regs_len;
+ 	struct en75_ppe				*ppe;
+ 	unsigned long				*crsn_count;	/* [32] */
++	struct en75_rx_csum_stats		*rx_csum;
+ };
+ 
+ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config);
+@@ -180,9 +189,10 @@ struct en75_eth {
+ 	struct device *dev;
+ };
+ 
+-/* Called in softirq context */
++/* Called in softirq context. l4_csum_ok: the RX descriptor passes the checksum rule of en75_erx_l4_csum_ok(). */
+ int en75_rx_before_recv(struct en75_eth *eth, struct sk_buff *skb,
+-			enum etx_fport sport, u8 crsn, u16 ppe_entry);
++			enum etx_fport sport, u8 crsn, u16 ppe_entry,
++			bool l4_csum_ok);
+ 
+ /* Called from the port driver to the main eth to notify the switch */
+ int en75_port_set_macaddr(struct en75_eth *eth, enum etx_fport portn,
+diff --git a/econet_eth_debug.c b/econet_eth_debug.c
+index b5d2b35..138cc16 100644
+--- a/econet_eth_debug.c
++++ b/econet_eth_debug.c
+@@ -39,7 +39,7 @@ static void print_erx(struct seq_file *m, struct qdma_desc_erx *erx)
+ 		is_erx_ip4(erx) ? " IP4" : "",
+ 		is_erx_ip4f(erx) ? " IP4F" : "",
+ 		is_erx_tack(erx) ? " TACK" : "",
+-		is_erx_l2vld(erx) ? " L2VLD" : "",
++		is_erx_l4vld(erx) ? " L4VLD" : "",
+ 		is_erx_l4f(erx) ? " L4F" : "",
+ 		is_erx_untag(erx) ? " UNTAG" : ""
+ 	);
+@@ -576,7 +576,9 @@ static int en75_init_qdma(struct en75_qdma_debug *qdma_debug)
+ 
+ /*
+  * fe_regs: raw access to the frame engine register window, for bringing up blocks the driver does not drive yet (the PPE). The file offset is the register offset; every transfer is whole, aligned 32-bit words in CPU byte order. Reads have the side effects of the registers read (clear-on-read counters).
++ * A transfer covers at most EN75_FE_REGS_MAX_XFER bytes: some offsets in the window stall the bus when read and hang the SoC without a watchdog reset (a whole-window read with grep did on GS2107, 2026-11-14), so a cat or grep, which asks for a page or more, gets -EINVAL instead of walking the window; read registers with dd bs=4 skip=<offset/4> count=<n>.
+  */
++#define EN75_FE_REGS_MAX_XFER	64
+ static ssize_t en75_fe_regs_xfer(struct file *file, char __user *ubuf,
+ 				 const char __user *wbuf, size_t len, loff_t *ppos)
+ {
+@@ -586,7 +588,7 @@ static ssize_t en75_fe_regs_xfer(struct file *file, char __user *ubuf,
+ 
+ 	if (!len)
+ 		return 0;
+-	if ((pos | len) & 3)
++	if (((pos | len) & 3) || len > EN75_FE_REGS_MAX_XFER)
+ 		return -EINVAL;
+ 	if (pos >= debug->config.fe_regs_len)
+ 		return 0;
+@@ -643,6 +645,17 @@ static int en75_crsn_show(struct seq_file *m, void *v)
+ }
+ DEFINE_SHOW_ATTRIBUTE(en75_crsn);
+ 
++static int en75_rx_csum_show(struct seq_file *m, void *v)
++{
++	struct en75_rx_csum_stats *st = m->private;
++
++	seq_printf(m, "marked=%lu not_tcp_udp=%lu ipv4_frag=%lu unparsed=%lu\n",
++		   READ_ONCE(st->marked), READ_ONCE(st->not_tcp_udp),
++		   READ_ONCE(st->ipv4_frag), READ_ONCE(st->unparsed));
++	return 0;
++}
++DEFINE_SHOW_ATTRIBUTE(en75_rx_csum);
++
+ static int en75_ppe_show(struct seq_file *m, void *v)
+ {
+ 	return en75_ppe_debugfs_show(m, m->private);
+@@ -676,6 +689,9 @@ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config)
+ 	if (config->crsn_count)
+ 		debugfs_create_file("crsn", 0400, debug->dir, config->crsn_count,
+ 				    &en75_crsn_fops);
++	if (config->rx_csum)
++		debugfs_create_file("rx_csum", 0400, debug->dir, config->rx_csum,
++				    &en75_rx_csum_fops);
+ 
+ 	BUILD_BUG_ON(ARRAY_SIZE(debug->qdma) != ARRAY_SIZE(config->qdma));
+ 	for (int i = 0; i < ARRAY_SIZE(debug->qdma); i++) {
+diff --git a/econet_port.c b/econet_port.c
+index 423e0a0..757e25d 100644
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -546,11 +546,11 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+ 
+ 	/*
+ 	 * NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6: TCP/UDP checksums (ICO for the IPv4 header, TCO/UCO) and TSO (MSS in the TCP checksum field) as the vendor qdma_bm_transmit_packet_tso does them for IPv4, one descriptor per buffer; IPv6 has no vendor precedent and was verified on GS2107 like IPv4, behind the MediaTek tag. en75_features_check() leaves other traffic to the stack. They pay off for traffic the router sends itself; forwarded TCP arrives as fraglist GRO and leaves as the original segments.
+-	 * NETIF_F_RXCSUM: not offered: the GDM checks TCP/UDP checksums only with stag_en (gdm_regs.h), which is set only with the PPE, and that check is not relied on; received frames are CHECKSUM_NONE.
++	 * NETIF_F_RXCSUM: frames that pass the vendor rule on the GDM checksum bits (en75_erx_l4_csum_ok()) are CHECKSUM_UNNECESSARY, the rest CHECKSUM_NONE. On a DSA conduit the GDM parses received frames only with stag_en, which is set only with the PPE; without it every frame is CHECKSUM_NONE.
+ 	 * NETIF_F_HW_TC: with the PPE, fixed on, for nf_flowtable hardware offload (TC_SETUP_FT, econet_ppe.c).
+ 	 */
+ 	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG |
+-			    NETIF_F_TSO | NETIF_F_TSO6;
++			    NETIF_F_TSO | NETIF_F_TSO6 | NETIF_F_RXCSUM;
+ 	/* A frame on the ring stays below 64 KiB (the vendor driver refuses longer ones); on this device skb->len already counts the Ethernet header and the MediaTek tag. */
+ 	netif_set_tso_max_size(ndev, 0xffff);
+ 
+diff --git a/econet_qdma.c b/econet_qdma.c
+index 8dd1a1e..95e137d 100644
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -205,6 +205,18 @@ static void en75_fill_rx_queue(struct en75_q_rx *q, u32 end_i)
+ 	en75_wreg(cpu_i, &q->qchain_regs->rx_cpui);
+ }
+ 
++/* The CHECKSUM_UNNECESSARY rule of the vendor eth_rx, bit for bit (eth.ko 0x11a4..0x11dc, 0x1410..0x1420): IP4 or IP6 set, L4VLD set, L4F and IP4F clear, source port not 0 or 5 (the CPU ports). Whether the GDM sets L4VLD on frames whose TCP/UDP checksum it cannot have checked (another IP protocol, an IPv4 fragment) is not verified; debugfs rx_csum counts such frames among those marked. Without stag_en the GDM does not report IP4/IP6 for frames behind the MediaTek tag (seen on GS2107), so none is marked. */
++static bool en75_erx_l4_csum_ok(struct qdma_desc_erx *erx)
++{
++	u32 w = erx->bitfield_0;
++	u8 sport = get_erx_sport(erx);
++
++	if (sport == ETX_FPORT_QDMA0_CPU || sport == ETX_FPORT_QDMA1_CPU)
++		return false;
++	return (w & (ERX_IP4 | ERX_IP6)) &&
++	       (w & (ERX_IP4F | ERX_L4VLD | ERX_L4F)) == ERX_L4VLD;
++}
++
+ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+ 				     enum dma_data_direction dir)
+ {
+@@ -241,14 +253,14 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+ 	skb_reserve(skb, EN75_RX_HEADROOM);
+ 	__skb_put(skb, len);
+ 	skb_mark_for_recycle(skb);
+-	/* ip_summed stays CHECKSUM_NONE: the GDM only checks TCP/UDP checksums when it parses the MediaTek tag (stag_en, see gdm_regs.h), which is set only with the PPE and not relied on, so the stack verifies everything. */
+ 
+ 	/* skb->hash stays unset: the PPE entry index in the descriptor is the same for every frame the engine does not learn (all of them while it is off), and a constant L4 hash sends all flows to one RPS CPU. The flow dissector hashes through the DSA tag. */
+ 
+ 	sport = get_erx_sport(&desc.msg.erx);
+ 	if (en75_rx_before_recv(q->qdma->eth, skb, sport,
+ 				get_erx_crsn(&desc.msg.erx),
+-				get_erx_ppe_entry(&desc.msg.erx)))
++				get_erx_ppe_entry(&desc.msg.erx),
++				en75_erx_l4_csum_ok(&desc.msg.erx)))
+ 		dev_kfree_skb(skb);
+ 	else
+ 		napi_gro_receive(&q->napi, skb);
+diff --git a/qdma_desc.h b/qdma_desc.h
+index d6b5a05..9b1f742 100644
+--- a/qdma_desc.h
++++ b/qdma_desc.h
+@@ -233,12 +233,12 @@ static inline void set_etx_vlan_tag(struct etx *x, u16 v) {
+  * @unknown0 (32 bit): Unknown / unused field, first word in descriptor
+  * @bitfield_0 (32 bit):
+  *   @unknown1 "nknwn" (bits 31..29): Revision number? (unused)
+- *   @ip6 "I" (bit 28): IPv6 packet indicator
+- *   @ip4 "P" (bit 27): IPv4 packet indicator
+- *   @ip4f "F" (bit 26): IPv4 fragment flag
++ *   @ip6 "I" (bit 28): IPv6 packet; on GDM1 behind the MediaTek tag reported only with stag_en (seen on GS2107)
++ *   @ip4 "P" (bit 27): IPv4 packet, same condition
++ *   @ip4f "F" (bit 26): the vendor eth_rx prints "IP checksum error" for it (eth.ko 0x10f4/0x14d0)
+  *   @tack "T" (bit 25): TCP ACK flag
+- *   @l2vld "L" (bit 24): Layer 2 valid flag
+- *   @l4f "A" (bit 23): Layer 4 flag (e.g., checksum failure)
++ *   @l4vld "L" (bit 24): L4 valid; the vendor eth_rx requires it for CHECKSUM_UNNECESSARY (eth.ko 0x1410), mainline mtk_eth_soc uses the same bit as RX_DMA_L4_VALID
++ *   @l4f "A" (bit 23): the vendor eth_rx prints "TCP/UDP checksum error" for it (eth.ko 0x1100/0x14b8)
+  *   @sport (bits 22..19): Where the packet came from, mostly unknown / unused,
+  *                         needs testing
+  *   @crsn (bits 18..14): Most likely a MediaTek PPE CPU_REASON
+@@ -265,7 +265,7 @@ struct qdma_desc_erx {
+ #define ERX_IP4						BIT(27)
+ #define ERX_IP4F					BIT(26)
+ #define ERX_TACK					BIT(25)
+-#define ERX_L2VLD					BIT(24)
++#define ERX_L4VLD					BIT(24)
+ #define ERX_L4F						BIT(23)
+ #define ERX_SPORT_MASK					GENMASK(22, 19)
+ #define ERX_CRSN_MASK					GENMASK(18, 14)
+@@ -301,11 +301,11 @@ static inline bool is_erx_tack(struct qdma_desc_erx *x) {
+ static inline void set_erx_tack(struct qdma_desc_erx *x, bool v) {
+ 	x->bitfield_0 = FIELD_SET(x->bitfield_0, ERX_TACK, v);
+ }
+-static inline bool is_erx_l2vld(struct qdma_desc_erx *x) {
+-	return FIELD_GET(ERX_L2VLD, x->bitfield_0);
++static inline bool is_erx_l4vld(struct qdma_desc_erx *x) {
++	return FIELD_GET(ERX_L4VLD, x->bitfield_0);
+ }
+-static inline void set_erx_l2vld(struct qdma_desc_erx *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, ERX_L2VLD, v);
++static inline void set_erx_l4vld(struct qdma_desc_erx *x, bool v) {
++	x->bitfield_0 = FIELD_SET(x->bitfield_0, ERX_L4VLD, v);
+ }
+ static inline bool is_erx_l4f(struct qdma_desc_erx *x) {
+ 	return FIELD_GET(ERX_L4F, x->bitfield_0);
