@@ -1,25 +1,24 @@
 Subject: [PATCH] mtd: spi-nand: add support for the BWET08U (0xBC/0xB2) SPI NAND
 
-The ChinaMobile GS2107 (EcoNet EN7528) uses a 256MB SPI NAND that the stock
-3.18 kernel identifies as _SPI_NAND_DEVICE_ID_BWET08U (manufacturer 0xBC,
-device 0xB2). The generic spi-nand core has no entry for manufacturer 0xBC,
-so even with a working low-level driver the probe fails at the ID match
-stage ("unknown raw ID").
+The ChinaMobile GS2107 (EcoNet EN7528) uses a 256MB SPI NAND that the stock 3.18 kernel identifies as _SPI_NAND_DEVICE_ID_BWET08U (manufacturer 0xBC, device 0xB2). The generic spi-nand core has no entry for manufacturer 0xBC, so even with a working low-level driver the probe fails at the ID match stage ("unknown raw ID").
 
-All parameters were reverse-engineered from the stock kernel's NAND table
-(scan_spi_nand_table@0x802cfa50, entry 43) and are documented with evidence
-levels in devices/gs2107/docs/11-NAND-ROOTCAUSE.md §12:
+All parameters were reverse-engineered from the stock kernel's NAND table (scan_spi_nand_table@0x802cfa50, entry 43) and are documented with evidence levels in devices/gs2107/docs/11-NAND-ROOTCAUSE.md §12:
 - geometry: 2048B pages, 64 pages/block, 2048 blocks/LUN, SLC, OOB 64
 - on-die ECC enabled via SET_FEATURE(0xB0, bit4) in configure_chip
 - block unlock via SET_FEATURE(0xA0, & ~0x38)
 - ID read method OPCODE_ADDR (the clean ID read on this board)
 
-ECC strength/step and the exact OOB ECC byte layout are placeholders
-pending datasheet confirmation (docs/11 §12.8).
+ECC strength/step and the exact OOB ECC byte layout are placeholders pending datasheet confirmation (docs/11 §12.8).
 
---- /dev/null	2026-11-04 21:30:38.310994673 +0800
-+++ b/drivers/mtd/nand/spi/bwet.c	2026-11-08 07:31:56.948964209 +0800
-@@ -0,0 +1,128 @@
+ECC status (status register bits 5:4): only 10 = uncorrectable is backed by evidence (the stock driver's ecc_fail_check {0x30, 0x20}); the stock driver uses the data on 01 and 11. Without a get_status hook the core fails the read on 11 (-EINVAL) and reports 01 as the full strength, which reaches bitflip_threshold, so every read that needed any correction made UBI scrub the PEB (copy and erase) or, in the enable-remap kernel partition, mtk_bmt retire the block for good into the reserve pool and rewrite the BMT.
+
+01 now reports half the strength, below the threshold. Trade-off: a block that only ever reports 01 is no longer scrubbed by UBI or remapped by mtk_bmt (mtk_bmt_read() remaps only at or above the threshold); in the kernel partition, which has no UBI, a weakening block has to be found from increments of /sys/class/mtd/mtd3/corrected_bits.
+
+The meaning of 11 is unknown: the stock table applies the same check to W25N01GV, MX35LF1GE4AB and F50L1G41LB, whose drivers fail the read on 11, while GD5FxGQ4xA, HYF1GQ4UDACAE, PN26G0xA and W25N0xKV use 11 for their highest corrected class. Following the stock driver (use the data) and the HYF1GQ4UDACAE driver (full strength for its refresh code), 11 reports the full strength, with a rate-limited warning so that real occurrences can be checked against the data.
+
+--- /dev/null
++++ b/drivers/mtd/nand/spi/bwet.c
+@@ -0,0 +1,155 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Support for the SPI NAND found in the ChinaMobile GS2107 (EcoNet EN7528),
@@ -42,6 +41,9 @@ pending datasheet confirmation (docs/11 §12.8).
 +#define BWET_FR_BLOCK_LOCK_UNLOCK_MASK		0x38
 +#define BWET_FR_ECC				0xb0
 +#define BWET_FR_ECC_ON_DIE			BIT(4)
++
++/* ECC status, status register bits 5:4; no register with the exact bitflip count is known. There is no datasheet, and only 10 = uncorrectable is backed by evidence: the stock EcoNet driver fails a read only on (status & 0x30) == 0x20. The meaning of 11 is unknown. The stock driver uses the data, but its table applies the same check to W25N01GV, MX35LF1GE4AB and F50L1G41LB, whose Linux and U-Boot drivers fail the read on 11, while GD5FxGQ4xA, PN26G0xA, W25N0xKV and the Linux HYF1GQ4UDACAE driver use 11 for their highest corrected class. */
++#define BWET_STATUS_ECC_11			(3 << 4)
 +
 +static SPINAND_OP_VARIANTS(read_cache_variants,
 +		SPINAND_PAGE_READ_FROM_CACHE_1S_1S_1S_OP(0, 1, NULL, 0, 0),
@@ -117,6 +119,30 @@ pending datasheet confirmation (docs/11 §12.8).
 +	.free = bwet_ooblayout_free,
 +};
 +
++static int bwet08u_ecc_get_status(struct spinand_device *spinand, u8 status)
++{
++	struct nand_device *nand = spinand_to_nand(spinand);
++
++	switch (status & STATUS_ECC_MASK) {
++	case STATUS_ECC_NO_BITFLIPS:
++		return 0;
++
++	case STATUS_ECC_UNCOR_ERROR:
++		return -EBADMSG;
++
++	case STATUS_ECC_HAS_BITFLIPS:
++		/* Corrected, count unknown. Stay below mtd->bitflip_threshold (3/4 of the strength): reaching it makes UBI scrub the PEB (copy and erase) and, in enable-remap partitions, mtk_bmt retire the block for good into the reserve pool and rewrite the BMT, on every read that needed any correction. Both values are relative to the strength, so they stay on their side of the threshold while NAND_ECCREQ is a placeholder. */
++		return nanddev_get_ecc_conf(nand)->strength / 2;
++
++	case BWET_STATUS_ECC_11:
++		/* Meaning unknown (see above). Like the stock driver, use the data; like the HYF1GQ4UDACAE driver for its refresh code, report the full strength so that the block gets refreshed. The warning lets real occurrences be checked against the data. */
++		dev_warn_ratelimited(&spinand->spimem->spi->dev, "ECC status 11 (meaning unknown), data used as corrected\n");
++		return nanddev_get_ecc_conf(nand)->strength;
++	}
++
++	return -EINVAL;
++}
++
 +static const struct spinand_info bwet_spinand_table[] = {
 +	SPINAND_INFO("BWET08U",
 +		     /*
@@ -135,7 +161,7 @@ pending datasheet confirmation (docs/11 §12.8).
 +					      &update_cache_variants),
 +		     0,
 +		     SPINAND_CONFIGURE_CHIP(bwet08u_cfg),
-+		     SPINAND_ECCINFO(&bwet_ooblayout, NULL)),
++		     SPINAND_ECCINFO(&bwet_ooblayout, bwet08u_ecc_get_status)),
 +};
 +
 +static const struct spinand_manufacturer_ops bwet_spinand_manuf_ops = {
@@ -148,9 +174,9 @@ pending datasheet confirmation (docs/11 §12.8).
 +	.nchips = ARRAY_SIZE(bwet_spinand_table),
 +	.ops = &bwet_spinand_manuf_ops,
 +};
---- a/drivers/mtd/nand/spi/core.c	2026-11-08 07:32:29.958411722 +0800
-+++ b/drivers/mtd/nand/spi/core.c	2026-11-08 07:32:29.958617940 +0800
-@@ -1243,9 +1243,12 @@
+--- a/drivers/mtd/nand/spi/core.c
++++ b/drivers/mtd/nand/spi/core.c
+@@ -1242,9 +1242,12 @@ static const struct nand_ops spinand_ops
  	.isbad = spinand_isbad,
  };
  
@@ -163,8 +189,8 @@ pending datasheet confirmation (docs/11 §12.8).
  	&esmt_8c_spinand_manufacturer,
  	&esmt_c8_spinand_manufacturer,
  	&etron_spinand_manufacturer,
---- a/drivers/mtd/nand/spi/Makefile	2026-11-08 07:32:29.958708110 +0800
-+++ b/drivers/mtd/nand/spi/Makefile	2026-11-08 07:32:29.958782883 +0800
+--- a/drivers/mtd/nand/spi/Makefile
++++ b/drivers/mtd/nand/spi/Makefile
 @@ -1,5 +1,5 @@
  # SPDX-License-Identifier: GPL-2.0
  spinand-objs := core.o otp.o
@@ -172,5 +198,3 @@ pending datasheet confirmation (docs/11 §12.8).
 +spinand-objs += alliancememory.o ato.o bwet.o esmt.o etron.o fmsh.o foresee.o gigadevice.o heyangtek.o
  spinand-objs += macronix.o micron.o paragon.o skyhigh.o toshiba.o winbond.o xtx.o
  obj-$(CONFIG_MTD_SPI_NAND) += spinand.o
--- 
-2.43.0
