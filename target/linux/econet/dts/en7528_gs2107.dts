@@ -49,6 +49,21 @@
 		reg = <0x00000000 0x1c000000>;
 	};
 
+	reserved-memory {
+		#address-cells = <1>;
+		#size-cells = <1>;
+		ranges;
+
+		/* 崩溃现场（pstore/ramoops）：panic、oops 与锁死检测触发的 panic 把内核日志写进这里，热复位（看门狗、sysrq、panic 重启）后由 /sys/fs/pstore 读出。放在 384 MB 处：U-Boot 只用 256 MB 以内（board_get_usable_ram_top 把重定位上限钳在 0x90000000），FIT 加载在 0x82000000；ecc-size 让被启动链覆盖的记录显出来而不是读成乱码。 */
+		ramoops@18000000 {
+			compatible = "ramoops";
+			reg = <0x18000000 0x100000>;
+			record-size = <0x20000>;
+			console-size = <0x40000>;
+			ecc-size = <16>;
+		};
+	};
+
 	chosen {
 		stdout-path = "/serial@1fbf0000:115200";
 		/*
