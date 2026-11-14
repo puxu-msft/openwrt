@@ -1,11 +1,13 @@
 From: GS2107 <gs2107@local>
-Subject: [PATCH] econet-eth: RX checksum result and fe_regs transfer limit
+Subject: [PATCH] econet-eth: RX checksum result, RX ring register fix and idle ring size, fe_regs transfer limit
 
 - RX checksum: frames whose descriptor reports IPv4 or IPv6, L4VLD set and L4F/IP4F clear, from a source port other than the CPU ports, are passed up as CHECKSUM_UNNECESSARY (the vendor eth_rx rule bit for bit, eth.ko 0x11a4..0x11dc and 0x1410..0x1420), under NETIF_F_RXCSUM (ethtool -K eth0 rx off turns it off). On GS2107 (2026-11-14, stag_en on): TCP SYNs with a bad TCP checksum, ICMP echoes with a bad ICMP checksum and two-fragment UDP datagrams with a bad UDP checksum all go unanswered, the last two counted in Icmp/Udp InCsumErrors, and no ICMP frame or IPv4 fragment was among the frames marked. debugfs econet_eth/rx_csum counts marked frames and, among them, those that are not TCP/UDP or are IPv4 fragments.
+- RX ring registers: QDMA+0x100 (ring sizes) and +0x104 (low thresholds) hold ring 0 in the low half (vendor qdma_lan.ko); the accessors had the halves swapped, harmless while both rings had 512 entries.
+- Idle RX rings (ring 1 of each QDMA, ring 0 of a QDMA without a port) get 32 descriptors instead of 512: 2.8 MiB less on GS2107. With the swapped halves this made the hardware wrap ring 0 at 32 and bulk receive raised RX0 ERR_COHERENT millions of times until the NAPI thread soft-locked; with the fix, pushes, bulk transfers both ways and a multicast/broadcast flood ran clean and nothing reached the idle rings.
 - fe_regs: one transfer covers at most 64 bytes. Some offsets in the frame engine window stall the bus when read and hang the SoC (a grep over the whole file did), so cat and grep get -EINVAL; registers are read with dd bs=4.
 
 diff --git a/econet_eth.c b/econet_eth.c
-index fd817d5..0295bab 100644
+index fd817d5..03fb055 100644
 --- a/econet_eth.c
 +++ b/econet_eth.c
 @@ -37,6 +37,9 @@
@@ -96,7 +98,56 @@ index fd817d5..0295bab 100644
  
  	skb->dev = port;
  	skb->protocol = eth_type_trans(skb, port);
-@@ -440,6 +488,7 @@ static int en75_probe(struct platform_device *pdev)
+@@ -278,13 +326,34 @@ static int en75_init_port(struct en75_eth_pvt *eth, struct device_node *np)
+ 	return 0;
+ }
+ 
++/* RX descriptors of a ring that receives nothing in this setup (en75_prepare_qdma_cfg()). It is still filled and polled, so a frame the hardware does steer there is received; it only has less room for a burst. */
++#define EN75_RX_IDLE_DESCS	32
++
++/* Whether a GDM port will receive through QDMA @qdma_id: en75_init_port() gives the port with reg N the QDMA N. */
++static bool en75_qdma_has_port(struct device_node *parent, int qdma_id)
++{
++	struct device_node *np;
++	u32 reg;
++
++	for_each_available_child_of_node(parent, np) {
++		if (of_device_is_compatible(np, "econet,eth-mac") &&
++		    !of_property_read_u32(np, "reg", &reg) && reg == qdma_id) {
++			of_node_put(np);
++			return true;
++		}
++	}
++	return false;
++}
++
+ static void en75_prepare_qdma_cfg(struct en75_qdma_cfg *cfg,
+-				  const struct en75_soc_data *soc)
++				  const struct en75_soc_data *soc,
++				  bool has_port)
+ {
+ 	memset(cfg, 0, sizeof(*cfg));
+-	/* 512 RX descriptors per chain: with 128 the ring ran out (RX NO_DSCP) tens of thousands of times per minute while forwarding at 1 Gb/s, and each drop costs a TCP retransmit. */
+-	for (int i = 0; i < QDMA_NUM_CHAINS; i++)
+-		cfg->num_rx_descs[i] = 512;
++	/* 512 RX descriptors on ring 0 of a QDMA with a port: with 128 the ring ran out (RX NO_DSCP) tens of thousands of times per minute while forwarding at 1 Gb/s, and each drop costs a TCP retransmit. A QDMA without a port never enables its RX DMA (en75_qdma_use() runs from ndo_open only). Ring 1 gets the frames whose CPU reason CDMA1_CRSN_QSEL (FE+0x410..0x41c, 4 bits per reason) steers to it; the driver leaves those registers at their reset value, and on GS2107 no frame reached ring 1 or QDMA1 under bulk TCP both ways, a 38,700-packet multicast and broadcast flood and PPE flow learning (2026-11-14). The vendor fe_core maps CPU reasons 8 (IPv4 fragment), 21, 22, 24 and 25 to ring 1 (fe_core init 0x1b0..0x228); programming it that way needs ring 1 sized like ring 0. The idle rings would otherwise hold 512 buffers of 2 KiB each. */
++	cfg->num_rx_descs[0] = has_port ? 512 : EN75_RX_IDLE_DESCS;
++	for (int i = 1; i < QDMA_NUM_CHAINS; i++)
++		cfg->num_rx_descs[i] = EN75_RX_IDLE_DESCS;
+ 	for (int i = 0; i < QDMA_NUM_CHAINS; i++)
+ 		cfg->num_tx_descs[i] = 128;
+ 	for (int i = 0; i < QDMA_NUM_TX_DONE; i++)
+@@ -402,7 +471,8 @@ static int en75_probe(struct platform_device *pdev)
+ 	BUILD_BUG_ON(ARRAY_SIZE(eth->qdma) != ARRAY_SIZE(regs->qdma_regs));
+ 	BUILD_BUG_ON(ARRAY_SIZE(eth->qdma) != ARRAY_SIZE(eth->qdma_irq) * QDMA_NUM_IRQS);
+ 	for (i = 0; i < ARRAY_SIZE(eth->qdma); i++) {
+-		en75_prepare_qdma_cfg(&cfg, eth->soc);
++		en75_prepare_qdma_cfg(&cfg, eth->soc,
++				      en75_qdma_has_port(pdev->dev.of_node, i));
+ 		eth->qdma[i] = en75_qdma_new(&eth->pub, &regs->qdma_regs[i], i,
+ 					     &eth->qdma_irq[i * QDMA_NUM_IRQS],
+ 					     QDMA_NUM_IRQS, &cfg,
+@@ -440,6 +510,7 @@ static int en75_probe(struct platform_device *pdev)
  	}
  
  	debug_conf.crsn_count = eth->crsn_count;
@@ -309,3 +360,41 @@ index d6b5a05..9b1f742 100644
  }
  static inline bool is_erx_l4f(struct qdma_desc_erx *x) {
  	return FIELD_GET(ERX_L4F, x->bitfield_0);
+diff --git a/qdma_regs.h b/qdma_regs.h
+index 7587c24..3da268d 100644
+--- a/qdma_regs.h
++++ b/qdma_regs.h
+@@ -1034,11 +1034,12 @@ static inline u16 get_qregs_doneq_state_head_index(struct qregs_doneq_state *x)
+ /**
+  * Bitfield accessors for: qregs_rxring_size
+  * Register layout (32-bit word):
+- * - Bits 31-16: RING0_SIZE (size of RX ring 0, max 4095)
+- * - Bits 15-0: RING1_SIZE (size of RX ring 1, max 4095)
++ * - Bits 31-16: RING1_SIZE (size of RX ring 1, max 4095)
++ * - Bits 15-0: RING0_SIZE (size of RX ring 0, max 4095)
++ * Ring 0 is the low half: the vendor qdma_lan.ko reads ring n with a 0xfff mask shifted by 16 * n (qdma_set_rx_low_threshold, qdma_prepare_rx_buffer). With the halves swapped, rings of different sizes give the hardware the other ring's size; on GS2107 a 32-entry ring 1 made the hardware wrap ring 0 at 32 while the driver walked 512, and bulk receive raised RX0 ERR_COHERENT millions of times (2026-11-14).
+  */
+-#define QREGS_RXRING_SIZE_RING0_MASK			GENMASK(31, 16)
+-#define QREGS_RXRING_SIZE_RING1_MASK			GENMASK(15, 0)
++#define QREGS_RXRING_SIZE_RING0_MASK			GENMASK(15, 0)
++#define QREGS_RXRING_SIZE_RING1_MASK			GENMASK(31, 16)
+ 
+ static inline u16 get_qregs_rxring_size_ring0(struct qregs_rxring_size *x) {
+ 	return FIELD_GET(QREGS_RXRING_SIZE_RING0_MASK, x->word);
+@@ -1056,11 +1057,12 @@ static inline void set_qregs_rxring_size_ring1(struct qregs_rxring_size *x, u16
+ /**
+  * Bitfield accessors for: qregs_rxring_low
+  * Register layout (32-bit word):
+- * - Bits 31-16: RING0_LOW (interrupt threshold for ring 0, max 4095)
+- * - Bits 15-0: RING1_LOW (interrupt threshold for ring 1, max 4095)
++ * - Bits 31-16: RING1_LOW (interrupt threshold for ring 1, max 4095)
++ * - Bits 15-0: RING0_LOW (interrupt threshold for ring 0, max 4095)
++ * Same layout as qregs_rxring_size: the vendor qdma_get_rx_low_threshold takes ring 0 with andi 0xfff and ring 1 with ext 16,12.
+  */
+-#define QREGS_RXRING_LOW_RING0_MASK			GENMASK(31, 16)
+-#define QREGS_RXRING_LOW_RING1_MASK			GENMASK(15, 0)
++#define QREGS_RXRING_LOW_RING0_MASK			GENMASK(15, 0)
++#define QREGS_RXRING_LOW_RING1_MASK			GENMASK(31, 16)
+ 
+ static inline u16 get_qregs_rxring_low_ring0(struct qregs_rxring_low *x) {
+ 	return FIELD_GET(QREGS_RXRING_LOW_RING0_MASK, x->word);
