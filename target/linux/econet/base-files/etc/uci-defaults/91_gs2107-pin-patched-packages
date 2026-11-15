@@ -1,0 +1,30 @@
+. /lib/functions.sh
+
+# 镜像里打过本地补丁的包：上游 snapshots 源一出现更新版本，apk upgrade 就会用未打补丁的版本盖掉它们（2026-11-15 实测 firewall4 排在升级清单第一项）。这里在 /etc/apk/world 里把它们钉在镜像版本上，和构建时写进 world 的 base-files=、kernel= 一样；要换版本时显式 apk add 包名=版本。
+# 不带版本标记，每次出现都运行（firstboot、保留配置的 sysupgrade、部署新镜像之后），那时已安装的就是镜像里的版本；开机时网络还没起来，所以不访问网络。
+# 已安装版本与 /rom 里的镜像版本不一致（之前已被升级过）时不固定，只记日志。gs2107-provision.sh 以 GS2107_PIN_STRICT=1 运行同一个文件，这时以非零状态退出。
+case "$(board_name)" in
+chinamobile,gs2107)
+	pin_rc=0
+	pins=""
+	for pkg in firewall4 uboot-envtools kmod-econet-eth busybox; do
+		rom="$(awk -v p="$pkg" '/^P:/ { n = substr($0, 3) } /^V:/ && n == p { print substr($0, 3); exit }' /rom/lib/apk/db/installed)"
+		cur="$(awk -v p="$pkg" '/^P:/ { n = substr($0, 3) } /^V:/ && n == p { print substr($0, 3); exit }' /lib/apk/db/installed)"
+		if [ -z "$rom" ] || [ "$cur" != "$rom" ]; then
+			logger -s -t gs2107-pin "$pkg：已安装 ${cur:-无}，镜像 ${rom:-无}，不固定"
+			pin_rc=1
+		else
+			pins="$pins $pkg=$rom"
+		fi
+	done
+	# 一次 apk add 写完：每次调用都会整套重写 apk 数据库。
+	# shellcheck disable=SC2086
+	[ -z "$pins" ] || apk add --no-network -q $pins || {
+		logger -s -t gs2107-pin "apk add$pins 失败"
+		pin_rc=1
+	}
+	[ "${GS2107_PIN_STRICT:-0}" = 1 ] && exit "$pin_rc"
+	;;
+esac
+
+exit 0
