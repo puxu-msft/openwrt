@@ -2,40 +2,53 @@
 
 case "$(board_name)" in
 chinamobile,gs2107)
-	# The marker holds the version of these defaults already applied: sysupgrade keeps /etc/config/system, so a later image only adds what a newer version introduces and never re-adds an option the user removed (LuCI disables flow offloading by deleting the option).
-	# Without a marker (first image carrying these defaults, or a config from before them) a removed option cannot be told from one never set, so version 1 sets any of its options that are absent.
+	# 标记记录已经应用到第几版：sysupgrade 保留 /etc/config/system，所以新镜像只补新版本引入的项，不会把用户删掉的选项再加回来（LuCI 关闭 flow offloading 的方式就是删掉选项）。
+	# 没有标记时（第一次带这些默认值的镜像，或更早的配置），分不清选项是被删掉的还是从未设过，所以第 1 版把缺的选项都补上。
 	applied="$(uci -q get system.@system[0].gs2107_router_defaults)"
 	applied="${applied:-0}"
 
 	if [ "$applied" -lt 1 ]; then
-		# econet-eth has one interrupt line per QDMA and feeds a DSA conduit: packet steering mode 2 spreads RPS over every CPU by flow, while the default mode cannot see the MIPS GIC interrupts or the qdma NAPI threads here and steers all eth0 receive work to a single CPU.
+		# econet-eth 每个 QDMA 只有一条中断线，后面接 DSA conduit：packet steering 模式 2 按流把 RPS 分到所有 CPU；默认模式在这里看不到 MIPS GIC 中断和 qdma 的 NAPI 线程，会把 eth0 的收包全部压到一个 CPU 上。
 		uci -q get network.globals.packet_steering >/dev/null ||
 			uci set network.globals.packet_steering='2'
-		# Software flow offloading: established flows skip the forward path.
+		# 软件 flow offloading：已建立的流跳过转发路径。
 		uci -q get firewall.@defaults[0].flow_offloading >/dev/null ||
 			uci set firewall.@defaults[0].flow_offloading='1'
 	fi
 
 	if [ "$applied" -lt 2 ]; then
-		# Wi-Fi APs join br-lan after the firewall starts; the "phy*" prefix hooks them into the flowtable when they appear (firewall4 package patch 100).
+		# Wi-Fi AP 在防火墙启动之后才加入 br-lan；"phy*" 前缀让它们一出现就挂进 flowtable（firewall4 包补丁 100）。
 		uci -q get firewall.@defaults[0].flow_offloading_devices >/dev/null ||
 			uci add_list firewall.@defaults[0].flow_offloading_devices='phy*'
 	fi
 
 	if [ "$applied" -lt 3 ]; then
-		# Hardware flow offloading: econet-eth drives the EN7528 PPE, so flows between switch ports are forwarded by the engine; the Wi-Fi APs stay on the software path of the same flowtable (firewall4 package patch 101). Only on top of software offloading, which is what LuCI allows (choosing "None" there deletes both options).
+		# 硬件 flow offloading：econet-eth 驱动 EN7528 的 PPE，交换机口之间的流由硬件转发；Wi-Fi AP 留在同一 flowtable 的软件路径上（firewall4 包补丁 101）。只在开了软件 offloading 时才开，与 LuCI 允许的组合一致（在那里选"无"会把两个选项都删掉）。
 		[ "$(uci -q get firewall.@defaults[0].flow_offloading)" = 1 ] &&
 			! uci -q get firewall.@defaults[0].flow_offloading_hw >/dev/null &&
 			uci set firewall.@defaults[0].flow_offloading_hw='1'
 	fi
 
 	if [ "$applied" -lt 4 ]; then
-		# The console is the 115200-baud UART (and netconsole): every message at or above the console loglevel is written out synchronously by the caller, about 5.5 ms per line, which once held each received frame that hit a per-packet dev_info. Errors and worse still reach the console; everything stays in the kernel log (dmesg, logread).
+		# 控制台是 115200 波特的串口（加 netconsole）：每条不低于控制台日志级别的消息都由调用者同步写出，每行约 5.5 ms，曾让每个触发逐包 dev_info 的收包都被拖住。错误及更严重的消息仍上控制台，所有消息都留在内核日志里（dmesg、logread）。
 		uci -q get system.@system[0].conloglevel >/dev/null ||
 			uci set system.@system[0].conloglevel='4'
 	fi
 
-	uci set system.@system[0].gs2107_router_defaults='4'
+	if [ "$applied" -lt 5 ]; then
+		# 交换机口不协商 802.3x 流控：对端持续发 PAUSE 时，开着流控的口出方向一直被暂停，积压经交换机反压到 CPU 口，所有有线口的发送一起停下。已有同名 device 段时复用（WAN 口的段由 config_generate 按 board.json 生成），用户已设过的选项不改。
+		for port in lan1 lan2 lan3 lan4; do
+			sec="$(uci -X show network | sed -n "s/^network\.\([^.]*\)\.name='$port'\$/\1/p" | head -n 1)"
+			if [ -z "$sec" ]; then
+				sec="$(uci add network device)"
+				uci set "network.$sec.name=$port"
+			fi
+			uci -q get "network.$sec.rxpause" >/dev/null || uci set "network.$sec.rxpause=0"
+			uci -q get "network.$sec.txpause" >/dev/null || uci set "network.$sec.txpause=0"
+		done
+	fi
+
+	uci set system.@system[0].gs2107_router_defaults='5'
 	uci commit network
 	uci commit firewall
 	uci commit system
