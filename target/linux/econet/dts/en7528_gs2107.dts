@@ -528,14 +528,14 @@
 		 *   - **不死 u-boot 链路**：内置 bootbase(mtd0) → 不死 u-boot(mtd2) →
 		 *     kernel(mtd3) → rootfs(mtd4)，从而实现 uart-free 管理。
 		 *     bootbase 固定从 0x80000 读 HDR2，故 4MB uboot 槽必须落在 0x80000。
-		 *     现阶段该槽放一个最简链式跳转 stub（tools/cross/uboot_stub.c）：
-		 *     bootbase 解压它 → 它把 0x480000 的内核搬到 RAM 0x80020000 → 跳过去。
+		 *     该槽放 uboot.hdr2：bootbase 解压后执行 tools/uboot/stub.S，stub 把
+		 *     内嵌的 U-Boot 搬到 0x81000000 再跳过去；U-Boot 从 mtd3 读 FIT 启动内核。
 		 *   - **不保留原厂 A/B backup 与 java**（无 Android 了）。原厂 11 个分区已
 		 *     全量 dump 到 devices/gs2107/firmware/，设备端 SHA256 **8/8 字节级一致**；
 		 *     需要时从 host 备份经串口 console + flash 裸原语重刷即可。
 		 *   - bootloader / romfile / reservearea 三个分区**永不写入**：
 		 *       · bootloader(mtd0)  = tcboot stage1+2，唯一启动入口
-		 *       · romfile(mtd1)     = bootbase 读它（A/B 开关不在这里，见 docs/09）
+		 *       · romfile(mtd1)     = 厂商配置的唯一副本，tcboot 不读它（docs/23 §4）
 		 *       · reservearea(mtd7) = A/B flag 在 +0x200000（芯片偏移 0xDFC0000）
 		 *
 		 * 空间账：0x80000 起共 0xDD40000（221.25MB）= uboot 4M + kernel 8M + rootfs 32M + uboot_env 256K + overlay 177M，严丝合缝到 reservearea 前一刻。
@@ -568,7 +568,7 @@
 		/*
 		 * uboot：不死 u-boot 槽。bootbase 固定从 0x80000 读 HDR2 并解压到
 		 * 0x80002000，故本槽必须从 0x80000 起。4MB。
-		 * 现居者 = 链式跳转 stub（见上方设计前提）。
+		 * 现居者 = uboot.hdr2（stub + 内嵌 U-Boot，见上方设计前提）。
 		 */
 		partition@80000 {			/* mtd2 4M */
 			label = "uboot";
@@ -577,7 +577,7 @@
 
 		/*
 		 * kernel：8MB。LZMA 流约 3.83MB，余 4.17MB 给后续加驱动。
-		 * 由 uboot 槽里的 stub 搬移并跳入，不由 bootbase 直接读。
+		 * 由 U-Boot 读出（gs_nand_boot）并 bootm，不由 bootbase 直接读。
 		 */
 		partition@480000 {			/* mtd3 8M */
 			label = "kernel";
@@ -624,7 +624,9 @@
 
 		/*
 		 * reservearea：A/B flag 在 +0x200000（芯片偏移 0xDFC0000，单字节 ASCII
-		 * '0'=主 / '1'=slave）。bootbase 每轮启动都会写它——永不写入。
+		 * '0'=主 / '1'=slave）。tcboot 只在主备切换时写它：主槽失败改起
+		 * slave 时写 '1'，旗标为 '1' 而 slave 失败改起主槽时写 '0'（docs/23 §3.1）；
+		 * 正常从主槽启动不写。OpenWrt 永不写入。
 		 */
 		partition@ddc0000 {		/* mtd7 2.25M */
 			label = "reservearea";
