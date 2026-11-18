@@ -538,7 +538,8 @@
 		 *       · romfile(mtd1)     = 厂商配置的唯一副本，tcboot 不读它（docs/23 §4）
 		 *       · reservearea(mtd7) = A/B flag 在 +0x200000（芯片偏移 0xDFC0000）
 		 *
-		 * 空间账：0x80000 起共 0xDD40000（221.25MB）= uboot 4M + kernel 8M + rootfs 32M + uboot_env 256K + overlay 177M，严丝合缝到 reservearea 前一刻。
+		 * 空间账：0x80000 起共 0xDD40000（221.25MB）= uboot 4M + kernel 8M + rootfs 32M + uboot_env 256K + recovery 16M + overlay 161M，严丝合缝到 reservearea 前一刻。
+		 * recovery 在地址上位于 uboot_env 与 rootfs_data 之间，但节点排在最后（mtd8），mtd0–mtd7 的编号不变。
 		 */
 		partition@0 {			/* mtd0 256K */
 			label = "bootloader";
@@ -596,15 +597,15 @@
 			linux,rootfs;
 		};
 
-		/* uboot_env: two 128KB redundant U-Boot env copies; rootfs_data: shared UBIFS overlay. */
+		/* uboot_env：两份 128KB 的冗余 U-Boot env；rootfs_data：UBIFS overlay。 */
 		partition@2c80000 {		/* mtd5 256K */
 			label = "uboot_env";
 			reg = <0x02c80000 0x00040000>;
 		};
 
-		partition@2cc0000 {		/* mtd6 177M */
+		partition@3cc0000 {		/* mtd6 161M */
 			label = "rootfs_data";
-			reg = <0x02cc0000 0x0b100000>;
+			reg = <0x03cc0000 0x0a100000>;
 			/*
 			 * overlay：UBIFS 卷。`linux,ubi` 让内核 ubi_notify_add()
 			 * 在注册这个 MTD 分区时自动 ubiattach，否则要用户在
@@ -632,6 +633,16 @@
 			label = "reservearea";
 			reg = <0x0ddc0000 0x00240000>;
 			read-only;
+		};
+
+		/*
+		 * recovery：自救镜像（主系统同一内核 + DTB + rootfs ramdisk 的 FIT）。
+		 * U-Boot 进 recovery 时整区读出后 bootm（gs_rescue_boot），镜像坏了
+		 * 就继续试主系统 NAND。地址在 uboot_env 之后，节点放最后成为 mtd8。
+		 */
+		partition@2cc0000 {		/* mtd8 16M */
+			label = "recovery";
+			reg = <0x02cc0000 0x01000000>;
 		};
 	};
 };
