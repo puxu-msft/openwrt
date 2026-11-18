@@ -1,20 +1,111 @@
 #!/bin/sh
-# Small UART-free recovery helper for GS2107 single-slot U-Boot. 'reboot' asks U-Boot to enter its network recovery loop on the next boot.
+# GS2107 单槽 U-Boot 的 recovery 辅助命令，不需要串口。
+# U-Boot 在 env 里 recovery=1 时走 gs_recovery：依次试网络（TFTP boot.scr）→ U 盘 → mtd8 上的自救镜像 → 主系统 NAND。连续 bootlimit（3）次启动没被清掉 bootcount 时，altbootcmd → gs_fallback 在主系统与自救镜像之间轮流（recovery 是 1 就清掉，否则置 1）。主系统的 gs2107-bootok 每次开机清 bootcount；自救模式不清，自救系统反复崩溃时也会轮回主系统。
+# 自救镜像（内核命令行带 gs2107.recovery=1）整个在内存里跑；gs2107-recovery-return 服务在连续 N 秒（默认 1800，内核命令行 gs2107.recovery_return=<秒> 可改）既没有 hold、也没有登录后的 SSH 会话时，清掉 recovery 与 bootcount 并重启，重试主系统。
+# 子命令：
+#   reboot   置 recovery=1 并重启，下次启动走 gs_recovery
+#   clear    清掉 recovery 与 bootcount（下次启动走正常顺序）
+#   status   打印当前模式、hold 状态与 env 里的 recovery/bootcount/bootok
+#   hold     阻止自救模式自动回主系统（标记在 /tmp，重启即失）
+#   release  撤销 hold
+#   auto-return  由 gs2107-recovery-return 服务调用，不手动运行
+# env 写入走 gs2107_env_set：只在 env 读回来是 GS2107 的 env 时写，只写有变化的值、合成一次 fw_setenv。
+
+. /lib/functions.sh
+. /lib/functions/gs2107.sh
+
+HOLD="${GS2107_RECOVERY_HOLD:-/tmp/gs2107-recovery.hold}"
+RETURN_DEFAULT=1800
+# 检查间隔。会话判据是对进程表的采样，持续不到一个间隔、又恰好落在两次检查之间的命令看不到；间隔越短越不容易漏，但每次检查都要跑 pidof（有会话进程时还要扫一遍 /proc）。15 秒时交互式 shell 与持续 15 秒以上的命令一定会被看到，而返回要求连续 N 秒一次都没看到活动，零星漏掉的短命令不会单独触发返回。
+RETURN_POLL=15
+
+# 开机以来的整秒数。/proc/uptime 单调递增，不受 NTP 校时让墙上时钟跳变的影响。
+uptime_s() {
+	local up=
+
+	{ read -r up _ < "${GS2107_PROC:-/proc}/uptime"; } 2>/dev/null
+	echo "${up%%.*}"
+}
+
+# 空闲计时：每次检查看到 hold 或登录后的 SSH 会话就把“最后活动时刻”刷新为当前时刻；距最后活动满 N 秒才写 env 并重启。服务启动（开机末尾的 S99）算第一次活动，所以开机后至少空闲 N 秒；会话断断续续出现时，每出现一次都重新计满 N 秒。
+auto_return() {
+	local delay last now
+
+	if ! gs2107_recovery_mode; then
+		echo "not in recovery mode (no gs2107.recovery=1 on the kernel command line, or the root is not in RAM)" >&2
+		return 1
+	fi
+	delay="$(gs2107_cmdline_value gs2107.recovery_return)"
+	case "$delay" in
+	'') delay=$RETURN_DEFAULT ;;
+	*[!0-9]*)
+		logger -t gs2107-recovery "ignoring gs2107.recovery_return=$delay; using ${RETURN_DEFAULT}s"
+		delay=$RETURN_DEFAULT
+		;;
+	esac
+
+	logger -t gs2107-recovery "returning to the main system after ${delay}s without a hold ($HOLD) or a logged-in SSH session"
+	last="$(uptime_s)"
+	while :; do
+		sleep "$RETURN_POLL"
+		now="$(uptime_s)"
+		if [ -e "$HOLD" ] || gs2107_ssh_session_active; then
+			last=$now
+		elif [ $((now - last)) -ge "$delay" ]; then
+			break
+		fi
+	done
+
+	# 写不进 env 时不重启：recovery 仍是 1，重启只会再进自救镜像；留在这里等人处理。
+	if ! gs2107_env_set gs2107-recovery recovery=0 bootcount=0; then
+		logger -t gs2107-recovery "could not clear recovery in the U-Boot env; staying in recovery mode"
+		return 1
+	fi
+	logger -t gs2107-recovery "idle for $((now - last))s (no hold, no SSH session); rebooting into the main system"
+	sync
+	reboot
+}
+
 case "$1" in
 	reboot)
-		/usr/sbin/fw_setenv recovery 1
+		gs2107_env_set gs2107-recovery recovery=1 || {
+			echo "U-Boot env not written (see logread -e gs2107-recovery); not rebooting" >&2
+			exit 1
+		}
 		sync
 		reboot
 		;;
 	clear)
-		/usr/sbin/fw_setenv recovery 0
-		/usr/sbin/fw_setenv bootcount 0
+		gs2107_env_set gs2107-recovery recovery=0 bootcount=0 || {
+			echo "U-Boot env not written (see logread -e gs2107-recovery)" >&2
+			exit 1
+		}
 		;;
 	status)
-		/usr/sbin/fw_printenv recovery bootcount bootok 2>/dev/null
+		if gs2107_recovery_mode; then
+			echo "mode: recovery (gs2107.recovery=1)"
+		else
+			echo "mode: normal"
+		fi
+		if [ -e "$HOLD" ]; then
+			echo "hold: yes ($HOLD)"
+		else
+			echo "hold: no"
+		fi
+		fw_printenv recovery bootcount bootok 2>/dev/null
+		;;
+	hold)
+		touch "$HOLD"
+		gs2107_recovery_mode || echo "note: not in recovery mode; hold only affects the recovery image" >&2
+		;;
+	release)
+		rm -f "$HOLD"
+		;;
+	auto-return)
+		auto_return
 		;;
 	*)
-		echo "usage: $0 reboot|clear|status" >&2
+		echo "usage: $0 reboot|clear|status|hold|release" >&2
 		exit 1
 		;;
 esac

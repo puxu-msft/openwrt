@@ -5,10 +5,18 @@
 # 已安装版本与 /rom 里的镜像版本不一致（之前已被升级过）时不固定，只记日志。gs2107-provision.sh 以 GS2107_PIN_STRICT=1 运行同一个文件，这时以非零状态退出。
 case "$(board_name)" in
 chinamobile,gs2107)
+	# 没有 /rom 里的 apk 数据库就没有镜像版本可对比：自救镜像（initramfs，整个系统在内存里）正是这种情况，装的包也只在内存里，不需要钉版本，直接退出。严格模式下照旧报错退出。
+	# 不 source /lib/functions/gs2107.sh：provision 第 5f 步把本文件推到运行中的设备上执行，旧镜像里没有那个库。
+	rom_db=/rom/lib/apk/db/installed
+	if [ ! -f "$rom_db" ]; then
+		[ "${GS2107_PIN_STRICT:-0}" = 1 ] || exit 0
+		logger -s -t gs2107-pin "没有 $rom_db，无镜像版本可对比，不固定"
+		exit 1
+	fi
 	pin_rc=0
 	pins=""
 	for pkg in firewall4 uboot-envtools kmod-econet-eth busybox; do
-		rom="$(awk -v p="$pkg" '/^P:/ { n = substr($0, 3) } /^V:/ && n == p { print substr($0, 3); exit }' /rom/lib/apk/db/installed)"
+		rom="$(awk -v p="$pkg" '/^P:/ { n = substr($0, 3) } /^V:/ && n == p { print substr($0, 3); exit }' "$rom_db")"
 		cur="$(awk -v p="$pkg" '/^P:/ { n = substr($0, 3) } /^V:/ && n == p { print substr($0, 3); exit }' /lib/apk/db/installed)"
 		if [ -z "$rom" ] || [ "$cur" != "$rom" ]; then
 			logger -s -t gs2107-pin "$pkg：已安装 ${cur:-无}，镜像 ${rom:-无}，不固定"

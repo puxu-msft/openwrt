@@ -1,0 +1,47 @@
+# 自救模式（内核命令行带 gs2107.recovery=1）下把两个 Wi-Fi AP 配成与主系统相同：SSID 与口令取自构建时渲染的 /lib/gs2107/credentials.sh（真源 var/credentials/gs2107/wifi.json），psk2+ccmp，2.4G 信道 1 HT20、5G 信道 36 VHT80，国家码 CN，接入 lan（取值同 tools/openwrt/gs2107-provision.sh 第 3 步）。主系统下直接退出。
+# 时机：/etc/config/wireless 由 10-wifi-detect 在 phy 出现时（wifi config）生成。mt7603/mt7615e 在 /etc/modules.d，由 /etc/init.d/boot 的 kmodloader 加载，phy 出现后的 hotplug 事件由 procd 另行排队执行，与随后的 uci-defaults 先后不确定；procd 的 hotplug 队列逐条串行执行，hotplug-call 按文件名顺序执行本目录脚本，所以排在 10-wifi-detect 之后的这里总能看到刚生成的段。
+# 按 band 认 radio，不按段名：段名由 phy 注册顺序决定。每个 phy 一次 add 事件，第二次时值已一致，不再提交、不再重载。
+[ "$ACTION" = "add" ] || exit 0
+
+. /lib/functions/gs2107.sh
+gs2107_recovery_mode || exit 0
+
+[ -r /lib/gs2107/credentials.sh ] && . /lib/gs2107/credentials.sh
+if [ -z "${GS2107_WIFI_KEY_2G:-}" ] || [ -z "${GS2107_WIFI_KEY_5G:-}" ]; then
+	logger -t gs2107-recovery "recovery mode: /lib/gs2107/credentials.sh missing Wi-Fi keys (image built without rendered credentials), APs left unconfigured"
+	exit 0
+fi
+
+changed=0
+
+wifi_set() {
+	[ "$(uci -q get "$1")" = "$2" ] && return 0
+	uci set "$1=$2" && changed=1
+}
+
+for radio in $(uci -q show wireless | sed -n 's/^wireless\.\([^.=]*\)=wifi-device$/\1/p'); do
+	case "$(uci -q get "wireless.$radio.band")" in
+	2g) ssid=$GS2107_WIFI_SSID_2G; key=$GS2107_WIFI_KEY_2G; channel=1; htmode=HT20 ;;
+	5g) ssid=$GS2107_WIFI_SSID_5G; key=$GS2107_WIFI_KEY_5G; channel=36; htmode=VHT80 ;;
+	*) continue ;;
+	esac
+	wifi_set "wireless.$radio.disabled" 0
+	wifi_set "wireless.$radio.country" CN
+	wifi_set "wireless.$radio.channel" "$channel"
+	wifi_set "wireless.$radio.htmode" "$htmode"
+	for iface in $(uci -q show wireless | sed -n "s/^wireless\.\([^.=]*\)\.device='$radio'\$/\1/p"); do
+		[ "$(uci -q get "wireless.$iface.mode")" = ap ] || continue
+		wifi_set "wireless.$iface.disabled" 0
+		wifi_set "wireless.$iface.network" lan
+		wifi_set "wireless.$iface.ssid" "$ssid"
+		wifi_set "wireless.$iface.encryption" psk2+ccmp
+		wifi_set "wireless.$iface.key" "$key"
+	done
+done
+
+[ "$changed" = 1 ] || exit 0
+uci commit wireless
+logger -t gs2107-recovery "recovery mode: Wi-Fi APs configured"
+# 即 wifi reload（/sbin/wifi 的 wifi_reload）。netifd 还没起来时调用失败无妨：netifd 启动时读到的已是提交后的配置。
+ubus call network reload 2>/dev/null
+exit 0

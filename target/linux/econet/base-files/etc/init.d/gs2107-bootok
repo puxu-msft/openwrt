@@ -1,52 +1,20 @@
 #!/bin/sh /etc/rc.common
-# Mark this boot good for U-Boot: with upgrade_available=1, U-Boot's BOOTCOUNT_ENV increments bootcount on every boot (bootlimit -> altbootcmd -> recovery); this clears it once OpenWrt is up.
-# Every fw_setenv rewrites a whole env copy (one 128 KiB NAND erase), so only values that differ are written, in a single fw_setenv call.
-# Nothing is written unless /etc/fw_env.config points at the uboot_env partition and the env reads back as the GS2107 env (gs_boot present, no bad CRC): on a bad CRC or a wrong partition fw_setenv would store its built-in default env (bootcmd=run distro_bootcmd) and the board would stop booting.
+# 向 U-Boot 标记本次启动成功：upgrade_available=1 时 U-Boot 的 BOOTCOUNT_ENV 每次启动都把 bootcount 加 1（超过 bootlimit → altbootcmd → recovery），OpenWrt 起来后由这里清零。
+# 写 env 走 gs2107_env_set（/lib/functions/gs2107.sh）：只写有变化的值、合成一次 fw_setenv，且只在 env 读回来是 GS2107 的 env 时才写。
 START=99
 
-ENV_CONFIG=/etc/fw_env.config
-
-# The partition is found by label so the mtd number can move; the file is only rewritten when it does not match.
-ensure_env_config() {
-	local idx want
-
-	idx="$(find_mtd_index uboot_env)"
-	[ -n "$idx" ] || return 1
-	want="/dev/mtd$idx 0x0 0x20000 0x20000
-/dev/mtd$idx 0x20000 0x20000 0x20000"
-	# compared field by field: uboot-envtools writes the lines with a trailing blank
-	[ "$(awk '{$1=$1; print}' "$ENV_CONFIG" 2>/dev/null)" = "$want" ] && return 0
-	printf '%s\n' "$want" > "$ENV_CONFIG.new" && mv "$ENV_CONFIG.new" "$ENV_CONFIG"
-}
-
 mark_boot_ok() {
-	local kv changes=""
+	. /lib/functions/gs2107.sh
 
-	if ! ensure_env_config; then
-		logger -t gs2107-bootok "uboot_env partition not found; not writing"
+	# 自救模式（自救镜像在内存里跑）不写 env：bootcount 留着让 U-Boot 继续累加，自救系统若每次撑过这里才崩溃，连续 bootlimit 次后 gs_fallback 就轮到主系统，不会无限循环在自救镜像里；回主系统由 gs2107-recovery-return 或 gs2107-recovery clear 清 recovery 与 bootcount；bootok 表示主系统起来过，自救镜像不写。
+	if gs2107_recovery_mode; then
 		return 0
-	fi
-	if ! fw_printenv -n gs_boot >/dev/null 2>&1 ||
-	   fw_printenv -n bootcount 2>&1 | grep -q "Bad CRC"; then
-		logger -t gs2107-bootok "U-Boot env does not read back as the GS2107 env; not writing"
-		return 0
-	fi
-
-	for kv in bootcount=0 recovery=0 bootok=1; do
-		[ "$(fw_printenv -n "${kv%%=*}" 2>/dev/null)" = "${kv#*=}" ] ||
-			changes="$changes${kv%%=*} ${kv#*=}
-"
-	done
-	[ -n "$changes" ] || return 0
-
-	if printf '%s' "$changes" | fw_setenv -s -; then
-		logger -t gs2107-bootok "set $(printf '%s' "$changes" | tr '\n' ' ')"
 	else
-		logger -t gs2107-bootok "fw_setenv failed"
+		gs2107_env_set gs2107-bootok bootcount=0 recovery=0 bootok=1
 	fi
 }
 
 boot() {
-	# Count the boot as good once it has stayed up for a while, without holding up the init scripts that run after this one.
+	# 起来一段时间后才算这次启动成功；放到后台，不拖住排在后面的 init 脚本。
 	( sleep 10; mark_boot_ok ) &
 }
