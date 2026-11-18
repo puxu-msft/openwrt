@@ -164,6 +164,22 @@ static int __init en7528_wdt_init(void)
 	watchdog_set_nowayout(&en7528_wdt->wdd, nowayout);
 	watchdog_stop_on_unregister(&en7528_wdt->wdd);
 
+	/*
+	 * GS2107 的 U-Boot 在跳内核前打开看门狗（board_preboot_os，约 38 s 超时），
+	 * 让内核早期卡死也会复位。这里接手：按 heartbeat 重装，并标记硬件在跑，
+	 * 由 watchdog core 代喂，直到用户态（procd）打开设备；用户态迟迟不打开时，
+	 * watchdog.open_timeout 到期后 core 停止代喂，设备复位。
+	 */
+	if ((readl(en7528_wdt->base + EN7528_WDT_CTRL) &
+	     (EN7528_WDT_TIMER_ENABLE | EN7528_WDT_RESET_ENABLE)) ==
+	    (EN7528_WDT_TIMER_ENABLE | EN7528_WDT_RESET_ENABLE)) {
+		ret = en7528_wdt_start(&en7528_wdt->wdd);
+		if (ret)
+			goto err_unmap;
+		set_bit(WDOG_HW_RUNNING, &en7528_wdt->wdd.status);
+		pr_info("EN7528 watchdog: already running at probe, kept alive until userspace opens it\n");
+	}
+
 	ret = watchdog_register_device(&en7528_wdt->wdd);
 	if (ret)
 		goto err_unmap;
@@ -174,6 +190,8 @@ static int __init en7528_wdt_init(void)
 	return 0;
 
 err_unmap:
+	/* U-Boot 打开的计时器没人喂会在约 38 s 后复位，每次启动都一样，形成循环；驱动起不来时关掉它 */
+	en7528_wdt_stop(&en7528_wdt->wdd);
 	iounmap(en7528_wdt->base);
 err_free:
 	kfree(en7528_wdt);
