@@ -1,0 +1,39 @@
+From: xp <a.xp@live.com>
+Date: Fri, 20 Nov 2026 09:15:00 +0800
+Subject: [PATCH] net: phy: 只把已注册的 netdev 交给 LED 硬件控制
+
+phy_led_hw_control_get_device() 只要 phydev->attached_dev 非空就返回 &attached_dev->dev。PHY 往往在 net_device 注册之前就已接上：dsa_user_create() 先在 dsa_user_phy_setup() 里经 phylink 调 phy_attach_direct()（此时设置 attached_dev），之后才 register_netdevice()。在这之间 netdev_register_kobject() 还没运行，内嵌的 struct device 没有经过 device_initialize()，init_name 和 kobj.name 都是 NULL。
+
+netdev 触发器激活时（netdev_trig_activate()，由 0316cc5629d1 引入）对 hw_control_get_device() 返回的设备做 strlen(dev_name(dev))。在这个窗口里往 PHY LED 的 trigger 写 "netdev" 就会对 NULL 做 strlen()。EcoNet EN7528（GS2107）上实际出现过：econet_eth 是模块，交换机要等用户态加载它之后才延迟探测，PHY LED 注册产生的 uevent 让 hotplug 运行 /etc/init.d/led start <LED>，脚本写 "netdev" 恰好落进对应 lanN 的窗口：
+
+  CPU 1 Unable to handle kernel paging request at virtual address 00000000, epc == 8191e668, ra == 8151d9e8
+  epc   : 8191e668 strlen+0x0/0x2c
+  ra    : 8151d9e8 netdev_trig_activate+0x144/0x238
+  Call Trace: strlen <- netdev_trig_activate <- led_trigger_set <- led_trigger_write <- sysfs_kf_bin_write
+
+现在只在 reg_state 为 NETREG_REGISTERED 时返回 netdev 的设备，注册之前和开始注销之后都返回 NULL，符合 hw_control_get_device 的约定（LED 还没关联设备时返回 NULL）。注册完成后，触发器在 NETDEV_REGISTER 时按 device_name 接上 netdev，但只在 NETDEV_UP 或再次写 mode 属性时重新判定能否硬件控制；所以回到硬件闪烁的前提是用户态写过 device_name，且之后该口 up 或再写一次 mode（OpenWrt 的 /etc/init.d/led 按 trigger → device_name → mode 的顺序写，GS2107 的 lan1–4 都会 up）。从未 up 的口停在软件态，但 carrier 为 down，灯灭且没有周期 work。
+
+残余风险：写 mode 属性的路径（netdev_led_attr_store → can_hw_control）只持 trigger_data->lock、不持 RTNL，现在会多读一次 ndev->reg_state；与 DSA 撤销端口（建口失败回滚或 dsa_user_destroy）并发时理论上可能读到已释放的 net_device。窗口极窄，要彻底关上需要调用方持 RTNL。
+
+Fixes: 1dcc03c9a7a8 ("net: phy: phy_device: Call into the PHY driver to set LED offload")
+Fixes: 0316cc5629d1 ("leds: trigger: netdev: init mode if hw control already active")
+---
+ drivers/net/phy/phy_device.c | 6 ++++--
+ 1 file changed, 4 insertions(+), 2 deletions(-)
+
+--- a/drivers/net/phy/phy_device.c
++++ b/drivers/net/phy/phy_device.c
+@@ -3164,9 +3164,11 @@ phy_led_hw_control_get_device(struct led
+ {
+ 	struct phy_led *phyled = to_phy_led(led_cdev);
+ 	struct phy_device *phydev = phyled->phydev;
++	struct net_device *ndev = READ_ONCE(phydev->attached_dev);
+ 
+-	if (phydev->attached_dev)
+-		return &phydev->attached_dev->dev;
++	/* MAC/DSA 驱动常在 register_netdevice() 之前就接上 PHY（dsa_user_create() 先经 phylink 调 phy_attach_direct()，再注册），这段时间 net_device 内嵌的 struct device 还没初始化、没有名字，交给 netdev 触发器会让它对 dev_name() 返回的 NULL 做 strlen()。开始注销后 netdev 即将消失，也不再交出。所以只交出已注册的 netdev；注册之后，触发器在 NETDEV_UP 通知或再次写 mode 属性时重新判定能否硬件控制。 */
++	if (ndev && READ_ONCE(ndev->reg_state) == NETREG_REGISTERED)
++		return &ndev->dev;
+ 	return NULL;
+ }
+ 
