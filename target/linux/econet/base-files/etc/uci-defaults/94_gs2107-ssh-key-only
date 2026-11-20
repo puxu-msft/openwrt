@@ -1,0 +1,27 @@
+. /lib/functions.sh
+
+# 主系统的 SSH 只认公钥（用户定，2026-11-17）：/etc/dropbear/authorized_keys 里至少有一把钥匙时，关掉默认实例 main 的口令登录（含 root）；一把钥匙都没有时不动，免得关掉唯一的登录途径（之后由 tools/openwrt/gs2107-provision.sh 写入公钥并推送同一个文件重跑）。root 口令（92_gs2107-root-password）仍用于 LuCI 与串口。
+# 自救模式下由 93_gs2107-recovery-mode 配置 dropbear，这里跳过。不带版本标记，每次出现都运行（firstboot、保留配置的 sysupgrade、部署新镜像之后）；改的是 uci 配置，dropbear 在之后启动时生效，运行中的设备由 provision 推送后重启 dropbear。
+case "$(board_name)" in
+chinamobile,gs2107)
+	# 函数库随自救模式（补丁 0034）进镜像；provision 也会把本文件推给更早的 rootfs，那里没有它，那时一定是主系统
+	if [ -f /lib/functions/gs2107.sh ]; then
+		. /lib/functions/gs2107.sh
+		gs2107_recovery_mode && exit 0
+	fi
+	# 只数形如“类型 base64”的钥匙行（类型 ssh-*/ecdsa-sha2-*/sk-*，base64 至少 40 字符）；带选项前缀的行不计，结果偏保守（宁可口令保持打开）
+	keys="$(grep -cE '^(ssh-[a-z0-9-]+|ecdsa-sha2-[a-z0-9-]+|sk-[a-z0-9@.-]+) [A-Za-z0-9+/]{40,}' /etc/dropbear/authorized_keys 2>/dev/null)"
+	if [ "${keys:-0}" -gt 0 ]; then
+		if uci -q set dropbear.main.PasswordAuth='off' && uci -q set dropbear.main.RootPasswordAuth='off' && uci commit dropbear; then
+			logger -s -t gs2107-ssh "authorized_keys 里有 $keys 把钥匙，dropbear 只认公钥"
+		else
+			logger -s -t gs2107-ssh "改 dropbear 配置失败（没有 main 段？），口令登录保持打开"
+			exit 1
+		fi
+	else
+		logger -s -t gs2107-ssh "authorized_keys 里没有钥匙，口令登录保持打开"
+	fi
+	;;
+esac
+
+exit 0
