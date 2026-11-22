@@ -1,0 +1,261 @@
+From: xp <a.xp@live.com>
+Date: Sun, 22 Nov 2026 15:40:00 +0800
+Subject: [PATCH] wifi: mt76: mt7615: MT7663 的 LED 经固件命令驱动
+
+mt76 对 MT7663（PCIe）沿用 MT7615 的 LED 写法：经 PCIe remap 窗口写 LED 控制器的 MT_LED_STATUS_0/1(pin) 与整字 MT_LED_CTRL，DT 不给 led 子节点时用 pin 0。MT7663 上这条路点不亮灯：GS2107（EN7528 + MT7663E）的 5G 灯在 mt76 写 pin0、pin1、全引脚反极性时都不亮，LED 控制器里 pin0/pin1 的控制字节读回不变。
+
+MediaTek 自己的 mt_wifi 驱动对 MT7663 不碰 LED 控制器，只发 MCU 扩展命令 EXT_CMD_ID_LED（0x17）：负载 8 字节小端，第 1 个字是 LED 号，第 2 个字是 LED_ENHANCE（bits 7:0 模式、15:8 off_time、23:16 on_time、25:24 tx_blink、29 band、30 反极性、31 tx_over_blink），模式 0 常亮、1 常灭、2 按发包闪；MT7663 固定用 LED1，下发的是 {1, 模式 | tx_blink=2}。这是从 GS2107 原厂内核里内建的 mt_wifi 逆向得出的（AndesLedEnhanceOP 与 RTMPSetLEDStatus），与 MT7615 LinuxAP 4.4.2.1 源码 andes_core.h 的位域一致；mt76 自己的 mt7603/mcu.h 也把 0x17 列为 MCU_EXT_CMD_LED_CTRL。
+
+在 GS2107 上用 7663mp1827（20200904171623）N9 固件实测：
+- {1, 0x02000000} 与 {1, 0x02000001} 每条都得到 EXT 事件 0x00（命令结果），负载为 ext_cid 0x17、status 0；
+- 开机后第一条 LED 命令把 BAR 偏移 0 的字从 0x42424242 改成 0x4242c242，之后不变（重新下载固件也不复位它）；
+- 不等回复（wait_resp=false）时固件照样回 ACK，mcu.res_q 每条命令多一个 skb，要等下一条等回复的命令才清掉；
+- 本补丁热装后，20 次亮灭交替产生 22 条 MCU 命令（背景约 0.4 条/秒），20 次重复写亮 1 条；LED 定时器按 25/25 ms 闪 10 分钟共 13903 条命令，无 MCU 超时，可用内存不漂移。
+
+改动：
+- MT7663 改挂 brightness_set_blocking：LED 核心在自己的工作队列里调用，持 dev->mt76.mutex 发 EXT_CMD_ID_LED（常亮或常灭）并等固件回复。命令与固件最近确认过的一条相同时不再发；LED 号与极性取自 leds.pin/leds.al，经 debugfs 改了之后下一次回调按新值重发。
+- 不实现 blink_set：phyNtpt 触发器的闪烁由 LED 核心做软件闪烁，最终都落到亮灭回调，节奏与其它 mt76 芯片用的同一张 mt76_tpt_blink 表一致；有收发时每次亮灭一条命令（表的最高档是 25 ms 半周期，HZ=100 的内核上 LED 定时器取整到 30 ms，GS2107 实测约 25 条/秒），常亮或常灭稳定时为 0 条。
+- 固件没运行时只记状态（这时 mt7615_mcu_send_message() 会把命令放进固件下载队列）；固件初始化完成（mt7615_pci_init_work）与 SER 复位完成（mt7615_mac_reset_work）后按记下的状态重发一次。DT 用 status = "disabled" 关掉 LED（不注册）时不发任何 LED 命令。
+- MT7663 默认 leds.pin = 1，DT led 子节点的 led-sources 可改，led-active-low 对应反极性位。
+- mt76_led_init()/mt76_led_cleanup() 原来只认 brightness_set 或 blink_set，加上 brightness_set_blocking，否则 MT7663 的 LED 不会注册。
+- MT7615 与 MT7622 仍走原来的寄存器写法；MT7663U/MT7663S 不注册 LED，行为不变。
+
+范围与边界：只在 MT7663 的 AP 固件（N9 7663mp1827）上实测，offload（STA）固件对 0x17 的应答没有验证，假如它不回，每次亮灭会持锁等满 20 s 超时。固件回复里的 status 不检查（与 mt7615 的其它 EXT 命令一样，seq 对上即视为确认），经 debugfs 设了固件不认的 LED 号也会被记成已确认。
+---
+ mac80211.c        |    6 +++--
+ mt76_connac_mcu.h |    1 +
+ mt7615/init.c     |   61 +++++++++++++++++++++++++++++++++++++++++++++++++++++
+ mt7615/mcu.c      |   15 +++++++++++++
+ mt7615/mcu.h      |   15 +++++++++++++
+ mt7615/mt7615.h   |   10 +++++++++
+ mt7615/pci_init.c |   18 ++++++++++++++--
+ mt7615/pci_mac.c  |    1 +
+ 8 files changed, 123 insertions(+), 4 deletions(-)
+
+--- a/mac80211.c
++++ b/mac80211.c
+@@ -199,7 +199,8 @@ static int mt76_led_init(struct mt76_phy
+ 	struct ieee80211_hw *hw = phy->hw;
+ 	struct device_node *np = dev->dev->of_node;
+ 
+-	if (!phy->leds.cdev.brightness_set && !phy->leds.cdev.blink_set)
++	if (!phy->leds.cdev.brightness_set && !phy->leds.cdev.blink_set &&
++	    !phy->leds.cdev.brightness_set_blocking)
+ 		return 0;
+ 
+ 	np = of_get_child_by_name(np, "led");
+@@ -242,7 +243,8 @@ static int mt76_led_init(struct mt76_phy
+ 
+ static void mt76_led_cleanup(struct mt76_phy *phy)
+ {
+-	if (!phy->leds.cdev.brightness_set && !phy->leds.cdev.blink_set)
++	if (!phy->leds.cdev.brightness_set && !phy->leds.cdev.blink_set &&
++	    !phy->leds.cdev.brightness_set_blocking)
+ 		return;
+ 
+ 	led_classdev_unregister(&phy->leds.cdev);
+--- a/mt76_connac_mcu.h
++++ b/mt76_connac_mcu.h
+@@ -1269,6 +1269,7 @@ enum {
+ 	MCU_EXT_CMD_CHANNEL_SWITCH = 0x08,
+ 	MCU_EXT_CMD_SET_TX_POWER_CTRL = 0x11,
+ 	MCU_EXT_CMD_FW_LOG_2_HOST = 0x13,
++	MCU_EXT_CMD_LED_CTRL = 0x17,
+ 	MCU_EXT_CMD_TXBF_ACTION = 0x1e,
+ 	MCU_EXT_CMD_EFUSE_BUFFER_MODE = 0x21,
+ 	MCU_EXT_CMD_THERMAL_PROT = 0x23,
+--- a/mt7615/init.c
++++ b/mt7615/init.c
+@@ -524,6 +524,67 @@ void mt7615_led_set_brightness(struct le
+ }
+ EXPORT_SYMBOL_GPL(mt7615_led_set_brightness);
+ 
++/* MT7663 的 LED 由固件驱动（EXT_CMD_ID_LED），不写 LED 控制器寄存器。没有 blink_set：触发器的闪烁由 LED 核心做软件闪烁，落到这里的亮灭。命令与固件最近确认过的相同时不再发；LED 号与极性取自 leds.pin/leds.al，经 debugfs 改了之后下一次回调按新值重发 */
++static int __mt7663_led_apply(struct mt7615_dev *dev)
++{
++	struct mt76_phy *mphy = &dev->mphy;
++	u8 pin = mphy->leds.pin;
++	u32 ctrl;
++	int ret;
++
++	lockdep_assert_held(&dev->mt76.mutex);
++
++	/* 固件没运行时命令会进固件下载队列，先只记状态，固件就绪后由 mt7663_led_sync() 补发 */
++	if (!test_bit(MT76_STATE_MCU_RUNNING, &mphy->state))
++		return 0;
++
++	/* 与 MediaTek mt_wifi 对 MT7663 发的一致：tx_blink 选 2（只按数据帧，常亮/常灭模式下不起作用），band 与 tx_over_blink 为 0 */
++	ctrl = FIELD_PREP(MT7663_LED_MODE, dev->led_on ? MT7663_LED_SOLID_ON :
++							 MT7663_LED_SOLID_OFF) |
++	       FIELD_PREP(MT7663_LED_TX_BLINK_SEL, 2) |
++	       (mphy->leds.al ? MT7663_LED_POLARITY : 0);
++	if (dev->led_fw_valid && dev->led_fw_idx == pin && dev->led_fw_ctrl == ctrl)
++		return 0;
++
++	ret = mt7663_mcu_set_led(dev, pin, ctrl);
++	dev->led_fw_valid = !ret;
++	dev->led_fw_idx = pin;
++	dev->led_fw_ctrl = ctrl;
++
++	return ret;
++}
++
++int mt7663_led_set_brightness(struct led_classdev *led_cdev,
++			      enum led_brightness brightness)
++{
++	struct mt76_phy *mphy = container_of(led_cdev, struct mt76_phy,
++					     leds.cdev);
++	struct mt7615_dev *dev = container_of(mphy->dev, struct mt7615_dev,
++					      mt76);
++	bool on = brightness != LED_OFF;
++	int ret;
++
++	mt7615_mutex_acquire(dev);
++	dev->led_on = on;
++	ret = __mt7663_led_apply(dev);
++	mt7615_mutex_release(dev);
++
++	return ret;
++}
++EXPORT_SYMBOL_GPL(mt7663_led_set_brightness);
++
++/* 固件初始化完成或 SER 复位后调用（调用方持 dev->mt76.mutex），把 LED 核心要求的状态重发给固件；只对已注册的 MT7663 LED，DT 用 status = "disabled" 关掉时不碰这颗灯 */
++void mt7663_led_sync(struct mt7615_dev *dev)
++{
++	if (!dev->mphy.leds.cdev.brightness_set_blocking ||
++	    !dev->mphy.leds.cdev.dev)
++		return;
++
++	dev->led_fw_valid = false;
++	__mt7663_led_apply(dev);
++}
++EXPORT_SYMBOL_GPL(mt7663_led_sync);
++
+ int mt7615_register_ext_phy(struct mt7615_dev *dev)
+ {
+ 	struct mt7615_phy *phy = mt7615_ext_phy(dev);
+--- a/mt7615/mcu.c
++++ b/mt7615/mcu.c
+@@ -240,6 +240,21 @@ int mt7615_rf_wr(struct mt7615_dev *dev,
+ 				 &req, sizeof(req), false);
+ }
+ 
++int mt7663_mcu_set_led(struct mt7615_dev *dev, u32 idx, u32 ctrl)
++{
++	struct {
++		__le32 idx;
++		__le32 ctrl;
++	} __packed req = {
++		.idx = cpu_to_le32(idx),
++		.ctrl = cpu_to_le32(ctrl),
++	};
++
++	/* 固件对 EXT 命令一律回 ACK，不等的话 ACK 会积在 mcu.res_q 里，直到下一条等回复的命令才清掉 */
++	return mt76_mcu_send_msg(&dev->mt76, MCU_EXT_CMD(LED_CTRL),
++				 &req, sizeof(req), true);
++}
++
+ void mt7622_trigger_hif_int(struct mt7615_dev *dev, bool en)
+ {
+ 	if (!is_mt7622(&dev->mt76))
+--- a/mt7615/mcu.h
++++ b/mt7615/mcu.h
+@@ -132,6 +132,21 @@ enum {
+     MT_SKU_4SS_DELTA,
+ };
+ 
++/* EXT_CMD_ID_LED 负载的 ctrl 字（小端），位域取自 MediaTek mt_wifi 的 LED_ENHANCE */
++enum {
++	MT7663_LED_SOLID_ON,
++	MT7663_LED_SOLID_OFF,
++	MT7663_LED_TX_BLINK,
++};
++
++#define MT7663_LED_MODE			GENMASK(7, 0)
++#define MT7663_LED_OFF_TIME		GENMASK(15, 8)
++#define MT7663_LED_ON_TIME		GENMASK(23, 16)
++#define MT7663_LED_TX_BLINK_SEL		GENMASK(25, 24)
++#define MT7663_LED_BAND			BIT(29)
++#define MT7663_LED_POLARITY		BIT(30)
++#define MT7663_LED_TX_OVER_BLINK	BIT(31)
++
+ struct mt7615_mcu_rxd {
+ 	__le32 rxd[4];
+ 
+--- a/mt7615/mt7615.h
++++ b/mt7615/mt7615.h
+@@ -283,6 +283,12 @@ struct mt7615_dev {
+ 
+ 	u32 muar_mask;
+ 
++	/* MT7663 的 LED：LED 核心要求的亮灭，与最近一次固件确认过的 LED 命令 */
++	bool led_on;
++	bool led_fw_valid;
++	u8 led_fw_idx;
++	u32 led_fw_ctrl;
++
+ 	struct mt76_connac_pm pm;
+ 	struct mt76_connac_coredump coredump;
+ };
+@@ -377,6 +383,9 @@ int mt7615_led_set_blink(struct led_clas
+ 			 unsigned long *delay_off);
+ void mt7615_led_set_brightness(struct led_classdev *led_cdev,
+ 			       enum led_brightness brightness);
++int mt7663_led_set_brightness(struct led_classdev *led_cdev,
++			      enum led_brightness brightness);
++void mt7663_led_sync(struct mt7615_dev *dev);
+ void mt7615_init_device(struct mt7615_dev *dev);
+ int mt7615_register_device(struct mt7615_dev *dev);
+ void mt7615_unregister_device(struct mt7615_dev *dev);
+@@ -485,6 +494,7 @@ int mt7615_mcu_parse_response(struct mt7
+ 			      struct sk_buff *skb, int seq);
+ u32 mt7615_rf_rr(struct mt7615_dev *dev, u32 wf, u32 reg);
+ int mt7615_rf_wr(struct mt7615_dev *dev, u32 wf, u32 reg, u32 val);
++int mt7663_mcu_set_led(struct mt7615_dev *dev, u32 idx, u32 ctrl);
+ int mt7615_mcu_set_dbdc(struct mt7615_dev *dev);
+ int mt7615_mcu_set_eeprom(struct mt7615_dev *dev);
+ int mt7615_mcu_get_temperature(struct mt7615_dev *dev);
+--- a/mt7615/pci_init.c
++++ b/mt7615/pci_init.c
+@@ -28,6 +28,12 @@ static void mt7615_pci_init_work(struct
+ 		return;
+ 
+ 	mt7615_init_work(dev);
++
++	if (is_mt7663(&dev->mt76)) {
++		mt7615_mutex_acquire(dev);
++		mt7663_led_sync(dev);
++		mt7615_mutex_release(dev);
++	}
+ }
+ 
+ static int mt7615_init_hardware(struct mt7615_dev *dev)
+@@ -75,8 +81,16 @@ int mt7615_register_device(struct mt7615
+ 
+ 	/* init led callbacks */
+ 	if (IS_ENABLED(CONFIG_MT76_LEDS)) {
+-		dev->mphy.leds.cdev.brightness_set = mt7615_led_set_brightness;
+-		dev->mphy.leds.cdev.blink_set = mt7615_led_set_blink;
++		if (is_mt7663(&dev->mt76)) {
++			/* MediaTek 的 mt_wifi 对 MT7663 固定用 LED1，DT 的 led-sources 可改 */
++			dev->mphy.leds.pin = 1;
++			dev->mphy.leds.cdev.brightness_set_blocking =
++				mt7663_led_set_brightness;
++		} else {
++			dev->mphy.leds.cdev.brightness_set =
++				mt7615_led_set_brightness;
++			dev->mphy.leds.cdev.blink_set = mt7615_led_set_blink;
++		}
+ 	}
+ 
+ 	ret = mt7622_wmac_init(dev);
+--- a/mt7615/pci_mac.c
++++ b/mt7615/pci_mac.c
+@@ -283,6 +283,7 @@ void mt7615_mac_reset_work(struct work_s
+ 	mt7615_wait_reset_state(dev, MT_MCU_CMD_NORMAL_STATE);
+ 
+ 	mt7615_update_beacons(dev);
++	mt7663_led_sync(dev);
+ 
+ 	mt7615_mutex_release(dev);
+ 

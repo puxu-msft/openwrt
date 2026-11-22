@@ -113,8 +113,7 @@
 	 *    有能力时直接接管，不让 GPIO 悬空。
 	 *  - 网络：原厂 led.conf 的 INTERNET 行全为 0，xpon/tcledctrl 没有给出
 	 *    任何 GPIO；没有可写的硬件映射，暂不建节点。
-	 *  - 无线：MT7603E/MT7663E 自己的 LED 引脚，驱动已注册
-	 *    /sys/class/leds/mt76-phy0|phy1，默认触发器 phy0tpt/phy1tpt。
+	 *  - 无线：驱动注册 /sys/class/leds/mt76-phy0|phy1，默认触发器 phy0tpt/phy1tpt。2.4G（MT7603E）由 mt76 写芯片 LED 控制器的 pin 0；5G（MT7663E）接在芯片的 LED1，由固件经 MCU 命令 EXT_CMD_ID_LED 驱动（mt76 补丁，见 slot0 的 led 节点）。
 	 */
 	leds {
 		compatible = "gpio-leds";
@@ -284,6 +283,11 @@
 			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 			00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
 		];
+
+		/* 5G 灯：MediaTek 的 mt_wifi 对 MT7663 固定用 LED1（原厂内核逆向，docs/28），mt76 的 MT7663 补丁缺省也是 1，这里写明板级事实；原厂不置反极性，不加 led-active-low */
+		led {
+			led-sources = <1>;
+		};
 	};
 };
 
