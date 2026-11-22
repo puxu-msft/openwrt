@@ -1,0 +1,146 @@
+From: xp <a.xp@live.com>
+Date: Sun, 22 Nov 2026 22:10:00 +0800
+Subject: [PATCH] net: gso: fraglist 分段从头包同步 TTL/hop limit 与 DS 字段
+
+fraglist GRO（rx-gro-list）把同一条流里连续到达的包原样挂在头包的 frag_list 上。转发路径只改头包的网络头：ip_forward()、ip6_forward() 与 nf_flow_table 的软件转发只给头包减 TTL/hop limit，DSCP 改写与出口 AQM 打的 ECN CE 标记也只落在头包上。出口按 skb_segment_list() 分段时只把头包的链路层头抄给其余分段，各分段的网络头保留收到时的内容（之后 inet_gso_segment() 只重写 IPv4 的 ID、总长与头校验和，ipv6_gso_segment() 只重写 payload_len）；__tcpv4_gso_segment_list_csum()、__tcpv6_gso_segment_list_csum() 与 __udpv4/6_gso_segment_list_csum() 只为 NAT 同步地址与端口（c3df39ac9b0e "udp: ipv4: manipulate network header of NATed UDP GRO fraglist" 起）。结果是一个聚合包里只有头包的 TTL/hop limit 减了 1、带着新的 DS 字段，其余分段带着收到时的值离开路由器。
+
+GRO 只把 TTL 与 TOS 都与头包相同（inet_gro_flush()）、IPv6 的版本与流标签（ipv6_gro_receive()）以及 Traffic Class 与 hop limit（ipv6_gro_flush()）都与头包相同的包串在一起，所以分段时头包上这几个字段的值就是协议栈对整个聚合包的处置。现在分段时把它们从头包抄给其余分段：IPv4 抄 TOS 与 TTL，头校验和按所在的 16 位字增量更新（inet_gso_segment() 随后还会整头重算一次；增量更新让头部在任何时刻都有效，与 NAT 同步地址时的写法一致）；IPv6 抄首个 32 位字（版本、Traffic Class、流标签）与 hop limit。这几个字段都不在伪首部里，TCP/UDP 校验和不变。这与非 fraglist 的 GSO 一致：skb_segment() 用头包的网络头生成每个分段，ECN CE 因此也落到全部分段上。"无需改写就返回"的快速路径同时比较这几个字段；转发时头包的 TTL 总是减过，转发的 fraglist 包总会逐段走一遍，每段多几次字节比较与写入。
+
+复现（netns + veth：A 关 TSO/GSO 按 MSS 发，经 R 转发到 B，R 入口开 rx-gro-list、出口关 tx-gso-list，R 的 forward 链用 nft 把 DSCP 改成 CS5，B 抓包）：主机内核 7.0.0 上（两轮）B 收到的帧里 TTL/hop limit 仍是 64 的，TCP v4 93.8–94.1%、v6 92.8–93.2%，UDP（UDP_SEGMENT 发送）v4 与 v6 都是 97.8%，带 CS5 的帧数与 TTL 为 63 的帧数逐一相等；rx-gro-list 关掉时全部 63、全部 CS5。GS2107（EcoNet EN7528，6.18.60，OpenWrt 软件 flowtable，单流 LAN → VLAN WAN）：TCP v4 28.6–38.8%、v6 37.9%，UDP v4 96.8–96.9%、v6 90.2%，关掉 rx-gro-list 时为 0。
+
+验证：同一份 6.18.60 x86_64 内核在 qemu 里跑同一复现，不打本补丁时 rx-gro-list 开的四个组合 TTL/hop limit 仍为 64 的帧 TCP v4 90.6%、v6 91.7%，UDP v4 与 v6 都是 97.8%，带 CS5 的帧数同样只等于 TTL 为 63 的帧数；打上之后八个组合全部 TTL/hop limit 63、DSCP 全部 CS5、IPv4 头校验和无错，开着 rx-gro-list 的组合 skb_segment_list() 调用 980–3020 次（确实走了 fraglist 分段）。
+
+Fixes: 9fd1ff5d2ac7 ("udp: Support UDP fraglist GRO/GSO.")
+Fixes: bee88cd5bd83 ("net: add support for segmenting TCP fraglist GSO packets")
+---
+ include/net/gso.h        | 24 ++++++++++++++++++++++++
+ net/ipv4/tcp_offload.c   |  4 +++-
+ net/ipv4/udp_offload.c   | 10 ++++++++--
+ net/ipv6/tcpv6_offload.c |  6 +++++-
+ 4 files changed, 40 insertions(+), 4 deletions(-)
+
+--- a/include/net/gso.h
++++ b/include/net/gso.h
+@@ -3,6 +3,8 @@
+ #ifndef _NET_GSO_H
+ #define _NET_GSO_H
+ 
++#include <linux/ip.h>
++#include <linux/ipv6.h>
+ #include <linux/skbuff.h>
+ 
+ /* Keeps track of mac header offset relative to skb->head.
+@@ -37,6 +39,28 @@ static inline int skb_tnl_header_len(con
+ 		SKB_GSO_CB(inner_skb)->mac_offset;
+ }
+ 
++/* skb_segment_list() 只把头包的链路层头抄给其余分段，各分段的网络头保留收到时的内容（之后 inet_gso_segment() 只重写 IPv4 的 ID、总长与头校验和，ipv6_gso_segment() 只重写 payload_len）。GRO 只把 TTL、TOS（IPv6 为首个 32 位字里的版本、Traffic Class、流标签，以及 hop limit）都与头包相同的包串在一起，转发路径却只改头包（减 TTL/hop limit、改 DSCP、打 ECN CE），所以分段时把这些字段从头包抄给其余分段，与 skb_segment() 用头包的头生成每个分段一致；IPv4 头校验和随之增量更新，头部在任何时刻都有效。 */
++static inline void gso_segment_list_iph_sync(struct iphdr *iph2,
++					     const struct iphdr *iph)
++{
++	if (iph2->tos != iph->tos) {
++		csum_replace2(&iph2->check, htons(iph2->tos), htons(iph->tos));
++		iph2->tos = iph->tos;
++	}
++	if (iph2->ttl != iph->ttl) {
++		csum_replace2(&iph2->check, htons(iph2->ttl << 8),
++			      htons(iph->ttl << 8));
++		iph2->ttl = iph->ttl;
++	}
++}
++
++static inline void gso_segment_list_ip6h_sync(struct ipv6hdr *iph2,
++					      const struct ipv6hdr *iph)
++{
++	*(__be32 *)iph2 = *(const __be32 *)iph;
++	iph2->hop_limit = iph->hop_limit;
++}
++
+ static inline int gso_pskb_expand_head(struct sk_buff *skb, int extra)
+ {
+ 	int new_headroom, headroom;
+--- a/net/ipv4/tcp_offload.c
++++ b/net/ipv4/tcp_offload.c
+@@ -67,13 +67,15 @@ static struct sk_buff *__tcpv4_gso_segme
+ 	iph2 = ip_hdr(seg->next);
+ 
+ 	if (!(*(const u32 *)&th->source ^ *(const u32 *)&th2->source) &&
+-	    iph->daddr == iph2->daddr && iph->saddr == iph2->saddr)
++	    iph->daddr == iph2->daddr && iph->saddr == iph2->saddr &&
++	    iph->ttl == iph2->ttl && iph->tos == iph2->tos)
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+ 		th2 = tcp_hdr(seg);
+ 		iph2 = ip_hdr(seg);
+ 
++		gso_segment_list_iph_sync(iph2, iph);
+ 		__tcpv4_gso_segment_csum(seg,
+ 					 &iph2->saddr, iph->saddr,
+ 					 &th2->source, th->source);
+--- a/net/ipv4/udp_offload.c
++++ b/net/ipv4/udp_offload.c
+@@ -387,13 +387,16 @@ static struct sk_buff *__udpv4_gso_segme
+ 	if ((udp_hdr(seg)->dest == udp_hdr(seg->next)->dest) &&
+ 	    (udp_hdr(seg)->source == udp_hdr(seg->next)->source) &&
+ 	    (ip_hdr(seg)->daddr == ip_hdr(seg->next)->daddr) &&
+-	    (ip_hdr(seg)->saddr == ip_hdr(seg->next)->saddr))
++	    (ip_hdr(seg)->saddr == ip_hdr(seg->next)->saddr) &&
++	    (ip_hdr(seg)->ttl == ip_hdr(seg->next)->ttl) &&
++	    (ip_hdr(seg)->tos == ip_hdr(seg->next)->tos))
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+ 		uh2 = udp_hdr(seg);
+ 		iph2 = ip_hdr(seg);
+ 
++		gso_segment_list_iph_sync(iph2, iph);
+ 		__udpv4_gso_segment_csum(seg,
+ 					 &iph2->saddr, &iph->saddr,
+ 					 &uh2->source, &uh->source);
+@@ -445,13 +448,16 @@ static struct sk_buff *__udpv6_gso_segme
+ 
+ 	if (!(*(const u32 *)&uh->source ^ *(const u32 *)&uh2->source) &&
+ 	    ipv6_addr_equal(&iph->saddr, &iph2->saddr) &&
+-	    ipv6_addr_equal(&iph->daddr, &iph2->daddr))
++	    ipv6_addr_equal(&iph->daddr, &iph2->daddr) &&
++	    *(const __be32 *)iph == *(const __be32 *)iph2 &&
++	    iph->hop_limit == iph2->hop_limit)
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+ 		uh2 = udp_hdr(seg);
+ 		iph2 = ipv6_hdr(seg);
+ 
++		gso_segment_list_ip6h_sync(iph2, iph);
+ 		__udpv6_gso_segment_csum(seg, &iph2->saddr, &iph->saddr,
+ 					 &uh2->source, uh->source);
+ 		__udpv6_gso_segment_csum(seg, &iph2->daddr, &iph->daddr,
+--- a/net/ipv6/tcpv6_offload.c
++++ b/net/ipv6/tcpv6_offload.c
+@@ -9,6 +9,7 @@
+ #include <linux/skbuff.h>
+ #include <net/inet6_hashtables.h>
+ #include <net/gro.h>
++#include <net/gso.h>
+ #include <net/protocol.h>
+ #include <net/tcp.h>
+ #include <net/ip6_checksum.h>
+@@ -141,13 +142,16 @@ static struct sk_buff *__tcpv6_gso_segme
+ 
+ 	if (!(*(const u32 *)&th->source ^ *(const u32 *)&th2->source) &&
+ 	    ipv6_addr_equal(&iph->saddr, &iph2->saddr) &&
+-	    ipv6_addr_equal(&iph->daddr, &iph2->daddr))
++	    ipv6_addr_equal(&iph->daddr, &iph2->daddr) &&
++	    *(const __be32 *)iph == *(const __be32 *)iph2 &&
++	    iph->hop_limit == iph2->hop_limit)
+ 		return segs;
+ 
+ 	while ((seg = seg->next)) {
+ 		th2 = tcp_hdr(seg);
+ 		iph2 = ipv6_hdr(seg);
+ 
++		gso_segment_list_ip6h_sync(iph2, iph);
+ 		__tcpv6_gso_segment_csum(seg, &iph2->saddr, &iph->saddr,
+ 					 &th2->source, th->source);
+ 		__tcpv6_gso_segment_csum(seg, &iph2->daddr, &iph->daddr,
