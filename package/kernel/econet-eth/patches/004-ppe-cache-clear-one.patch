@@ -1,0 +1,250 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: PPE 表项缓存按条清除
+
+原来每次绑定与解绑都整表清除表项缓存（0xf20 = 0x4100）。原厂另有按条的路径（hw_nat ppeCacheClearOne 0x93c8，EN7528 上由 FoeDelEntryByNum 调用）：在 0xf24[15:0] 写表项号、命令 0x0100 查缓存（bit31 命中、[30:16] 行号），命中时读行（0xf28 = 行号 | 0x1f0000，命令 0x2100），把行字的 bit17:16 清掉后写回（0xf2c，命令 0x3100）。绑定与解绑改用它（原厂数据面绑定不刷缓存；按条丢行在缓存里没有该表项时只是一次未命中的查找，代价一次命令轮询）。block 释放期间缓存保持关闭，逐条失效其表项，结束时整表清除一次。按条失败时整表清除；整表也失败时缓存保持关闭，直到某次整表清除成功。cache_timeouts 对每条失败的命令计一次。en75_ppe_deinit() 释放流之后不再碰缓存寄存器（block 之后才由 unregister_netdev() 释放）。
+
+debugfs ppe 新增 cache_stale、cache_held、stopped 与三个计数：cache_search_hit（按条查到并丢掉）、cache_search_miss（缓存里没有该表项）、cache_clear_all（整表清除次数，含 block 释放与兜底），实测时据此确认走的是按条路径。
+
+diff --git a/econet_ppe.c b/econet_ppe.c
+index c58c40b..7bbaab5 100644
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -51,6 +51,10 @@
+ #define PPE_DFP_CPORT		0x048
+ #define PPE_HASH_CFG		0x088	/* unnamed by the vendor; written 0x77d */
+ #define PPE_CAH_CTRL		0x120
++#define PPE_CAH_TAG_SRH		0x124
++#define PPE_CAH_LINE_RW		0x128
++#define PPE_CAH_WDATA		0x12c
++#define PPE_CAH_RDATA		0x130
+ #define PPE_CAH_EN		0x134	/* EN7528 only: bit 0 enables the entry cache */
+ 
+ #define PPE_GLO_CFG_EN		BIT(0)
+@@ -63,8 +67,17 @@
+ #define PPE_TB_CFG_KEEPALIVE	GENMASK(13, 12)
+ #define PPE_TB_CFG_HASH_MODE	GENMASK(15, 14)
+ 
+-#define PPE_CAH_CTRL_CLEAR	0x4100
++/* Cache commands and their operands as the vendor issues them (hw_nat is_request_done 0x91c8, ppeCacheClearOne 0x93c8, hwnat_delete_foe_entry 0x1f038). */
++#define PPE_CAH_CTRL_SEARCH	0x0100	/* look up the entry in CAH_TAG_SRH */
++#define PPE_CAH_CTRL_READ	0x2100	/* line in CAH_LINE_RW -> CAH_RDATA */
++#define PPE_CAH_CTRL_WRITE	0x3100	/* CAH_WDATA -> line in CAH_LINE_RW */
++#define PPE_CAH_CTRL_CLEAR	0x4100	/* every line */
+ #define PPE_CAH_CTRL_BUSY	BIT(8)
++#define PPE_CAH_TAG_SRH_INDEX	GENMASK(15, 0)
++#define PPE_CAH_TAG_SRH_LINE	GENMASK(30, 16)	/* search result: line of the entry */
++#define PPE_CAH_TAG_SRH_HIT	BIT(31)		/* search result: the entry is cached */
++#define PPE_CAH_LINE_RW_SEL	GENMASK(20, 16)	/* written all ones with the line number, as the vendor does */
++#define PPE_CAH_LINE_VALID	GENMASK(17, 16)	/* of the line word; cleared to drop the line */
+ 
+ #define PPE_ENTRIES_SHIFT	4
+ #define PPE_ENTRIES		(1024 << PPE_ENTRIES_SHIFT)
+@@ -196,7 +209,17 @@ struct en75_ppe {
+ 
+ 	unsigned long binds;
+ 	unsigned long bind_misses;
+-	unsigned long cache_timeouts;	/* clear commands that did not complete; the cache then stays off */
++	unsigned long cache_timeouts;	/* cache commands that could not be issued or did not complete, one count each */
++	/* 按条清除的结果：查到该表项所在的缓存行并丢掉 / 缓存里没有该表项（不必动）；cache_clear_all 是整表清除的次数（block 释放与按条失败后的兜底）。 */
++	unsigned long cache_search_hit;
++	unsigned long cache_search_miss;
++	unsigned long cache_clear_all;
++	/* The cache may hold stale lines (a command timed out): it stays off until it is cleared as a whole. */
++	bool cache_stale;
++	/* A block release is invalidating its entries: the cache stays off and is cleared once when the release ends. Releases are serialised by cmd_lock. */
++	bool cache_held;
++	/* en75_ppe_deinit() has released the flows and turns the engine off: the cache registers are left alone from then on (flow blocks are only released after it, from unregister_netdev()). */
++	bool stopped;
+ };
+ 
+ static void ppe_w32(struct en75_ppe *ppe, u32 reg, u32 val)
+@@ -226,34 +249,72 @@ static struct hlist_head *ppe_bucket(struct en75_ppe *ppe,
+ 			     PPE_FLOW_BUCKETS];
+ }
+ 
+-/* Table entries are written between these two, in the order of the vendor hwnat_delete_foe_entry: with the cache off and cleared the engine can neither use nor write back a stale copy of the entry being changed. Caller holds ppe->lock. */
+-static bool ppe_cache_idle(struct en75_ppe *ppe)
++/* Caller holds ppe->lock. Waits for the cache command in flight (the vendor polls up to about a second; a stuck command is reported, not waited out in softirq). */
++static bool ppe_cache_wait(struct en75_ppe *ppe)
+ {
+ 	u32 val;
+ 
+-	/* the vendor polls up to about a second; a stuck command is reported, not waited out in softirq */
+ 	return !readl_poll_timeout_atomic(ppe->regs + PPE_CAH_CTRL, val,
+ 					  !(val & PPE_CAH_CTRL_BUSY), 1, 1000);
+ }
+ 
+-/* Returns whether the cache was cleared. If it was not, it is left off (a valid mode, the one the vendor tears down in) rather than re-enabled with stale copies in it. */
+-static bool ppe_cache_off(struct en75_ppe *ppe)
++/* Caller holds ppe->lock. Issues @cmd once the previous command is done and waits for it. */
++static bool ppe_cache_cmd(struct en75_ppe *ppe, u32 cmd)
+ {
+-	ppe_w32(ppe, PPE_CAH_EN, ppe_r32(ppe, PPE_CAH_EN) & ~BIT(0));
+-	if (ppe_cache_idle(ppe)) {
+-		ppe_w32(ppe, PPE_CAH_CTRL, PPE_CAH_CTRL_CLEAR);
+-		if (ppe_cache_idle(ppe))
++	if (ppe_cache_wait(ppe)) {
++		ppe_w32(ppe, PPE_CAH_CTRL, cmd);
++		if (ppe_cache_wait(ppe))
+ 			return true;
+ 	}
+ 	ppe->cache_timeouts++;
+-	dev_warn_ratelimited(ppe->dev, "PPE cache clear timed out, cache left off\n");
+ 	return false;
+ }
+ 
+-static void ppe_cache_on(struct en75_ppe *ppe, bool cleared)
++/* Caller holds ppe->lock, cache off. Drops the line holding entry @index, if one does (vendor ppeCacheClearOne): search the entry, read its line, write it back with the valid bits cleared. */
++static bool ppe_cache_drop_entry(struct en75_ppe *ppe, unsigned int index)
++{
++	u32 tag, line;
++
++	tag = ppe_r32(ppe, PPE_CAH_TAG_SRH) & ~PPE_CAH_TAG_SRH_INDEX;
++	ppe_w32(ppe, PPE_CAH_TAG_SRH, tag | FIELD_PREP(PPE_CAH_TAG_SRH_INDEX, index));
++	if (!ppe_cache_cmd(ppe, PPE_CAH_CTRL_SEARCH))
++		return false;
++	tag = ppe_r32(ppe, PPE_CAH_TAG_SRH);
++	if (!(tag & PPE_CAH_TAG_SRH_HIT)) {
++		ppe->cache_search_miss++;
++		return true;
++	}
++	ppe->cache_search_hit++;
++
++	line = FIELD_GET(PPE_CAH_TAG_SRH_LINE, tag) | PPE_CAH_LINE_RW_SEL;
++	ppe_w32(ppe, PPE_CAH_LINE_RW, line);
++	if (!ppe_cache_cmd(ppe, PPE_CAH_CTRL_READ))
++		return false;
++	ppe_w32(ppe, PPE_CAH_WDATA, ppe_r32(ppe, PPE_CAH_RDATA) & ~PPE_CAH_LINE_VALID);
++	ppe_w32(ppe, PPE_CAH_LINE_RW, line);
++	return ppe_cache_cmd(ppe, PPE_CAH_CTRL_WRITE);
++}
++
++/* Caller holds ppe->lock. Table entries are written between ppe_cache_off() and ppe_cache_on(): with the cache off and no copy of the entry left in it, the engine can neither use nor write back a stale copy of the entry being changed. The vendor does the same around its entry changes, dropping the one line where it deletes by index (FoeDelEntryByNum) and clearing every line in hwnat_delete_foe_entry. @index is the entry about to change, or -1 to clear the whole cache. If dropping the entry fails the whole cache is cleared; a cache that could not be cleared stays off (a valid mode, the one the vendor tears down in) until a whole clear succeeds. */
++static void ppe_cache_off(struct en75_ppe *ppe, int index)
++{
++	if (ppe->stopped)
++		return;
++	ppe_w32(ppe, PPE_CAH_EN, ppe_r32(ppe, PPE_CAH_EN) & ~BIT(0));
++	if (ppe->cache_held)
++		return;
++	if (index >= 0 && !ppe->cache_stale && ppe_cache_drop_entry(ppe, index))
++		return;
++	ppe->cache_clear_all++;
++	ppe->cache_stale = !ppe_cache_cmd(ppe, PPE_CAH_CTRL_CLEAR);
++	if (ppe->cache_stale)
++		dev_warn_ratelimited(ppe->dev, "PPE cache clear timed out, cache left off\n");
++}
++
++static void ppe_cache_on(struct en75_ppe *ppe)
+ {
+ 	wmb();
+-	if (cleared)
++	if (!ppe->stopped && !ppe->cache_stale && !ppe->cache_held)
+ 		ppe_w32(ppe, PPE_CAH_EN, ppe_r32(ppe, PPE_CAH_EN) | BIT(0));
+ }
+ 
+@@ -273,11 +334,10 @@ static void ppe_bind(struct en75_ppe *ppe, struct en75_flow *flow, int index,
+ 	const int ib2_word = offsetof(struct en75_foe_entry, ipv4.ib2) / 4 - 1;
+ 	struct en75_foe_entry *hwe = ppe_entry(ppe, index);
+ 	u32 ib1 = flow->data.ib1;
+-	bool cleared;
+ 	int i;
+ 
+ 	ib1 |= FIELD_PREP(FOE_IB1_BIND_TS, ppe_timestamp(ppe));
+-	cleared = ppe_cache_off(ppe);
++	ppe_cache_off(ppe, index);
+ 	for (i = 0; i < ARRAY_SIZE(hwe->data); i++) {
+ 		u32 val = flow->data.data[i];
+ 
+@@ -287,7 +347,7 @@ static void ppe_bind(struct en75_ppe *ppe, struct en75_flow *flow, int index,
+ 	}
+ 	wmb();
+ 	WRITE_ONCE(hwe->ib1, ib1);
+-	ppe_cache_on(ppe, cleared);
++	ppe_cache_on(ppe);
+ 	flow->index = index;
+ 	ppe->binds++;
+ }
+@@ -321,12 +381,10 @@ static void ppe_unbind(struct en75_ppe *ppe, struct en75_flow *flow)
+ 	struct en75_foe_entry *hwe;
+ 
+ 	if (ppe_flow_bound(ppe, flow, NULL)) {
+-		bool cleared;
+-
+ 		hwe = ppe_entry(ppe, flow->index);
+-		cleared = ppe_cache_off(ppe);
++		ppe_cache_off(ppe, flow->index);
+ 		WRITE_ONCE(hwe->ib1, FIELD_PREP(FOE_IB1_STATE, FOE_STATE_INVALID));
+-		ppe_cache_on(ppe, cleared);
++		ppe_cache_on(ppe);
+ 	}
+ 	flow->index = -1;
+ }
+@@ -709,10 +767,29 @@ static void en75_flow_free_one(void *ptr, void *arg)
+ 	en75_flow_free(arg, ptr);
+ }
+ 
++/* Caller holds ppe->cmd_lock. Frees every flow of @blk and its table. The cache stays off while the entries are invalidated and is cleared once at the end, instead of entry by entry. */
++static void en75_ppe_block_free_flows(struct en75_ppe_block *blk)
++{
++	struct en75_ppe *ppe = blk->ppe;
++
++	spin_lock_bh(&ppe->lock);
++	ppe->cache_held = true;
++	ppe_cache_off(ppe, -1);
++	spin_unlock_bh(&ppe->lock);
++
++	rhashtable_free_and_destroy(&blk->flows, en75_flow_free_one, ppe);
++
++	spin_lock_bh(&ppe->lock);
++	ppe->cache_held = false;
++	ppe_cache_off(ppe, -1);
++	ppe_cache_on(ppe);
++	spin_unlock_bh(&ppe->lock);
++}
++
+ /* Caller holds ppe->cmd_lock. */
+ static void en75_ppe_block_flush(struct en75_ppe_block *blk)
+ {
+-	rhashtable_free_and_destroy(&blk->flows, en75_flow_free_one, blk->ppe);
++	en75_ppe_block_free_flows(blk);
+ 	/* left valid and empty for later commands and the release */
+ 	WARN_ON(rhashtable_init(&blk->flows, &en75_flow_ht_params));
+ }
+@@ -724,7 +801,7 @@ static void en75_ppe_block_release(void *cb_priv)
+ 	struct en75_ppe *ppe = blk->ppe;
+ 
+ 	mutex_lock(&ppe->cmd_lock);
+-	rhashtable_free_and_destroy(&blk->flows, en75_flow_free_one, ppe);
++	en75_ppe_block_free_flows(blk);
+ 	list_del(&blk->node);
+ 	mutex_unlock(&ppe->cmd_lock);
+ 	kfree(blk);
+@@ -864,6 +941,9 @@ void en75_ppe_deinit(struct en75_ppe *ppe)
+ 	ppe->dead = true;
+ 	list_for_each_entry(blk, &ppe->blocks, node)
+ 		en75_ppe_block_flush(blk);
++	spin_lock_bh(&ppe->lock);
++	ppe->stopped = true;
++	spin_unlock_bh(&ppe->lock);
+ 	mutex_unlock(&ppe->cmd_lock);
+ 
+ 	ppe_w32(ppe, PPE_CAH_EN, ppe_r32(ppe, PPE_CAH_EN) & ~BIT(0));
+@@ -896,9 +976,15 @@ int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe)
+ 			blocks++;
+ 		}
+ 		mutex_unlock(&ppe->cmd_lock);
+-		seq_printf(m, "blocks=%u flows=%u binds=%lu bind_misses=%lu cache_timeouts=%lu\n",
++		seq_printf(m, "blocks=%u flows=%u binds=%lu bind_misses=%lu cache_timeouts=%lu cache_stale=%d cache_held=%d stopped=%d\n",
+ 			   blocks, flows, READ_ONCE(ppe->binds),
+-			   READ_ONCE(ppe->bind_misses), READ_ONCE(ppe->cache_timeouts));
++			   READ_ONCE(ppe->bind_misses), READ_ONCE(ppe->cache_timeouts),
++			   READ_ONCE(ppe->cache_stale), READ_ONCE(ppe->cache_held),
++			   READ_ONCE(ppe->stopped));
++		seq_printf(m, "cache_search_hit=%lu cache_search_miss=%lu cache_clear_all=%lu\n",
++			   READ_ONCE(ppe->cache_search_hit),
++			   READ_ONCE(ppe->cache_search_miss),
++			   READ_ONCE(ppe->cache_clear_all));
+ 	}
+ 
+ 	for (i = 0; i < PPE_ENTRIES; i++) {
