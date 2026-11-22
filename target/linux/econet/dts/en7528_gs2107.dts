@@ -583,11 +583,11 @@
 		/*
 		 * kernel：8MB。LZMA 流约 3.83MB，余 4.17MB 给后续加驱动。
 		 * 由 U-Boot 读出（gs_nand_boot）并 bootm，不由 bootbase 直接读。
+		 * 不开 econet,enable-remap：开了以后内核以 ECC 读这里、纠错到阈值时会自行把整块搬进保留区并重写 BMT 表，而 BMT 表也是 tcboot 取 mtd2 要用的启动相关存储，改写只经带确认门的工具做。块变弱由每周巡读的纠错增量报警，重写内核即刷新，真磨坏了再用工具重映射。
 		 */
 		partition@480000 {			/* mtd3 8M */
 			label = "kernel";
 			reg = <0x0480000 0x00800000>;
-			econet,enable-remap;
 		};
 
 		/*
