@@ -1,0 +1,18 @@
+. /lib/functions.sh
+. /lib/functions/migrations.sh
+
+board=$(board_name)
+
+case "$board" in
+chinamobile,gs2107)
+	# 端口标签改成与面板一致后（面板网口 N = lanN），各口的灯名随 PHY 换了编号；按旧名生成的 LED 配置指向已不存在的 sysfs 节点，灯全灭。
+	migrate_leds "^mt7530-0:09:green:lan-1$=mt7530-0:0c:green:lan-1" \
+		"^mt7530-0:0a:green:lan-2$=mt7530-0:0b:green:lan-2" \
+		"^mt7530-0:0b:green:lan-3$=mt7530-0:0a:green:lan-3" \
+		"^mt7530-0:0c:green:lan-4$=mt7530-0:09:green:lan-4"
+	;;
+esac
+
+migrations_apply system
+
+exit 0

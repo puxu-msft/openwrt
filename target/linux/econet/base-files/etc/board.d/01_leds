@@ -25,11 +25,11 @@ dasan,h660gm-a-generic)
 	ucidef_set_led_netdev "lan4-amber" "lan4" "amber:lan-4" "lan4" "link_10 link_100 tx rx"
 	;;
 chinamobile,gs2107)
-	# GSW PHY LED1 per port (DTS function-enumerator 1-4 = lan1-4).
-	ucidef_set_led_netdev "lan1" "lan1" "mt7530-0:09:green:lan-1" "lan1" "link tx rx"
-	ucidef_set_led_netdev "lan2" "lan2" "mt7530-0:0a:green:lan-2" "lan2" "link tx rx"
-	ucidef_set_led_netdev "lan3" "lan3" "mt7530-0:0b:green:lan-3" "lan3" "link tx rx"
-	ucidef_set_led_netdev "lan4" "lan4" "mt7530-0:0c:green:lan-4" "lan4" "link tx rx"
+	# 面板网口 N = lanN；交换机端口按反序接面板（面板网口 1 是端口 4），所以 lanN 的灯是 PHY 0x0d-N 的 LED1（DTS function-enumerator 与面板编号一致）。
+	ucidef_set_led_netdev "lan1" "lan1" "mt7530-0:0c:green:lan-1" "lan1" "link tx rx"
+	ucidef_set_led_netdev "lan2" "lan2" "mt7530-0:0b:green:lan-2" "lan2" "link tx rx"
+	ucidef_set_led_netdev "lan3" "lan3" "mt7530-0:0a:green:lan-3" "lan3" "link tx rx"
+	ucidef_set_led_netdev "lan4" "lan4" "mt7530-0:09:green:lan-4" "lan4" "link tx rx"
 	;;
 jiofiber,jcow407|\
 jiofiber,jcow414)
