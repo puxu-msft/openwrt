@@ -1,0 +1,1018 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: PPE 覆盖 IPv6 路由、802.1Q/QinQ 与 PPPoE，debugfs ppe_entries 与 ppe_flows
+
+表项按包类型泛化（原厂 hw_nat 的表项布局，同 mtk v1）：类型 0（IPv4 HNAPT）的 ib2 在 w4、L2 块在 w11..w15；类型 3..7 用 IPv6 布局，5T 路由（类型 5）的原始元组占 w1..w9（地址每 32 位一字、主机序数值，端口字同 IPv4），ib2 在 w14、L2 块在 w15..w19；四处偏移由 static_assert 固定。匹配键为 ib1 的包类型与 UDP 位加原始元组（40 字节，IPv4 时其余字节为 0）。FLOW_CFG 加 bit9 学习 IPv6 TCP/UDP。
+
+- IPv6 只做路由：表项没有新地址字段（原厂 NAT66/NPTv6 走软件），带任何 IPv4/IPv6 地址或端口改写的 IPv6 规则拒绝。硬件把 ib2[31:24] 写进转发包的 Traffic Class，与 IPv4 TOS 同样取触发帧的值，触发帧带 CE 时不绑定。
+- 出向封装由表项的出向字段表示（原厂 PpeSetVlan/PpeFillInL2Info/PpeSetEntryBind，与 mainline mtk_foe_entry_set_dsa/set_vlan/set_pppoe 的原始顺序同义）：经交换机出向时第一层 802.1Q 与 MediaTek 标签合并（etype = BIT(端口) | TPID 类型 << 8，vlan1 = TCI，VLAN 层数 1，与 tag_mtk 发包的合并格式相同），第二层进 vlan2、层数 2；PPPoE 置 ib1 bit19、会话号写进 L2 块，etype 仍是标签，PPPoE 头与 PPP 协议号由硬件生成。ib1[21:20] 按原厂是 2 位 VPM，经交换机出向时为 0。nf_flowtable 只下发 802.1Q（802.1ad 出向没有对应动作，按未知动作拒绝）；出向就是 conduit 本身而带封装的规则拒绝（GS2107 的口都在交换机后面）。
+- 入向封装不进表项：VLAN_POP 为空操作，硬件剥掉入向 VLAN/PPPoE 后按出向字段重建二层。规则里的入向 VLAN（层数与 VID）存进流，绑定时与触发帧核对（入向 PPPoE 在规则里看不到，不核对）。
+- 绑定请求（原因码 15）的触发帧遍历封装：最多两层 0x8100/0x88a8，其后至多一层 PPPoE 会话（ver/type 0x11、code 0，PPP 协议 0x0021/0x0057）；表项类型须与帧的网络层一致（IPv4 帧只绑类型 0、IPv6 帧只绑类型 5）；触发帧的入向 VLAN（层数与 VID）须与规则一致，不一致时接着核对同一元组的其它流。外层 802.1ad 的 QinQ 因此不会被绑定：内核只给入向规则出内层 802.1Q 的键，触发帧却带两层。
+- 拆流时绑定态与 TCP FIN 态的表项都失效（同 mtk __mtk_foe_entry_clear 不看状态）；统计回调为 FIN 态表项保留表项号。硬件见到 FIN/RST 后把绑定表项改成 FIN 态，只失效绑定态时，FIN 态表项要等 5 s 老化，其间同一五元组的新连接每包以原因码 16 上 CPU、也不再请求绑定：GS2107 上紧接着重建的 TCP 连接修改前 20.3 万帧走原因码 16，修改后 0。
+- debugfs ppe 新增按网络层与封装分档的绑定请求计数（requests_ipv4/ipv6：plain、vlan、qinq、pppoe、vlan_pppoe、qinq_pppoe），解析不了、类型对不上、入向 VLAN 对不上的计数，已绑定表项按类型、VLAN 层数与 PPPoE 位分档。新增 ppe_entries（全部有效表项逐条解码：状态、类型、ib1 各位、元组、ib2、L2 块与原始 20 个字；按表项号迭代，每次只缓冲一页）与 ppe_flows（驱动接受的每条流：入向口与入向 VLAN、出向口、期望的表项、是否已绑定、表项号、空闲秒数、绑定次数与最近一次触发帧的封装；锁按桶取放）。
+
+GS2107 上热换实测（2026-11-22，主机千兆有线，单线 VLAN/PPPoE 拓扑）：IPv4/IPv6 无封装、单层 VLAN（出入向、VLAN 到 VLAN）、QinQ 8100/8100、PPPoE 与 PPPoE over VLAN 都由硬件绑定转发，TCP 896–934 Mb/s、各 CPU 忙碌率多在 10% 以内，绑定后 conntrack 包数冻结；路由器发出的帧逐帧核对 VID 与 TPID、PPPoE 头、TTL/hop limit、TOS/TC 正确。FE 以太类型表保持全 0 时硬件照样越过标签后的 VLAN/PPPoE 学习；硬件插入的第二层 TPID 是 0x8100；PPPoE 出向 IP 总长 ≤ 1492 由硬件转发、更大的以原因码 28 回 CPU。NAT66 与外层 802.1ad 留在软件。
+
+已知限制：表项只按 IP 元组匹配，两个入向封装里五元组相同的流会撞同一表项（原厂与 mtk 相同）；nf_flowtable 下发的 VLAN 不带 PCP，硬件转发的帧 PCP 为 0；网桥开 vlan_filtering 时交换机送 CPU 的帧在标签后带 PVID 的 802.1Q、规则里却没有这一层，这样的入向流核对不过、留在软件（mainline mtk 对 L3 流忽略入向 VLAN 键会照常绑定；GS2107 的 br-lan 不开 vlan_filtering）。
+
+diff --git a/econet_eth_debug.c b/econet_eth_debug.c
+index 138cc16..dd663b4 100644
+--- a/econet_eth_debug.c
++++ b/econet_eth_debug.c
+@@ -662,6 +662,29 @@ static int en75_ppe_show(struct seq_file *m, void *v)
+ }
+ DEFINE_SHOW_ATTRIBUTE(en75_ppe);
+ 
++static int en75_ppe_entries_dbg_open(struct inode *inode, struct file *file)
++{
++	int ret = seq_open(file, &en75_ppe_entries_seq_ops);
++
++	if (!ret)
++		((struct seq_file *)file->private_data)->private = inode->i_private;
++	return ret;
++}
++
++static const struct file_operations en75_ppe_entries_dbg_fops = {
++	.owner = THIS_MODULE,
++	.open = en75_ppe_entries_dbg_open,
++	.read = seq_read,
++	.llseek = seq_lseek,
++	.release = seq_release,
++};
++
++static int en75_ppe_flows_dbg_show(struct seq_file *m, void *v)
++{
++	return en75_ppe_flows_show(m, m->private);
++}
++DEFINE_SHOW_ATTRIBUTE(en75_ppe_flows_dbg);
++
+ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config)
+ {
+ 	struct en75_debug *debug;
+@@ -683,9 +706,14 @@ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config)
+ 	if (config->fe_regs)
+ 		debugfs_create_file_size("fe_regs", 0600, debug->dir, debug,
+ 					 &en75_fe_regs_fops, config->fe_regs_len);
+-	if (config->ppe)
++	if (config->ppe) {
+ 		debugfs_create_file("ppe", 0400, debug->dir, config->ppe,
+ 				    &en75_ppe_fops);
++		debugfs_create_file("ppe_entries", 0400, debug->dir, config->ppe,
++				    &en75_ppe_entries_dbg_fops);
++		debugfs_create_file("ppe_flows", 0400, debug->dir, config->ppe,
++				    &en75_ppe_flows_dbg_fops);
++	}
+ 	if (config->crsn_count)
+ 		debugfs_create_file("crsn", 0400, debug->dir, config->crsn_count,
+ 				    &en75_crsn_fops);
+diff --git a/econet_ppe.c b/econet_ppe.c
+index 7bbaab5..16866ba 100644
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -6,7 +6,9 @@
+  *
+  * Flows come from nf_flowtable hardware offload (TC_SETUP_FT on the DSA conduit, which DSA user ports delegate to). As in mtk_ppe, a flow is only bound once the engine asks for it: on a table miss it builds an unbound entry at the hash index of the frame and, past the bind rate, delivers frames of that entry with CPU reason HIT_UNBIND_RATE_REACHED and the index in the RX descriptor. en75_ppe_check_skb() then reads the tuple back from that entry and binds the matching flow in place, so the software never has to reproduce the hardware hash.
+  *
+- * Scope: IPv4 TCP/UDP (NAPT or plain routing) between ports behind the MediaTek-tagged switch on GDM1, leaving through GDM1 directly (no QDMA forwarding queue). Everything else stays in software.
++ * Scope: IPv4 TCP/UDP (NAPT or plain routing) and IPv6 TCP/UDP routing (5-tuple entries, no address translation) between ports behind the MediaTek-tagged switch on GDM1, leaving through GDM1 directly (no QDMA forwarding queue), with up to two encapsulation layers on either side as nf_flowtable describes them (NF_FLOW_TABLE_ENCAP_MAX): one or two 802.1Q tags, a PPPoE session, or 802.1Q then PPPoE. Everything else stays in software.
++ *
++ * 封装（原厂 hw_nat PpeSetVlan/PpeFillInL2Info/PpeSetEntryBind 与 mainline mtk_foe_entry_set_dsa/vlan/pppoe 同义）：表项只描述出向二层，入向的 VLAN/PPPoE 不进表项，由硬件解析后剥掉、按出向字段重建。出向经交换机时 802.1Q 头与 MediaTek 标签合并：etype = BIT(端口) | (TPID 类型 << 8)，vlan1 = 第一层 TCI，ib1 的 VLAN 层数（含标签这一层）为 1；第二层 802.1Q 时 vlan2 = 内层 TCI、层数 2。PPPoE 置 ib1 bit19、会话号写进 L2 块，etype 仍是标签。IPv6 表项没有新地址字段（原厂 NAT66 走软件），带地址或端口改写的 IPv6 规则拒绝。
+  */
+ #include <linux/bitfield.h>
+ #include <linux/device.h>
+@@ -16,12 +18,17 @@
+ #include <linux/io.h>
+ #include <linux/iopoll.h>
+ #include <linux/ip.h>
++#include <linux/ipv6.h>
++#include <linux/if_pppox.h>
++#include <linux/if_vlan.h>
++#include <linux/ppp_defs.h>
+ #include <linux/jhash.h>
+ #include <linux/rhashtable.h>
+ #include <linux/seq_file.h>
+ #include <linux/slab.h>
+ #include <linux/unaligned.h>
+ #include <net/dsa.h>
++#include <net/dsfield.h>
+ #include <net/inet_ecn.h>
+ #include <net/flow_offload.h>
+ #include <net/pkt_cls.h>
+@@ -58,6 +65,7 @@
+ #define PPE_CAH_EN		0x134	/* EN7528 only: bit 0 enables the entry cache */
+ 
+ #define PPE_GLO_CFG_EN		BIT(0)
++#define PPE_FLOW_CFG_IP6_5T_ROUTE	BIT(9)	/* 学习 IPv6 TCP/UDP（表项类型 5） */
+ #define PPE_FLOW_CFG_NAT_FRAG	BIT(17)
+ 
+ #define PPE_TB_CFG_ENTRY_NUM	GENMASK(2, 0)	/* 1024 << n entries */
+@@ -84,8 +92,9 @@
+ 
+ #define FOE_IB1_UNBIND_TS	GENMASK(7, 0)
+ #define FOE_IB1_BIND_TS		GENMASK(14, 0)
+-#define FOE_IB1_BIND_VLAN_LAYER	GENMASK(18, 16)
+-#define FOE_IB1_BIND_VLAN_TAG	BIT(20)
++#define FOE_IB1_BIND_VLAN_LAYER	GENMASK(18, 16)	/* 出向 VLAN 层数，MediaTek 标签算一层 */
++#define FOE_IB1_BIND_PPPOE	BIT(19)		/* 出向加 PPPoE 会话头 */
++#define FOE_IB1_BIND_VPM	GENMASK(21, 20)	/* EN7528 的 2 位 VPM（原厂 ppe_trans_tpid_to_vpm）；经交换机出向时为 0 */
+ #define FOE_IB1_BIND_CACHE	BIT(22)
+ #define FOE_IB1_BIND_TTL	BIT(24)
+ #define FOE_IB1_PACKET_TYPE	GENMASK(27, 25)
+@@ -96,7 +105,7 @@
+ #define FOE_IB2_MULTICAST	BIT(8)
+ #define FOE_IB2_METER		GENMASK(17, 12)	/* 63: no meter */
+ #define FOE_IB2_ACCOUNT		GENMASK(23, 18)	/* 63: no accounting group */
+-#define FOE_IB2_TOS		GENMASK(31, 24)	/* written into the IPv4 TOS of every forwarded packet */
++#define FOE_IB2_TOS		GENMASK(31, 24)	/* written into the IPv4 TOS / IPv6 Traffic Class of every forwarded packet */
+ 
+ enum {
+ 	FOE_STATE_INVALID,
+@@ -108,8 +117,14 @@ enum {
+ enum {
+ 	FOE_TYPE_IPV4_HNAPT = 0,
+ 	FOE_TYPE_IPV4_ROUTE = 1,
++	FOE_TYPE_IPV4_DSLITE = 3,	/* 从这一类型起表项用 IPv6 布局 */
++	FOE_TYPE_IPV6_ROUTE_3T = 4,
++	FOE_TYPE_IPV6_ROUTE_5T = 5,
+ };
+ 
++/* etype（出向 MediaTek 标签的前 2 字节）里第一层 VLAN 的 TPID 类型（net/dsa/tag_mtk.c 的 MTK_HDR_XMIT_TAGGED_TPID_*），左移 8 位。 */
++#define EN75_STAG_TPID_8100	1
++
+ /* PSE port the frames of a bound flow leave through. */
+ #define PSE_PORT_GDM1		1
+ 
+@@ -149,21 +164,79 @@ struct en75_foe_ipv4 {
+ 	struct en75_foe_mac_info l2;
+ };
+ 
++/* IPv6 地址按 32 位分字、每字为主机序数值（[0] 是地址的高 32 位），端口字同 IPv4。 */
++struct en75_ipv6_tuple {
++	u32 src_ip[4];
++	u32 dest_ip[4];
++	union {
++		struct {
++			u16 dest_port;
++			u16 src_port;
++		};
++		u32 ports;
++	};
++};
++
++/* 类型 3..7 的布局（原厂 ipv6_3_5t_print 与 PpeFillInL2Info/PpeSetInfoBlk2，同 mtk v1 的 mtk_foe_entry ipv6）：5T 的原始元组占 w1..w9，w10..w12 保留（6RD 用），w13 UDF，w14 ib2，w15..w19 L2。 */
++struct en75_foe_ipv6 {
++	struct en75_ipv6_tuple orig;
++	u32 _rsv[3];
++	u32 udf_tsid;
++	u32 ib2;
++	struct en75_foe_mac_info l2;
++};
++
+ struct en75_foe_entry {
+ 	u32 ib1;
+ 	union {
+ 		struct en75_foe_ipv4 ipv4;
++		struct en75_foe_ipv6 ipv6;
+ 		u32 data[19];
+ 	};
+ };
+ static_assert(sizeof(struct en75_foe_entry) == 80);
++static_assert(offsetof(struct en75_foe_entry, ipv4.ib2) == 0x10);
++static_assert(offsetof(struct en75_foe_entry, ipv4.l2) == 0x2c);
++static_assert(offsetof(struct en75_foe_entry, ipv6.ib2) == 0x38);
++static_assert(offsetof(struct en75_foe_entry, ipv6.l2) == 0x3c);
+ 
+-/* The key a bind request is matched on: packet type and UDP bit of ib1, original tuple. */
++static bool en75_foe_type_ipv6(u32 type)
++{
++	return type >= FOE_TYPE_IPV4_DSLITE;
++}
++
++/* 按包类型取 ib2 所在的字与 L2 块（同 mtk_foe_entry_ib2/l2）。 */
++static u32 *en75_foe_ib2(struct en75_foe_entry *e, u32 type)
++{
++	return en75_foe_type_ipv6(type) ? &e->ipv6.ib2 : &e->ipv4.ib2;
++}
++
++static struct en75_foe_mac_info *en75_foe_l2(struct en75_foe_entry *e, u32 type)
++{
++	return en75_foe_type_ipv6(type) ? &e->ipv6.l2 : &e->ipv4.l2;
++}
++
++/* The key a bind request is matched on: packet type and UDP bit of ib1, original tuple. IPv4 时联合体其余字节为 0，哈希与比较覆盖整键。 */
+ struct en75_flow_key {
+ 	u32 ib1;
+-	struct en75_ipv4_tuple orig;
++	union {
++		struct en75_ipv4_tuple v4;
++		struct en75_ipv6_tuple v6;
++	};
++};
++
++/* 帧在 MediaTek 标签之后的封装（绑定请求的触发帧、规则描述的入向与出向）：802.1Q 层数与是否有 PPPoE 会话头。计数按 nvlan + 3 * pppoe 分 6 档。 */
++#define EN75_ENCAP_KINDS	6
++
++static const char * const en75_encap_name[EN75_ENCAP_KINDS] = {
++	"plain", "vlan", "qinq", "pppoe", "vlan_pppoe", "qinq_pppoe",
+ };
+ 
++static unsigned int en75_encap_kind(unsigned int nvlan, bool pppoe)
++{
++	return nvlan + (pppoe ? 3 : 0);
++}
++
+ #define FOE_KEY_IB1		(FOE_IB1_PACKET_TYPE | FOE_IB1_UDP)
+ #define PPE_FLOW_BUCKETS	1024
+ 
+@@ -174,6 +247,13 @@ struct en75_flow {
+ 	struct en75_flow_key key;
+ 	struct en75_foe_entry data;	/* the bound entry, without timestamp */
+ 	int index;			/* table index while bound, else -1 */
++	/* 只给绑定时核对与 debugfs ppe_flows 用：入向口与规则里的入向 VLAN（外层在前），出向口；绑定次数与最近一次触发帧的封装。 */
++	s8 in_port;
++	s8 out_port;
++	u8 in_nvlan;
++	u16 in_vid[2];
++	u8 req_kind;
++	unsigned long binds;
+ };
+ 
+ /* One per flow block (one flowtable) bound on the conduit. nf_flowtable unbinds a block before it tears its flows down, so the DESTROY commands for those flows never reach the driver: the flows of a block are released with it. */
+@@ -209,6 +289,11 @@ struct en75_ppe {
+ 
+ 	unsigned long binds;
+ 	unsigned long bind_misses;
++	/* 原因码 15 的帧按网络层（0 IPv4、1 IPv6）与封装计数；解析不了的封装（超过两层 VLAN、非 0x11 的 PPPoE、PPP 内不是 IP）、表项类型与帧的网络层对不上、入向 VLAN 层数与规则不符的另计。 */
++	unsigned long requests[2][EN75_ENCAP_KINDS];
++	unsigned long req_unparsed;
++	unsigned long req_type_mismatch;
++	unsigned long req_encap_mismatch;
+ 	unsigned long cache_timeouts;	/* cache commands that could not be issued or did not complete, one count each */
+ 	/* 按条清除的结果：查到该表项所在的缓存行并丢掉 / 缓存里没有该表项（不必动）；cache_clear_all 是整表清除的次数（block 释放与按条失败后的兜底）。 */
+ 	unsigned long cache_search_hit;
+@@ -318,20 +403,39 @@ static void ppe_cache_on(struct en75_ppe *ppe)
+ 		ppe_w32(ppe, PPE_CAH_EN, ppe_r32(ppe, PPE_CAH_EN) | BIT(0));
+ }
+ 
+-static void ppe_hw_key(const struct en75_foe_entry *hwe, u32 ib1,
++/* 从硬件学到（或已绑定）的表项取匹配键；不是本驱动写的类型（IPv4 HNAPT、IPv6 5T 之外）返回 false。 */
++static bool ppe_hw_key(const struct en75_foe_entry *hwe, u32 ib1,
+ 		       struct en75_flow_key *key)
+ {
++	int i;
++
++	memset(key, 0, sizeof(*key));
+ 	key->ib1 = ib1 & FOE_KEY_IB1;
+-	key->orig.src_ip = READ_ONCE(hwe->ipv4.orig.src_ip);
+-	key->orig.dest_ip = READ_ONCE(hwe->ipv4.orig.dest_ip);
+-	key->orig.ports = READ_ONCE(hwe->ipv4.orig.ports);
++	switch (FIELD_GET(FOE_IB1_PACKET_TYPE, ib1)) {
++	case FOE_TYPE_IPV4_HNAPT:
++		key->v4.src_ip = READ_ONCE(hwe->ipv4.orig.src_ip);
++		key->v4.dest_ip = READ_ONCE(hwe->ipv4.orig.dest_ip);
++		key->v4.ports = READ_ONCE(hwe->ipv4.orig.ports);
++		return true;
++	case FOE_TYPE_IPV6_ROUTE_5T:
++		for (i = 0; i < 4; i++) {
++			key->v6.src_ip[i] = READ_ONCE(hwe->ipv6.orig.src_ip[i]);
++			key->v6.dest_ip[i] = READ_ONCE(hwe->ipv6.orig.dest_ip[i]);
++		}
++		key->v6.ports = READ_ONCE(hwe->ipv6.orig.ports);
++		return true;
++	default:
++		return false;
++	}
+ }
+ 
+-/* Caller holds ppe->lock. The entry body goes in first and ib1 (state BIND) last, so the engine never sees a bound entry with a stale body. @tos is that of the packet that asked for the binding: the engine writes the TOS field of ib2 into every packet it forwards (on GS2107 a flow marked 0xb8 left the engine with 0x00 while the field was 0). */
++/* Caller holds ppe->lock. The entry body goes in first and ib1 (state BIND) last, so the engine never sees a bound entry with a stale body. @dsfield is that of the packet that asked for the binding (IPv4 TOS / IPv6 Traffic Class): the engine writes the TOS field of ib2 into every packet it forwards (on GS2107 a flow marked 0xb8 left the engine with 0x00 while the field was 0). */
+ static void ppe_bind(struct en75_ppe *ppe, struct en75_flow *flow, int index,
+-		     u8 tos)
++		     u8 dsfield)
+ {
+-	const int ib2_word = offsetof(struct en75_foe_entry, ipv4.ib2) / 4 - 1;
++	u32 type = FIELD_GET(FOE_IB1_PACKET_TYPE, flow->data.ib1);
++	const int ib2_word = ((u8 *)en75_foe_ib2(&flow->data, type) -
++			      (u8 *)flow->data.data) / 4;
+ 	struct en75_foe_entry *hwe = ppe_entry(ppe, index);
+ 	u32 ib1 = flow->data.ib1;
+ 	int i;
+@@ -342,13 +446,14 @@ static void ppe_bind(struct en75_ppe *ppe, struct en75_flow *flow, int index,
+ 		u32 val = flow->data.data[i];
+ 
+ 		if (i == ib2_word)
+-			val = (val & ~FOE_IB2_TOS) | FIELD_PREP(FOE_IB2_TOS, tos);
++			val = (val & ~FOE_IB2_TOS) | FIELD_PREP(FOE_IB2_TOS, dsfield);
+ 		WRITE_ONCE(hwe->data[i], val);
+ 	}
+ 	wmb();
+ 	WRITE_ONCE(hwe->ib1, ib1);
+ 	ppe_cache_on(ppe);
+ 	flow->index = index;
++	flow->binds++;
+ 	ppe->binds++;
+ }
+ 
+@@ -367,20 +472,36 @@ static bool ppe_flow_bound(struct en75_ppe *ppe, struct en75_flow *flow,
+ 	ib1 = READ_ONCE(hwe->ib1);
+ 	if (FIELD_GET(FOE_IB1_STATE, ib1) != FOE_STATE_BIND)
+ 		return false;
+-	ppe_hw_key(hwe, ib1, &key);
+-	if (memcmp(&key, &flow->key, sizeof(key)))
++	if (!ppe_hw_key(hwe, ib1, &key) || memcmp(&key, &flow->key, sizeof(key)))
+ 		return false;
+ 	if (ib1p)
+ 		*ib1p = ib1;
+ 	return true;
+ }
+ 
+-/* Caller holds ppe->lock. */
++/* Caller holds ppe->lock. Whether the entry at flow->index still carries this flow, bound or moved by the engine to the TCP FIN state (a bound TCP entry that saw FIN/RST: the engine sends its packets to the CPU with reason 16 until the entry ages out). */
++static bool ppe_flow_owns(struct en75_ppe *ppe, struct en75_flow *flow)
++{
++	struct en75_foe_entry *hwe;
++	struct en75_flow_key key;
++	u32 ib1, state;
++
++	if (flow->index < 0)
++		return false;
++	hwe = ppe_entry(ppe, flow->index);
++	ib1 = READ_ONCE(hwe->ib1);
++	state = FIELD_GET(FOE_IB1_STATE, ib1);
++	if (state != FOE_STATE_BIND && state != FOE_STATE_FIN)
++		return false;
++	return ppe_hw_key(hwe, ib1, &key) && !memcmp(&key, &flow->key, sizeof(key));
++}
++
++/* Caller holds ppe->lock. 绑定态与 FIN 态的表项都失效掉：留着 FIN 态表项时，同一五元组的新连接在它老化（TCP FIN 5 s）之前每包都以原因码 16 上 CPU、也不会再请求绑定（与 mtk __mtk_foe_entry_clear 不看状态直接失效同理）。 */
+ static void ppe_unbind(struct en75_ppe *ppe, struct en75_flow *flow)
+ {
+ 	struct en75_foe_entry *hwe;
+ 
+-	if (ppe_flow_bound(ppe, flow, NULL)) {
++	if (ppe_flow_owns(ppe, flow)) {
+ 		hwe = ppe_entry(ppe, flow->index);
+ 		ppe_cache_off(ppe, flow->index);
+ 		WRITE_ONCE(hwe->ib1, FIELD_PREP(FOE_IB1_STATE, FOE_STATE_INVALID));
+@@ -389,45 +510,145 @@ static void ppe_unbind(struct en75_ppe *ppe, struct en75_flow *flow)
+ 	flow->index = -1;
+ }
+ 
++/* 触发帧在标签之后的封装：最多两层 802.1Q/802.1ad，其后至多一层 PPPoE 会话（ver/type 0x11、code 0，PPP 协议 0x0021/0x0057，同原厂 GetPppoeSid）。原厂软件把特殊标签也算一层、总共只解析两层，标签后两层 VLAN 的帧硬件照样学出表项、上报原因码 15（2026-11-22 GS2107 实测），这里按两层解析。RX 帧是单描述符、全线性的。 */
++struct en75_rx_encap {
++	unsigned int nvlan;
++	u16 vid[2];
++	bool pppoe;
++	unsigned int l3_off;
++	u16 l3_proto;
++};
++
++static bool en75_rx_parse_encap(const struct sk_buff *skb, unsigned int off,
++				struct en75_rx_encap *enc)
++{
++	unsigned int len = skb_headlen(skb);
++	u16 proto;
++
++	enc->nvlan = 0;
++	enc->pppoe = false;
++	if (len < off + 2)
++		return false;
++	proto = get_unaligned_be16(skb->data + off);
++	while (proto == ETH_P_8021Q || proto == ETH_P_8021AD) {
++		if (enc->nvlan == 2 || len < off + VLAN_HLEN + 2)
++			return false;
++		enc->vid[enc->nvlan++] = get_unaligned_be16(skb->data + off + 2) & VLAN_VID_MASK;
++		off += VLAN_HLEN;
++		proto = get_unaligned_be16(skb->data + off);
++	}
++	if (proto == ETH_P_PPP_SES) {
++		const u8 *ph = skb->data + off + 2;
++
++		if (len < off + 2 + PPPOE_SES_HLEN || ph[0] != 0x11 || ph[1] != 0)
++			return false;
++		switch (get_unaligned_be16(ph + 6)) {
++		case PPP_IP:
++			proto = ETH_P_IP;
++			break;
++		case PPP_IPV6:
++			proto = ETH_P_IPV6;
++			break;
++		default:
++			return false;
++		}
++		enc->pppoe = true;
++		off += PPPOE_SES_HLEN;
++	}
++	enc->l3_off = off + 2;
++	enc->l3_proto = proto;
++	return true;
++}
++
++static bool en75_flow_ingress_matches(const struct en75_flow *flow,
++				      const struct en75_rx_encap *enc)
++{
++	unsigned int i;
++
++	if (flow->in_nvlan != enc->nvlan)
++		return false;
++	for (i = 0; i < enc->nvlan; i++)
++		if (flow->in_vid[i] != enc->vid[i])
++			return false;
++	return true;
++}
++
+ void en75_ppe_check_skb(struct en75_ppe *ppe, struct sk_buff *skb,
+ 			 unsigned int proto_off, u8 crsn, u16 index)
+ {
+ 	struct en75_foe_entry *hwe;
++	struct en75_rx_encap enc;
+ 	struct en75_flow_key key;
+ 	struct en75_flow *flow;
+-	u32 ib1;
+-	u8 tos;
++	bool mismatch = false;
++	unsigned int kind;
++	u32 ib1, type;
++	u8 dsfield;
++	int fam;
+ 
+ 	if (crsn != PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED || index >= PPE_ENTRIES)
+ 		return;
+-	/* Bound entries are written for plain IPv4 behind the tag: a flow that arrives with PPPoE (which nf_flowtable does not describe to the driver) or 802.1Q (refused by the offload already) stays in software. */
+-	if (skb_headlen(skb) < proto_off + 2 + sizeof(struct iphdr) ||
+-	    get_unaligned_be16(skb->data + proto_off) != ETH_P_IP)
+-		return;
+-	/* The TOS of this packet is written into every packet of the bound flow, ECN field included; a CE mark would then stick to the whole flow, so such a packet does not bind (the next one asks again). What the packet carries becomes the flow's: per-packet DSCP within one flow collapses to one value, a Not-ECT trigger (a retransmission, a window probe) turns the flow Not-ECT, an ECT trigger puts ECT on its later retransmissions too, and CE marks added upstream of the engine are lost. The vendor driver writes the TOS the same way; no switch that keeps the packet's own TOS is known. */
+-	tos = ((struct iphdr *)(skb->data + proto_off + 2))->tos;
+-	if ((tos & INET_ECN_MASK) == INET_ECN_CE)
++	if (!en75_rx_parse_encap(skb, proto_off, &enc))
++		goto unparsed;
++	/* The TOS (IPv6: Traffic Class) of this packet is written into every packet of the bound flow, ECN field included; a CE mark would then stick to the whole flow, so such a packet does not bind (the next one asks again). What the packet carries becomes the flow's: per-packet DSCP within one flow collapses to one value, a Not-ECT trigger (a retransmission, a window probe) turns the flow Not-ECT, an ECT trigger puts ECT on its later retransmissions too, and CE marks added upstream of the engine are lost. The vendor driver writes the TOS the same way; no switch that keeps the packet's own TOS is known. */
++	switch (enc.l3_proto) {
++	case ETH_P_IP:
++		if (skb_headlen(skb) < enc.l3_off + sizeof(struct iphdr))
++			goto unparsed;
++		dsfield = ((struct iphdr *)(skb->data + enc.l3_off))->tos;
++		type = FOE_TYPE_IPV4_HNAPT;
++		fam = 0;
++		break;
++	case ETH_P_IPV6:
++		if (skb_headlen(skb) < enc.l3_off + sizeof(struct ipv6hdr))
++			goto unparsed;
++		dsfield = ipv6_get_dsfield((struct ipv6hdr *)(skb->data + enc.l3_off));
++		type = FOE_TYPE_IPV6_ROUTE_5T;
++		fam = 1;
++		break;
++	default:
++		goto unparsed;
++	}
++	kind = en75_encap_kind(enc.nvlan, enc.pppoe);
++	ppe->requests[fam][kind]++;
++	if ((dsfield & INET_ECN_MASK) == INET_ECN_CE)
+ 		return;
+ 
+ 	hwe = ppe_entry(ppe, index);
+ 	spin_lock(&ppe->lock);
+ 	ib1 = READ_ONCE(hwe->ib1);
+-	if (FIELD_GET(FOE_IB1_STATE, ib1) != FOE_STATE_UNBIND ||
+-	    FIELD_GET(FOE_IB1_PACKET_TYPE, ib1) != FOE_TYPE_IPV4_HNAPT)
++	if (FIELD_GET(FOE_IB1_STATE, ib1) != FOE_STATE_UNBIND)
+ 		goto out;
++	/* 表项类型须与帧的网络层一致：IPv4 帧只绑 HNAPT 表项，IPv6 帧只绑 5T 表项 */
++	if (FIELD_GET(FOE_IB1_PACKET_TYPE, ib1) != type ||
++	    !ppe_hw_key(hwe, ib1, &key)) {
++		ppe->req_type_mismatch++;
++		goto out;
++	}
+ 
+-	ppe_hw_key(hwe, ib1, &key);
+ 	hlist_for_each_entry(flow, ppe_bucket(ppe, &key), list) {
+ 		if (memcmp(&key, &flow->key, sizeof(key)))
+ 			continue;
++		/* 表项不含入向封装，硬件只按 IP 元组匹配；规则写明了入向 VLAN（层数与 VID），触发帧对不上的不绑，同一元组的下一条流照样核对（入向 PPPoE 规则里看不到，不核对） */
++		if (!en75_flow_ingress_matches(flow, &enc)) {
++			mismatch = true;
++			continue;
++		}
+ 		if (flow->index >= 0 && flow->index != index)
+ 			ppe_unbind(ppe, flow);
+-		ppe_bind(ppe, flow, index, tos);
++		flow->req_kind = kind;
++		ppe_bind(ppe, flow, index, dsfield);
+ 		goto out;
+ 	}
+-	ppe->bind_misses++;
++	if (mismatch)
++		ppe->req_encap_mismatch++;
++	else
++		ppe->bind_misses++;
+ out:
+ 	spin_unlock(&ppe->lock);
++	return;
++unparsed:
++	ppe->req_unparsed++;
+ }
+ 
+ struct en75_flow_data {
+@@ -436,6 +657,11 @@ struct en75_flow_data {
+ 	__be32 dst_addr;
+ 	__be16 src_port;
+ 	__be16 dst_port;
++	/* 出向封装（外层在前）：VLAN_PUSH 最多两个，PPPOE_PUSH 最多一个 */
++	u16 vlan_tci[2];
++	unsigned int nvlan;
++	u16 pppoe_sid;
++	bool pppoe;
+ };
+ 
+ static void en75_flow_mangle_eth(const struct flow_action_entry *act, void *eth)
+@@ -519,6 +745,41 @@ static void en75_foe_set_tuple(struct en75_ipv4_tuple *t, __be32 src,
+ 	t->dest_port = be16_to_cpu(dport);
+ }
+ 
++static void en75_foe_set_tuple6(struct en75_ipv6_tuple *t,
++				const struct in6_addr *src, __be16 sport,
++				const struct in6_addr *dst, __be16 dport)
++{
++	int i;
++
++	for (i = 0; i < 4; i++) {
++		t->src_ip[i] = be32_to_cpu(src->s6_addr32[i]);
++		t->dest_ip[i] = be32_to_cpu(dst->s6_addr32[i]);
++	}
++	t->src_port = be16_to_cpu(sport);
++	t->dest_port = be16_to_cpu(dport);
++}
++
++/* 规则里的入向 VLAN 键（nf_flowtable 只对 802.1Q 出键，外层在 VLAN、内层在 CVLAN）。 */
++static int en75_flow_ingress_vlans(struct flow_rule *rule, struct en75_flow *flow)
++{
++	struct flow_match_vlan vlan;
++
++	flow->in_nvlan = 0;
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN)) {
++		flow_rule_match_vlan(rule, &vlan);
++		if (vlan.key->vlan_tpid != htons(ETH_P_8021Q))
++			return -EOPNOTSUPP;
++		flow->in_vid[flow->in_nvlan++] = vlan.key->vlan_id;
++	}
++	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN)) {
++		flow_rule_match_cvlan(rule, &vlan);
++		if (vlan.key->vlan_tpid != htons(ETH_P_8021Q))
++			return -EOPNOTSUPP;
++		flow->in_vid[flow->in_nvlan++] = vlan.key->vlan_id;
++	}
++	return 0;
++}
++
+ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 				     struct net_device *conduit,
+ 				     struct flow_cls_offload *f)
+@@ -528,7 +789,6 @@ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 	struct en75_flow_data data = {};
+ 	struct net_device *idev, *odev = NULL;
+ 	struct flow_action_entry *act;
+-	struct flow_match_ipv4_addrs addrs;
+ 	struct flow_match_control control;
+ 	struct flow_match_ports ports;
+ 	struct flow_match_basic basic;
+@@ -536,7 +796,8 @@ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 	struct en75_foe_mac_info *l2;
+ 	struct en75_foe_entry *foe;
+ 	struct en75_flow *flow;
+-	int i, port, err;
++	int i, in_port, port, err;
++	u32 type, *ib2;
+ 	u8 l4proto;
+ 
+ 	if (rhashtable_lookup_fast(&blk->flows, &f->cookie, en75_flow_ht_params))
+@@ -547,15 +808,20 @@ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_BASIC) ||
+ 	    !flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_PORTS))
+ 		return -EOPNOTSUPP;
+-	/* ingress 802.1Q: the entries here are written for frames with only the MediaTek tag */
+-	if (flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_VLAN) ||
+-	    flow_rule_match_key(rule, FLOW_DISSECTOR_KEY_CVLAN))
+-		return -EOPNOTSUPP;
+ 
+ 	flow_rule_match_control(rule, &control);
+-	if (control.key->addr_type != FLOW_DISSECTOR_KEY_IPV4_ADDRS ||
+-	    flow_rule_has_control_flags(control.mask->flags, f->common.extack))
++	if (flow_rule_has_control_flags(control.mask->flags, f->common.extack))
++		return -EOPNOTSUPP;
++	switch (control.key->addr_type) {
++	case FLOW_DISSECTOR_KEY_IPV4_ADDRS:
++		type = FOE_TYPE_IPV4_HNAPT;
++		break;
++	case FLOW_DISSECTOR_KEY_IPV6_ADDRS:
++		type = FOE_TYPE_IPV6_ROUTE_5T;
++		break;
++	default:
+ 		return -EOPNOTSUPP;
++	}
+ 
+ 	flow_rule_match_basic(rule, &basic);
+ 	l4proto = basic.key->ip_proto;
+@@ -566,9 +832,9 @@ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 	flow_rule_match_meta(rule, &meta);
+ 	rcu_read_lock();
+ 	idev = dev_get_by_index_rcu(dev_net(conduit), meta.key->ingress_ifindex);
+-	port = en75_flow_port(conduit, idev);
++	in_port = en75_flow_port(conduit, idev);
+ 	rcu_read_unlock();
+-	if (port < -1)
++	if (in_port < -1)
+ 		return -EOPNOTSUPP;
+ 
+ 	flow_action_for_each(i, act, &rule->action) {
+@@ -582,9 +848,24 @@ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 			break;
+ 		case FLOW_ACTION_PRIORITY:
+ 		case FLOW_ACTION_CSUM:
++		/* 入向封装不进表项：硬件剥掉入向 VLAN，按出向字段重建二层 */
++		case FLOW_ACTION_VLAN_POP:
++			break;
++		case FLOW_ACTION_VLAN_PUSH:
++			/* 802.1ad 出向 nf_flowtable 不下发（没有对应动作）；PCP 由 nf_flowtable 恒给 0 */
++			if (data.nvlan == 2 || data.pppoe ||
++			    act->vlan.proto != htons(ETH_P_8021Q))
++				return -EOPNOTSUPP;
++			data.vlan_tci[data.nvlan++] = act->vlan.vid |
++				(act->vlan.prio << VLAN_PRIO_SHIFT);
++			break;
++		case FLOW_ACTION_PPPOE_PUSH:
++			if (data.pppoe)
++				return -EOPNOTSUPP;
++			data.pppoe_sid = act->pppoe.sid;
++			data.pppoe = true;
+ 			break;
+ 		default:
+-			/* VLAN and PPPoE encapsulation: not supported yet */
+ 			return -EOPNOTSUPP;
+ 		}
+ 	}
+@@ -592,26 +873,43 @@ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 	port = en75_flow_port(conduit, odev);
+ 	if (port < -1)
+ 		return -EOPNOTSUPP;
++	/* 出向就是 conduit 本身时表项只写 L2 的 etype，带不了封装（GS2107 的口全在交换机后面） */
++	if (port < 0 && (data.nvlan || data.pppoe))
++		return -EOPNOTSUPP;
+ 
+ 	if (!is_valid_ether_addr(data.eth.h_source) ||
+ 	    !is_valid_ether_addr(data.eth.h_dest))
+ 		return -EINVAL;
+ 
+ 	flow_rule_match_ports(rule, &ports);
+-	flow_rule_match_ipv4_addrs(rule, &addrs);
+ 
+ 	flow = kzalloc(sizeof(*flow), GFP_KERNEL);
+ 	if (!flow)
+ 		return -ENOMEM;
+ 	flow->cookie = f->cookie;
+ 	flow->index = -1;
++	flow->in_port = in_port;
++	flow->out_port = port;
++	err = en75_flow_ingress_vlans(rule, flow);
++	if (err)
++		goto free;
+ 	foe = &flow->data;
+ 
+-	en75_foe_set_tuple(&foe->ipv4.orig, addrs.key->src, ports.key->src,
+-			   addrs.key->dst, ports.key->dst);
++	if (type == FOE_TYPE_IPV4_HNAPT) {
++		struct flow_match_ipv4_addrs addrs;
++
++		flow_rule_match_ipv4_addrs(rule, &addrs);
++		en75_foe_set_tuple(&foe->ipv4.orig, addrs.key->src, ports.key->src,
++				   addrs.key->dst, ports.key->dst);
++		data.src_addr = addrs.key->src;
++		data.dst_addr = addrs.key->dst;
++	} else {
++		struct flow_match_ipv6_addrs addrs;
+ 
+-	data.src_addr = addrs.key->src;
+-	data.dst_addr = addrs.key->dst;
++		flow_rule_match_ipv6_addrs(rule, &addrs);
++		en75_foe_set_tuple6(&foe->ipv6.orig, &addrs.key->src, ports.key->src,
++				    &addrs.key->dst, ports.key->dst);
++	}
+ 	data.src_port = ports.key->src;
+ 	data.dst_port = ports.key->dst;
+ 	flow_action_for_each(i, act, &rule->action) {
+@@ -620,10 +918,13 @@ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 		switch (act->mangle.htype) {
+ 		case FLOW_ACT_MANGLE_HDR_TYPE_TCP:
+ 		case FLOW_ACT_MANGLE_HDR_TYPE_UDP:
+-			err = en75_flow_mangle_ports(act, &data);
++			/* IPv6 表项没有新元组：NAT66/NPTv6 留在软件 */
++			err = type == FOE_TYPE_IPV4_HNAPT ?
++			      en75_flow_mangle_ports(act, &data) : -EOPNOTSUPP;
+ 			break;
+ 		case FLOW_ACT_MANGLE_HDR_TYPE_IP4:
+-			err = en75_flow_mangle_ipv4(act, &data);
++			err = type == FOE_TYPE_IPV4_HNAPT ?
++			      en75_flow_mangle_ipv4(act, &data) : -EOPNOTSUPP;
+ 			break;
+ 		case FLOW_ACT_MANGLE_HDR_TYPE_ETH:
+ 			err = 0;
+@@ -634,33 +935,50 @@ static int en75_flow_offload_replace(struct en75_ppe_block *blk,
+ 		if (err)
+ 			goto free;
+ 	}
+-	en75_foe_set_tuple(&foe->ipv4.new, data.src_addr, data.src_port,
+-			   data.dst_addr, data.dst_port);
++	if (type == FOE_TYPE_IPV4_HNAPT)
++		en75_foe_set_tuple(&foe->ipv4.new, data.src_addr, data.src_port,
++				   data.dst_addr, data.dst_port);
+ 
+ 	foe->ib1 = FIELD_PREP(FOE_IB1_STATE, FOE_STATE_BIND) |
+-		   FIELD_PREP(FOE_IB1_PACKET_TYPE, FOE_TYPE_IPV4_HNAPT) |
++		   FIELD_PREP(FOE_IB1_PACKET_TYPE, type) |
+ 		   FIELD_PREP(FOE_IB1_UDP, l4proto == IPPROTO_UDP) |
+ 		   FOE_IB1_BIND_CACHE | FOE_IB1_BIND_TTL;
+-	foe->ipv4.ib2 = FIELD_PREP(FOE_IB2_DEST_PORT, PSE_PORT_GDM1) |
+-			FIELD_PREP(FOE_IB2_METER, 0x3f) |
+-			FIELD_PREP(FOE_IB2_ACCOUNT, 0x3f);
++	ib2 = en75_foe_ib2(foe, type);
++	*ib2 = FIELD_PREP(FOE_IB2_DEST_PORT, PSE_PORT_GDM1) |
++	       FIELD_PREP(FOE_IB2_METER, 0x3f) |
++	       FIELD_PREP(FOE_IB2_ACCOUNT, 0x3f);
+ 	if (is_multicast_ether_addr(data.eth.h_dest))
+-		foe->ipv4.ib2 |= FOE_IB2_MULTICAST;
++		*ib2 |= FOE_IB2_MULTICAST;
+ 
+-	l2 = &foe->ipv4.l2;
++	l2 = en75_foe_l2(foe, type);
+ 	l2->dest_mac_hi = get_unaligned_be32(data.eth.h_dest);
+ 	l2->dest_mac_lo = get_unaligned_be16(data.eth.h_dest + 4);
+ 	l2->src_mac_hi = get_unaligned_be32(data.eth.h_source);
+ 	l2->src_mac_lo = get_unaligned_be16(data.eth.h_source + 4);
+-	l2->etype = ETH_P_IP;
++	l2->etype = type == FOE_TYPE_IPV4_HNAPT ? ETH_P_IP : ETH_P_IPV6;
+ 	if (port >= 0) {
+-		/* The engine writes etype/vlan1 as the 4-byte MediaTek tag: no 802.1Q tag inside, destination port bitmap (net/dsa/tag_mtk.c). */
++		/* The engine writes etype/vlan1 as the 4-byte MediaTek tag with the destination port bitmap (net/dsa/tag_mtk.c). A first 802.1Q tag is merged into it as tag_mtk does on transmit (TPID type in the high byte, TCI in vlan1) and keeps the layer count at 1; a second one goes to vlan2 and makes it 2. VPM stays 0. */
+ 		l2->etype = BIT(port);
+-		foe->ib1 |= FIELD_PREP(FOE_IB1_BIND_VLAN_LAYER, 1);
++		if (data.nvlan) {
++			l2->etype |= EN75_STAG_TPID_8100 << 8;
++			l2->vlan1 = data.vlan_tci[0];
++		}
++		if (data.nvlan == 2)
++			l2->vlan2 = data.vlan_tci[1];
++		foe->ib1 |= FIELD_PREP(FOE_IB1_BIND_VLAN_LAYER,
++				       data.nvlan == 2 ? 2 : 1);
++	}
++	if (data.pppoe) {
++		/* PPPoE 头与 PPP 协议号由硬件生成；etype 仍是标签（原厂 PpeFillInL2Info、mtk_foe_entry_set_pppoe） */
++		foe->ib1 |= FOE_IB1_BIND_PPPOE;
++		l2->pppoe_id = data.pppoe_sid;
+ 	}
+ 
+ 	flow->key.ib1 = foe->ib1 & FOE_KEY_IB1;
+-	flow->key.orig = foe->ipv4.orig;
++	if (type == FOE_TYPE_IPV4_HNAPT)
++		flow->key.v4 = foe->ipv4.orig;
++	else
++		flow->key.v6 = foe->ipv6.orig;
+ 
+ 	err = rhashtable_insert_fast(&blk->flows, &flow->node, en75_flow_ht_params);
+ 	if (err)
+@@ -714,7 +1032,8 @@ static int en75_flow_offload_stats(struct en75_ppe_block *blk,
+ 
+ 	spin_lock_bh(&ppe->lock);
+ 	bound = ppe_flow_bound(ppe, flow, &ib1);
+-	if (!bound)
++	/* 表项号留到拆流时用：FIN 态的表项仍属这条流，要在 ppe_unbind() 里失效 */
++	if (!bound && !ppe_flow_owns(ppe, flow))
+ 		flow->index = -1;
+ 	spin_unlock_bh(&ppe->lock);
+ 
+@@ -898,8 +1217,8 @@ struct en75_ppe *en75_ppe_init(struct device *dev, void __iomem *fe)
+ 	ppe_w32(ppe, PPE_HASH_CFG, 0x77d);
+ 	ppe_w32(ppe, PPE_CAH_EN, 0x33);
+ 
+-	/* IPv4 NAT/NAPT and fragments, the protocol blacklist and bits the vendor sets without a name; NAT fragments once enabled. The vendor also has the engine learn IPv6 routes, 6RD, DS-Lite and L2 bridging (0x06a1f7c0), which the driver does not bind: those would only take entries and learning rate. */
+-	ppe_w32(ppe, PPE_FLOW_CFG, 0x06a130c0);
++	/* IPv4 NAT/NAPT and fragments, IPv6 5-tuple routes, the protocol blacklist and bits the vendor sets without a name; NAT fragments once enabled. The vendor also has the engine learn IPv6 3-tuple routes, 6RD, DS-Lite and L2 bridging (0x06a1f7c0), which nf_flowtable never hands to the driver: those would only take entries and learning rate. */
++	ppe_w32(ppe, PPE_FLOW_CFG, 0x06a130c0 | PPE_FLOW_CFG_IP6_5T_ROUTE);
+ 
+ 	ppe_w32(ppe, PPE_TB_BASE, ppe->foe_phys);
+ 	/* Keepalive stays off (mainline does the same): the vendor copies keepalive frames of bound flows to the CPU and drops them in hw_nat, while the stack here would forward them a second time. */
+@@ -955,7 +1274,7 @@ void en75_ppe_deinit(struct en75_ppe *ppe)
+ int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe)
+ {
+ 	static const char * const state_name[] = { "invalid", "unbind", "bind", "fin" };
+-	unsigned int count[4] = {}, type[8] = {}, shown = 0;
++	unsigned int count[4] = {}, type[8] = {}, bound[8][4][2] = {}, shown = 0;
+ 	unsigned int i;
+ 
+ 	seq_printf(m, "glo_cfg=%08x flow_cfg=%08x tb_cfg=%08x tb_base=%08x tb_used=%08x\n",
+@@ -986,6 +1305,19 @@ int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe)
+ 			   READ_ONCE(ppe->cache_search_miss),
+ 			   READ_ONCE(ppe->cache_clear_all));
+ 	}
++	/* 原因码 15 的帧按网络层与封装计数，以及解析不了、类型或入向 VLAN 对不上而没有绑定的 */
++	for (i = 0; i < 2; i++) {
++		unsigned int k;
++
++		seq_printf(m, "requests_%s:", i ? "ipv6" : "ipv4");
++		for (k = 0; k < EN75_ENCAP_KINDS; k++)
++			seq_printf(m, " %s=%lu", en75_encap_name[k],
++				   READ_ONCE(ppe->requests[i][k]));
++		seq_putc(m, '\n');
++	}
++	seq_printf(m, "req_unparsed=%lu req_type_mismatch=%lu req_encap_mismatch=%lu\n",
++		   READ_ONCE(ppe->req_unparsed), READ_ONCE(ppe->req_type_mismatch),
++		   READ_ONCE(ppe->req_encap_mismatch));
+ 
+ 	for (i = 0; i < PPE_ENTRIES; i++) {
+ 		u32 ib1 = READ_ONCE(ppe_entry(ppe, i)->ib1);
+@@ -993,6 +1325,11 @@ int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe)
+ 		count[FIELD_GET(FOE_IB1_STATE, ib1)]++;
+ 		if (FIELD_GET(FOE_IB1_STATE, ib1))
+ 			type[FIELD_GET(FOE_IB1_PACKET_TYPE, ib1)]++;
++		/* 已绑定表项按类型、出向 VLAN 层数与 PPPoE 位分档 */
++		if (FIELD_GET(FOE_IB1_STATE, ib1) == FOE_STATE_BIND)
++			bound[FIELD_GET(FOE_IB1_PACKET_TYPE, ib1)]
++			     [min_t(u32, FIELD_GET(FOE_IB1_BIND_VLAN_LAYER, ib1), 3)]
++			     [!!(ib1 & FOE_IB1_BIND_PPPOE)]++;
+ 	}
+ 	for (i = 0; i < ARRAY_SIZE(count); i++)
+ 		seq_printf(m, "%s=%u ", state_name[i], count[i]);
+@@ -1000,6 +1337,13 @@ int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe)
+ 	for (i = 0; i < ARRAY_SIZE(type); i++)
+ 		if (type[i])
+ 			seq_printf(m, " %u=%u", i, type[i]);
++	seq_puts(m, "\nbound:");
++	for (i = 0; i < 8; i++)
++		for (int l = 0; l < 4; l++)
++			for (int pp = 0; pp < 2; pp++)
++				if (bound[i][l][pp])
++					seq_printf(m, " type%u/layer%d%s/pppoe%d=%u",
++						   i, l, l == 3 ? "+" : "", pp, bound[i][l][pp]);
+ 	seq_putc(m, '\n');
+ 
+ 	/* Raw words of the first bound entries, then of the first other valid ones: ib1, original tuple, ib2, new tuple, then the L2 block. */
+@@ -1020,3 +1364,140 @@ int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe)
+ 	}
+ 	return 0;
+ }
++
++/* 表项的元组：IPv4 打 "a.b.c.d:port"，IPv6 打 "[addr]:port"（每字主机序数值还原成网络序）。 */
++static void en75_seq_tuple4(struct seq_file *m, const char *name, u32 ip, u16 port)
++{
++	__be32 a = cpu_to_be32(ip);
++
++	seq_printf(m, " %s=%pI4:%u", name, &a, port);
++}
++
++static void en75_seq_tuple6(struct seq_file *m, const char *name, const u32 *ip, u16 port)
++{
++	struct in6_addr a;
++	int i;
++
++	for (i = 0; i < 4; i++)
++		a.s6_addr32[i] = cpu_to_be32(ip[i]);
++	seq_printf(m, " %s=[%pI6c]:%u", name, &a, port);
++}
++
++static void en75_seq_entry(struct seq_file *m, struct en75_foe_entry *e, u32 ib1)
++{
++	u32 type = FIELD_GET(FOE_IB1_PACKET_TYPE, ib1);
++	struct en75_foe_mac_info *l2 = en75_foe_l2(e, type);
++	u32 ib2 = READ_ONCE(*en75_foe_ib2(e, type));
++	u8 dmac[ETH_ALEN], smac[ETH_ALEN];
++
++	seq_printf(m, " type=%u udp=%d layer=%lu pppoe=%d vpm=%lu ttl=%d cache=%d",
++		   type, !!(ib1 & FOE_IB1_UDP),
++		   FIELD_GET(FOE_IB1_BIND_VLAN_LAYER, ib1),
++		   !!(ib1 & FOE_IB1_BIND_PPPOE), FIELD_GET(FOE_IB1_BIND_VPM, ib1),
++		   !!(ib1 & FOE_IB1_BIND_TTL), !!(ib1 & FOE_IB1_BIND_CACHE));
++	switch (type) {
++	case FOE_TYPE_IPV4_HNAPT:
++		en75_seq_tuple4(m, "src", READ_ONCE(e->ipv4.orig.src_ip),
++				READ_ONCE(e->ipv4.orig.src_port));
++		en75_seq_tuple4(m, "dst", READ_ONCE(e->ipv4.orig.dest_ip),
++				READ_ONCE(e->ipv4.orig.dest_port));
++		en75_seq_tuple4(m, "new_src", READ_ONCE(e->ipv4.new.src_ip),
++				READ_ONCE(e->ipv4.new.src_port));
++		en75_seq_tuple4(m, "new_dst", READ_ONCE(e->ipv4.new.dest_ip),
++				READ_ONCE(e->ipv4.new.dest_port));
++		break;
++	case FOE_TYPE_IPV6_ROUTE_5T:
++		en75_seq_tuple6(m, "src", e->ipv6.orig.src_ip,
++				READ_ONCE(e->ipv6.orig.src_port));
++		en75_seq_tuple6(m, "dst", e->ipv6.orig.dest_ip,
++				READ_ONCE(e->ipv6.orig.dest_port));
++		break;
++	default:
++		break;
++	}
++	put_unaligned_be32(READ_ONCE(l2->dest_mac_hi), dmac);
++	put_unaligned_be16(READ_ONCE(l2->dest_mac_lo), dmac + 4);
++	put_unaligned_be32(READ_ONCE(l2->src_mac_hi), smac);
++	put_unaligned_be16(READ_ONCE(l2->src_mac_lo), smac + 4);
++	seq_printf(m, " ib2=%08x dport=%lu ds=0x%02lx etype=0x%04x vlan1=0x%04x vlan2=0x%04x sid=%u dmac=%pM smac=%pM",
++		   ib2, FIELD_GET(FOE_IB2_DEST_PORT, ib2), FIELD_GET(FOE_IB2_TOS, ib2),
++		   READ_ONCE(l2->etype), READ_ONCE(l2->vlan1), READ_ONCE(l2->vlan2),
++		   READ_ONCE(l2->pppoe_id), dmac, smac);
++}
++
++/* debugfs ppe_entries：表中所有有效表项逐条解码（状态、类型、ib1 各位、元组、ib2、L2 块），加原始 20 个字。按表项号逐条迭代，seq_file 每次只缓冲一页，表满（16K 条）也不必一次格式化全部输出。 */
++static void *en75_ppe_entries_start(struct seq_file *m, loff_t *pos)
++{
++	return *pos < PPE_ENTRIES ? pos : NULL;
++}
++
++static void *en75_ppe_entries_next(struct seq_file *m, void *v, loff_t *pos)
++{
++	++*pos;
++	return *pos < PPE_ENTRIES ? pos : NULL;
++}
++
++static void en75_ppe_entries_stop(struct seq_file *m, void *v)
++{
++}
++
++static int en75_ppe_entries_show(struct seq_file *m, void *v)
++{
++	static const char * const state_name[] = { "invalid", "unbind", "bind", "fin" };
++	unsigned int i = *(loff_t *)v;
++	struct en75_foe_entry *e = ppe_entry(m->private, i);
++	u32 ib1 = READ_ONCE(e->ib1);
++	int w;
++
++	if (!FIELD_GET(FOE_IB1_STATE, ib1))
++		return 0;
++	seq_printf(m, "idx=%u state=%s", i, state_name[FIELD_GET(FOE_IB1_STATE, ib1)]);
++	en75_seq_entry(m, e, ib1);
++	seq_printf(m, " raw=%08x", ib1);
++	for (w = 0; w < ARRAY_SIZE(e->data); w++)
++		seq_printf(m, ",%08x", READ_ONCE(e->data[w]));
++	seq_putc(m, '\n');
++	return 0;
++}
++
++const struct seq_operations en75_ppe_entries_seq_ops = {
++	.start = en75_ppe_entries_start,
++	.next = en75_ppe_entries_next,
++	.stop = en75_ppe_entries_stop,
++	.show = en75_ppe_entries_show,
++};
++
++/* debugfs ppe_flows：驱动接受的每条流一行——cookie、入向口与规则里的入向 VLAN、出向口，期望的表项（类型、出向封装、元组），是否已绑定、表项号、空闲秒数、绑定次数与最近一次触发帧的封装。锁按桶取放，读这个文件不会长时间挡住 NAPI 里的绑定请求。 */
++int en75_ppe_flows_show(struct seq_file *m, struct en75_ppe *ppe)
++{
++	unsigned int b;
++
++	for (b = 0; b < PPE_FLOW_BUCKETS; b++) {
++		struct en75_flow *flow;
++
++		spin_lock_bh(&ppe->lock);
++		hlist_for_each_entry(flow, &ppe->buckets[b], list) {
++			u32 ib1 = 0;
++			bool bound = ppe_flow_bound(ppe, flow, &ib1);
++
++			seq_printf(m, "cookie=%lx in_port=%d in_vlan=%u", flow->cookie,
++				   flow->in_port, flow->in_nvlan);
++			if (flow->in_nvlan)
++				seq_printf(m, ":%u", flow->in_vid[0]);
++			if (flow->in_nvlan > 1)
++				seq_printf(m, ",%u", flow->in_vid[1]);
++			seq_printf(m, " out_port=%d bound=%d index=%d binds=%lu last_req=%s",
++				   flow->out_port, bound, bound ? flow->index : -1,
++				   flow->binds,
++				   flow->binds ? en75_encap_name[flow->req_kind] : "-");
++			if (bound)
++				seq_printf(m, " idle=%lu",
++					   (ppe_timestamp(ppe) - FIELD_GET(FOE_IB1_BIND_TS, ib1)) &
++					   FOE_IB1_BIND_TS);
++			en75_seq_entry(m, &flow->data, flow->data.ib1);
++			seq_putc(m, '\n');
++		}
++		spin_unlock_bh(&ppe->lock);
++	}
++	return 0;
++}
+diff --git a/econet_ppe.h b/econet_ppe.h
+index 09d39d0..594a13d 100644
+--- a/econet_ppe.h
++++ b/econet_ppe.h
+@@ -8,6 +8,7 @@
+ 
+ struct device;
+ struct seq_file;
++struct seq_operations;
+ struct en75_ppe;
+ 
+ /* PPE register block, relative to the frame engine base (the MT7621-generation layout: block at FE+0xc00, registers from +0x200). */
+@@ -22,5 +23,8 @@ void en75_ppe_check_skb(struct en75_ppe *ppe, struct sk_buff *skb,
+ int en75_ppe_setup_tc(struct en75_ppe *ppe, struct net_device *dev,
+ 		      enum tc_setup_type type, void *type_data);
+ int en75_ppe_debugfs_show(struct seq_file *m, struct en75_ppe *ppe);
++/* debugfs ppe_entries 的迭代器，seq_file 的 private 是 struct en75_ppe */
++extern const struct seq_operations en75_ppe_entries_seq_ops;
++int en75_ppe_flows_show(struct seq_file *m, struct en75_ppe *ppe);
+ 
+ #endif
