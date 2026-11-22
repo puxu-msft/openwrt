@@ -394,24 +394,24 @@
 	status = "okay";
 };
 
-/* 四口同构（GSW 内置 PHY）；ROMFILE 的 ONU 画像报 GEPortNum=1 + FEPortNum=3，OMCI 报 4 桥端口。端口标签保持 lan1-4，lan4 由 board.d/02_network 配成 WAN（DHCP 客户端，用户定），lan1-3 进 LAN 桥。 */
+/* 四口同构（GSW 内置 PHY）；ROMFILE 的 ONU 画像报 GEPortNum=1 + FEPortNum=3，OMCI 报 4 桥端口。端口标签与面板网口编号一致（用户 2026-11-22 定）：交换机端口 1–4 在面板上依次是网口 4–1（2026-11-15 插线实测网口 1 与 4，网口 2、3 按反序推断，见 docs/28 §2.2），所以 gsw_port1 标 lan4……gsw_port4 标 lan1。lan4（面板网口 4）由 board.d/02_network 配成 WAN（DHCP 客户端），lan1–lan3 进 LAN 桥。 */
 &gsw_port1 {
-	label = "lan1";
+	label = "lan4";
 	status = "okay";
 };
 
 &gsw_port2 {
-	label = "lan2";
-	status = "okay";
-};
-
-&gsw_port3 {
 	label = "lan3";
 	status = "okay";
 };
 
+&gsw_port3 {
+	label = "lan2";
+	status = "okay";
+};
+
 &gsw_port4 {
-	label = "lan4";
+	label = "lan1";
 	status = "okay";
 };
 
@@ -475,7 +475,7 @@
 &gsw_phy1_led1 {
 	color = <LED_COLOR_ID_GREEN>;
 	function = LED_FUNCTION_LAN;
-	function-enumerator = <1>;
+	function-enumerator = <4>;
 	linux,default-trigger = "netdev";
 	active-low;
 	status = "okay";
@@ -484,7 +484,7 @@
 &gsw_phy2_led1 {
 	color = <LED_COLOR_ID_GREEN>;
 	function = LED_FUNCTION_LAN;
-	function-enumerator = <2>;
+	function-enumerator = <3>;
 	linux,default-trigger = "netdev";
 	active-low;
 	status = "okay";
@@ -493,7 +493,7 @@
 &gsw_phy3_led1 {
 	color = <LED_COLOR_ID_GREEN>;
 	function = LED_FUNCTION_LAN;
-	function-enumerator = <3>;
+	function-enumerator = <2>;
 	linux,default-trigger = "netdev";
 	active-low;
 	status = "okay";
@@ -502,7 +502,7 @@
 &gsw_phy4_led1 {
 	color = <LED_COLOR_ID_GREEN>;
 	function = LED_FUNCTION_LAN;
-	function-enumerator = <4>;
+	function-enumerator = <1>;
 	linux,default-trigger = "netdev";
 	active-low;
 	status = "okay";
