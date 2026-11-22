@@ -100,7 +100,7 @@ HOST_CONFIGURE_ARGS += \
 	--without-curses-h \
 	--with-terminfo-dirs=$(STAGING_DIR_HOST)/share/terminfo \
 	--with-default-terminfo-dir=$(STAGING_DIR_HOST)/share/terminfo \
-	--with-pkg-config-libdir=$(STAGING_DIR_HOST)/lib/pkgconfig
+	--with-pkg-config-libdir=$(STAGING_DIR_HOSTPKG)/lib/pkgconfig
 
 
 ifeq ($(HOST_OS),FreeBSD)
