@@ -47,6 +47,11 @@ gs2107_env_config() {
 	printf '%s\n' "$want" > "$config.new" && mv "$config.new" "$config"
 }
 
+# env 写不进去要看得见：mtd5 的某一块磨坏后，那份副本永远存不进去，U-Boot 与 fw_setenv 都只往那一份写，env 就冻结在另一份上。失败记成 user.err 写进内核日志：logd 会收进 logread，控制台记录又进 pstore，热复位后的下一次启动仍读得到。
+gs2107_env_error() {
+	printf '<11>%s: %s\n' "$1" "$2" 2>/dev/null > /dev/kmsg || logger -p user.err -t "$1" "$2"
+}
+
 # 把 U-Boot env 设成给定的值。$1 是 logger 标签，其余参数是 名=值。不需要写或写成功返回 0；分区找不到、身份门不通过或 fw_setenv 失败返回 1，都已记日志。
 # 身份门：只有 env 读回来是 GS2107 的 env（有 gs_boot、没有 Bad CRC）才写。CRC 坏或分区不对时，fw_setenv 会存进它内置的默认 env（bootcmd=run distro_bootcmd），板子就起不来了。
 # 每次 fw_setenv 都整份重写一份 env 副本（擦一个 128 KiB NAND 块），所以只写与现值不同的项，并合成一次 fw_setenv -s - 调用。
@@ -55,12 +60,12 @@ gs2107_env_set() {
 
 	shift
 	if ! gs2107_env_config; then
-		logger -t "$tag" "uboot_env partition not found; not writing"
+		gs2107_env_error "$tag" "uboot_env partition not found; not writing"
 		return 1
 	fi
 	if ! fw_printenv -n gs_boot >/dev/null 2>&1 ||
 	   fw_printenv -n bootcount 2>&1 | grep -q "Bad CRC"; then
-		logger -t "$tag" "U-Boot env does not read back as the GS2107 env; not writing"
+		gs2107_env_error "$tag" "U-Boot env does not read back as the GS2107 env; not writing"
 		return 1
 	fi
 
@@ -74,7 +79,7 @@ gs2107_env_set() {
 	if printf '%s' "$changes" | fw_setenv -s -; then
 		logger -t "$tag" "set $(printf '%s' "$changes" | tr '\n' ' ')"
 	else
-		logger -t "$tag" "fw_setenv failed"
+		gs2107_env_error "$tag" "fw_setenv failed"
 		return 1
 	fi
 }
