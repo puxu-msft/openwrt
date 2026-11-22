@@ -1,10 +1,10 @@
 From: GS2107 <gs2107@local>
-Subject: [PATCH] econet-eth: PPE hardware flow offload (IPv4)
+Subject: [PATCH] econet-eth: PPE 硬件转发（IPv4）
 
-- On EN7528 the PPE is set up at probe (load parameter ppe=0 leaves it alone): a 16K x 80-byte FOE table in coherent DMA memory and the engine registers with the values and order of the vendor hw_nat.ko (recovered by disassembly), except that keepalive stays off as in mainline mtk_ppe (the stack would forward the copies a second time), only IPv4 learning is enabled (the driver binds nothing else), the default CPU port stays QDMA0 and the per-VLAN-layer MTU and FE EtherType tables keep their reset values. GDM1 then forwards every received frame through the engine and parses the MediaTek tag of received frames (stag_en, set with the DMA tag parsing), without which the engine cannot find the IP header; frames of flows that are not bound still reach the CPU, and the GDM now drops frames with bad TCP/UDP checksums.
-- nf_flowtable hardware offload (TC_SETUP_FT on GDM1, which DSA user ports delegate to): IPv4 TCP/UDP flows between MediaTek-tagged switch ports become HNAPT entries that leave through GDM1 directly, the switch port carried in the tag field (mtk_foe_entry_set_dsa()). A flow is bound when the engine reports its unbound entry past the bind rate (CPU reason 15 and entry index in the RX descriptor) on a plain IPv4 frame: the tuple read back from that entry selects the flow, so the hardware hash is never computed in software; flows with 802.1Q ingress are refused, and PPPoE ingress, which nf_flowtable does not describe to the driver, stays in software. The engine writes the TOS field of the entry into every packet it forwards, so the entry gets the TOS of the packet that asked for the binding, and a packet marked CE does not bind (the mark would stick to the whole flow). What the triggering packet carries becomes the flow's: per-packet DSCP collapses to one value, and CE marks added upstream after the binding are lost; the vendor driver writes the TOS the same way. Stats report the last use from the entry timestamp; a flow whose entry is no longer bound is rebound on the next request. Entries are written with the entry cache off and cleared, in the order of the vendor hwnat_delete_foe_entry; a clear that does not complete leaves the cache off. The flows offloaded through a flow block are released with the block, because nf_flowtable unbinds the block before it tears its flows down and those DESTROY commands never reach the driver. NETIF_F_HW_TC is fixed on. On GS2107 routed TCP (LAN to WAN through NAT, 1 Gb/s links) went from 656-758 Mb/s with two CPUs saturated in softirq to 934-941 Mb/s with the CPUs about 1% busy.
-- RX: frames that come through the engine report source ports other than GDM1 (9, 11 and 12 seen); they belong to GDM1 like everything but GDM2. They used to log one line each, which at console loglevel 7 on the 115200-baud serial console held every such frame for about 5.5 ms.
-- debugfs econet_eth/ppe (engine registers, block, flow and bind counters, entry counts per state and packet type, raw words of the first bound and other valid entries) and econet_eth/crsn (received frames per CPU reason); econet_eth/fe_regs returns 0 for an empty transfer.
+- EN7528 上 probe 时初始化 PPE（加载参数 ppe=0 时不碰）：16K × 80 字节的 FOE 表放在一致性 DMA 内存里，引擎寄存器按原厂 hw_nat.ko 逆向得到的值与顺序写入。例外：keepalive 保持关闭（同 mainline mtk_ppe，否则协议栈会把复制品再转发一遍）；只开 IPv4 学习（驱动只绑定 IPv4）；缺省 CPU 口仍是 QDMA0；每层 MTU 与 FE 以太类型表保持复位值。之后 GDM1 把收到的每一帧送进引擎，并解析收包的 MediaTek 标签（stag_en，与 DMA 的标签解析一起置位），否则引擎找不到 IP 头；没绑定的流照样到 CPU，GDM 从此丢弃 TCP/UDP 校验和错误的帧。
+- nf_flowtable 硬件卸载（GDM1 上的 TC_SETUP_FT，DSA 用户口转交过来）：MediaTek 标签交换机口之间的 IPv4 TCP/UDP 流成为 HNAPT 表项，直接经 GDM1 出去，交换机端口写进标签字段（mtk_foe_entry_set_dsa()）。引擎在一帧纯 IPv4 帧上报告未绑定表项达到绑定速率（RX 描述符里原因码 15 与表项号）时绑定：从该表项读回的元组选出流，软件从不计算硬件哈希；入向带 802.1Q 的流拒绝，入向 PPPoE 在 nf_flowtable 的规则里看不到、留在软件。引擎把表项 TOS 字段写进转发的每个包，所以表项取请求绑定那个包的 TOS，带 CE 的包不绑定（标记会粘在整条流上）。触发包带什么，整条流就带什么：逐包不同的 DSCP 压成一个值，绑定后上游再打的 CE 会丢失；原厂驱动同样写 TOS。统计以表项时间戳报告最近使用；表项不再是绑定态的流，下次请求时重新绑定。写表项时按原厂 hwnat_delete_foe_entry 的顺序先关缓存并整表清除；清除没完成时缓存保持关闭。经一个 flow block 卸载的流随 block 释放：nf_flowtable 先解绑 block 再拆流，那些 DESTROY 到不了驱动。NETIF_F_HW_TC 固定开启。GS2107 上经 NAT 的 LAN→WAN TCP（千兆链路）从 656–758 Mb/s、两个 CPU 软中断打满，提到 934–941 Mb/s、CPU 约 1%。
+- RX：经引擎上送的帧报告的源端口不是 GDM1（见到 9、11、12），它们和 GDM2 以外的帧一样属于 GDM1。原来每帧打一行日志，控制台日志级别 7、115200 波特串口下每帧卡约 5.5 ms。
+- debugfs econet_eth/ppe（引擎寄存器、block/流/绑定计数、各状态与包类型的表项数、前若干条绑定与其它有效表项的原始字）与 econet_eth/crsn（按原因码计的收包数）；econet_eth/fe_regs 对空传输返回 0。
 
 diff --git a/Kbuild b/Kbuild
 index 09cd408..937ea67 100644
@@ -246,7 +246,7 @@ index 6679d87..b5d2b35 100644
  	BUILD_BUG_ON(ARRAY_SIZE(debug->qdma) != ARRAY_SIZE(config->qdma));
  	for (int i = 0; i < ARRAY_SIZE(debug->qdma); i++) {
 diff --git a/econet_port.c b/econet_port.c
-index 660139a..423e0a0 100644
+index c0b5e70..7c96551 100644
 --- a/econet_port.c
 +++ b/econet_port.c
 @@ -13,11 +13,13 @@
@@ -307,7 +307,7 @@ index 660139a..423e0a0 100644
  	/* read back so the write has landed before a frame relies on it */
  	en75_rreg(&port->regs->vlan);
  	WRITE_ONCE(port->stag_parse, on);
-@@ -464,8 +477,33 @@ en75_ethtool_get_rmon_stats(struct net_device *dev,
+@@ -468,8 +481,33 @@ en75_ethtool_get_rmon_stats(struct net_device *dev,
  	} while (u64_stats_fetch_retry(&port->stats.syncp, start));
  }
  
@@ -341,7 +341,7 @@ index 660139a..423e0a0 100644
  	.ndo_open		= en75_dev_open,
  	.ndo_stop		= en75_dev_stop,
  	.ndo_change_mtu		= en75_dev_change_mtu,
-@@ -473,6 +511,7 @@ static const struct net_device_ops en75_netdev_ops = {
+@@ -477,6 +515,7 @@ static const struct net_device_ops en75_netdev_ops = {
  	.ndo_features_check	= en75_features_check,
  	.ndo_get_stats64        = en75_dev_get_stats64,
  	.ndo_set_mac_address	= en75_dev_set_macaddr,
@@ -349,7 +349,7 @@ index 660139a..423e0a0 100644
  };
  
  static const struct ethtool_ops en75_ethtool_ops = {
-@@ -486,7 +525,8 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+@@ -490,7 +529,8 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
  				       struct gdm __iomem *regs,
  				       struct en75_qdma *qdma,
  				       enum etx_fport fport,
@@ -359,7 +359,7 @@ index 660139a..423e0a0 100644
  {
  	struct en75_gdm_port *port;
  	struct net_device *ndev;
-@@ -506,8 +546,8 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+@@ -510,8 +550,8 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
  
  	/*
  	 * NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6: TCP/UDP checksums (ICO for the IPv4 header, TCO/UCO) and TSO (MSS in the TCP checksum field) as the vendor qdma_bm_transmit_packet_tso does them for IPv4, one descriptor per buffer; IPv6 has no vendor precedent and was verified on GS2107 like IPv4, behind the MediaTek tag. en75_features_check() leaves other traffic to the stack. They pay off for traffic the router sends itself; forwarded TCP arrives as fraglist GRO and leaves as the original segments.
@@ -370,7 +370,7 @@ index 660139a..423e0a0 100644
  	 */
  	ndev->hw_features = NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG |
  			    NETIF_F_TSO | NETIF_F_TSO6;
-@@ -516,6 +556,9 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+@@ -520,6 +560,9 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
  
  	ndev->features |= ndev->hw_features;
  	ndev->vlan_features = ndev->hw_features;
@@ -380,7 +380,7 @@ index 660139a..423e0a0 100644
  	ndev->dev.of_node = np;
  	SET_NETDEV_DEV(ndev, eth->dev);
  
-@@ -538,6 +581,7 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+@@ -542,6 +585,7 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
  	port->regs = regs;
  	port->fport = fport;
  	port->qdma = qdma;
@@ -1363,10 +1363,10 @@ index 0000000..09d39d0
 +
 +#endif
 diff --git a/econet_qdma.c b/econet_qdma.c
-index 63090d6..8dd1a1e 100644
+index d0294ac..d01ed81 100644
 --- a/econet_qdma.c
 +++ b/econet_qdma.c
-@@ -241,15 +241,14 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+@@ -245,15 +245,14 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
  	skb_reserve(skb, EN75_RX_HEADROOM);
  	__skb_put(skb, len);
  	skb_mark_for_recycle(skb);

@@ -1,10 +1,10 @@
 From: GS2107 <gs2107@local>
-Subject: [PATCH] econet-eth: RX checksum result, RX ring register fix and idle ring size, fe_regs transfer limit
+Subject: [PATCH] econet-eth: RX 校验和结果、RX 环寄存器修复与空闲环大小、fe_regs 单次传输上限
 
-- RX checksum: frames whose descriptor reports IPv4 or IPv6, L4VLD set and L4F/IP4F clear, from a source port other than the CPU ports, are passed up as CHECKSUM_UNNECESSARY (the vendor eth_rx rule bit for bit, eth.ko 0x11a4..0x11dc and 0x1410..0x1420), under NETIF_F_RXCSUM (ethtool -K eth0 rx off turns it off). On GS2107 (2026-11-14, stag_en on): TCP SYNs with a bad TCP checksum, ICMP echoes with a bad ICMP checksum and two-fragment UDP datagrams with a bad UDP checksum all go unanswered, the last two counted in Icmp/Udp InCsumErrors, and no ICMP frame or IPv4 fragment was among the frames marked. debugfs econet_eth/rx_csum counts marked frames and, among them, those that are not TCP/UDP or are IPv4 fragments.
-- RX ring registers: QDMA+0x100 (ring sizes) and +0x104 (low thresholds) hold ring 0 in the low half (vendor qdma_lan.ko); the accessors had the halves swapped, harmless while both rings had 512 entries.
-- Idle RX rings (ring 1 of each QDMA, ring 0 of a QDMA without a port) get 32 descriptors instead of 512: 2.8 MiB less on GS2107. With the swapped halves this made the hardware wrap ring 0 at 32 and bulk receive raised RX0 ERR_COHERENT millions of times until the NAPI thread soft-locked; with the fix, pushes, bulk transfers both ways and a multicast/broadcast flood ran clean and nothing reached the idle rings.
-- fe_regs: one transfer covers at most 64 bytes. Some offsets in the frame engine window stall the bus when read and hang the SoC (a grep over the whole file did), so cat and grep get -EINVAL; registers are read with dd bs=4.
+- RX 校验和：描述符报 IPv4 或 IPv6、L4VLD 置位、L4F/IP4F 清零、源端口不是 CPU 口的帧，以 CHECKSUM_UNNECESSARY 上送（原厂 eth_rx 的规则逐位照搬，eth.ko 0x11a4..0x11dc 与 0x1410..0x1420），受 NETIF_F_RXCSUM 控制（ethtool -K eth0 rx off 可关）。GS2107 上（2026-11-14，stag_en 开）：TCP 校验和错误的 SYN、ICMP 校验和错误的 echo、UDP 校验和错误的两片 UDP 报文都得不到应答，后两者计入 Icmp/Udp InCsumErrors，被标记的帧里没有 ICMP 帧，也没有 IPv4 分片。debugfs econet_eth/rx_csum 计被标记的帧数，以及其中非 TCP/UDP 与 IPv4 分片的个数。
+- RX 环寄存器：QDMA+0x100（环大小）与 +0x104（低水位）以低半为 ring 0（原厂 qdma_lan.ko），访问函数把两半写反了；两个环都是 512 项时看不出来。
+- 空闲 RX 环（各 QDMA 的 ring 1、没有端口的 QDMA 的 ring 0）从 512 项改为 32 项，GS2107 上省 2.8 MiB。两半写反时这会让硬件按 32 回绕 ring 0，大块收包时 RX0 ERR_COHERENT 触发数百万次，直到 NAPI 线程软锁死；修正后推送、双向大块传输与组播/广播洪泛都干净，空闲环上没有收到任何帧。
+- fe_regs：单次传输最多 64 字节。帧引擎窗口里有些偏移一读就卡住总线、让 SoC 挂死（整文件 grep 就会），所以 cat 与 grep 得到 -EINVAL；寄存器用 dd bs=4 读。
 
 diff --git a/econet_eth.c b/econet_eth.c
 index fd817d5..03fb055 100644
@@ -256,10 +256,10 @@ index b5d2b35..138cc16 100644
  	BUILD_BUG_ON(ARRAY_SIZE(debug->qdma) != ARRAY_SIZE(config->qdma));
  	for (int i = 0; i < ARRAY_SIZE(debug->qdma); i++) {
 diff --git a/econet_port.c b/econet_port.c
-index 423e0a0..757e25d 100644
+index 7c96551..07ff45a 100644
 --- a/econet_port.c
 +++ b/econet_port.c
-@@ -546,11 +546,11 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+@@ -550,11 +550,11 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
  
  	/*
  	 * NETIF_F_IP_CSUM | NETIF_F_IPV6_CSUM | NETIF_F_SG | NETIF_F_TSO | NETIF_F_TSO6: TCP/UDP checksums (ICO for the IPv4 header, TCO/UCO) and TSO (MSS in the TCP checksum field) as the vendor qdma_bm_transmit_packet_tso does them for IPv4, one descriptor per buffer; IPv6 has no vendor precedent and was verified on GS2107 like IPv4, behind the MediaTek tag. en75_features_check() leaves other traffic to the stack. They pay off for traffic the router sends itself; forwarded TCP arrives as fraglist GRO and leaves as the original segments.
@@ -274,10 +274,10 @@ index 423e0a0..757e25d 100644
  	netif_set_tso_max_size(ndev, 0xffff);
  
 diff --git a/econet_qdma.c b/econet_qdma.c
-index 8dd1a1e..95e137d 100644
+index d01ed81..3da4a5d 100644
 --- a/econet_qdma.c
 +++ b/econet_qdma.c
-@@ -205,6 +205,18 @@ static void en75_fill_rx_queue(struct en75_q_rx *q, u32 end_i)
+@@ -209,6 +209,18 @@ static void en75_fill_rx_queue(struct en75_q_rx *q, u32 end_i)
  	en75_wreg(cpu_i, &q->qchain_regs->rx_cpui);
  }
  
@@ -296,7 +296,7 @@ index 8dd1a1e..95e137d 100644
  static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
  				     enum dma_data_direction dir)
  {
-@@ -241,14 +253,14 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+@@ -245,14 +257,14 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
  	skb_reserve(skb, EN75_RX_HEADROOM);
  	__skb_put(skb, len);
  	skb_mark_for_recycle(skb);

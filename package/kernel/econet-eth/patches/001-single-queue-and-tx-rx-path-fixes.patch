@@ -1,22 +1,26 @@
 From: GS2107 <gs2107@local>
-Subject: [PATCH] econet-eth: single TX queue, TX/RX path fixes and checksum/TSO offloads
+Subject: [PATCH] econet-eth: 单 TX 队列、TX/RX 路径修复与校验和/TSO 卸载
 
-- One TX/RX netdev queue per port. All packets go to the same hardware TX ring; 256 soft queues multiplied qdiscs (256 fq_codel instances) and BQL state without changing what reaches the hardware, and a queue could be stopped with none of its own packets in flight, so nothing woke it.
-- Ring-full (-EBUSY, nothing queued) freed the skb and then returned NETDEV_TX_BUSY, so the stack requeued and later sent freed memory. Keep the skb and re-check the ring after stopping the queue to close the stop/wake race with the TX-done NAPI.
-- BQL: account sent bytes under the ring lock before the doorbell; complete once per TX-done poll; reset the queue on open.
-- TX-done: shared by the NAPI and the stop path; napi_consume_skb for sent packets; a record for an entry that is already free is skipped.
-- Stop: let the hardware finish the TX rings, consume every completion record, free what was never sent and reset the rings, so the next open neither processes records for freed entries nor resends descriptors that point at freed buffers.
-- Open: enable NAPI before RX/TX DMA, unmask the DONE interrupts and poll once. An RX interrupt taken between DMA enable and napi_enable masked its bit while the schedule was refused, so receive stalled for good with a full ring (seen after a reboot with traffic on the WAN port).
-- Do not set skb->hash from the PPE entry index: with the PPE off it is the same for every packet, and the constant L4 hash steered every flow to a single RPS CPU.
-- RX buffers keep NET_SKB_PAD of headroom and the QDMA writes frames 2 bytes in (RX_2B_OFFSET). Frames used to start at the buffer start, so behind the 18-byte MediaTek-tagged header the IP header was only 2-byte aligned and MIPS emulated every unaligned load in the exception handler (about 17 emulations per packet, 825 million in an hour of benchmarks); forwarding also had no room to push headers. With the offset the emulation count stays at 0 and routed 4-flow TCP in the deployed configuration went from 370-500 to 761-925 Mb/s on GS2107 (same bridge-hairpin bench, 4 runs each, before/after builds). The MTU is capped at what one RX buffer holds (1708), so the GDM never passes a frame that would spill into a second descriptor.
-- 512 RX descriptors per chain (128 ran out under 1 Gb/s forwarding).
-- TX: IPv4 TCP/UDP checksum offload, scatter-gather and TSO, done as the vendor qdma_bm_transmit_packet_tso does them: one descriptor per buffer with NLS on all but the last (every descriptor completes on its own, the skb hangs off the last), ICO/TCO/UCO in the TX message, the TSO bit (bit 28, misnamed SCO before) with the MSS in the TCP checksum field. The hardware only parses the frames correctly once the DMA parses the MediaTek tag (CDMA_VLAN_CTRL bit 0, vendor macEN7512STagEnable); without it the checksums came out wrong and a TSO frame stalled the TX DMA. At boot DSA attaches before the conduit opens and the bit is set in ndo_open; when the driver is reloaded and the switch bound afterwards, it is set from ndo_features_check on the first frame. Checksum/GSO features are dropped for every frame while the bit is not set or the port is no DSA conduit, and for anything but plain IPv4/IPv6; on stop the bit is cleared only after the TX DMA is stopped. On GS2107 a single TCP stream sent by the router went from about 300 (offloads switched off with ethtool) to 360-440 Mb/s; forwarded TCP stays at the 1 Gb/s link limit of the bench (fraglist GRO leaves as the original segments).
-- RX checksum: received frames were all marked CHECKSUM_UNNECESSARY without any check, so frames with bad TCP/UDP/ICMP checksums were accepted by the router itself (and GRO could merge them into aggregates that are re-checksummed on the way out). The GDM checks checksums only when it parses the MediaTek tag (stag_en bit0, vendor GDMA1_VLAN_CHECK), which this patch leaves off (patch 002 sets it for the PPE). Received frames are now CHECKSUM_NONE and the stack verifies them.
-- TX checksum offload and TSO also for IPv6 TCP (TCO without ICO, TSO6), verified on GS2107 the same way; there is no vendor precedent. IPv6 UDP is checksummed in software because a computed zero has to go out as 0xffff there, which the hardware was not verified to do; a non-TCP/UDP IPv4 checksum request falls back to software as well.
-- TX doorbell rung once per batch (netdev_xmit_more()), whenever the ring cannot take another full skb, and when the last frame of a batch is dropped.
-- ndo_open no longer calls en75_qdma_use() (mutex, napi_enable) under the register spinlock.
-- NAPI completes with the work done, so napi_defer_hard_irqs and gro_flush_timeout (runtime module parameters) take effect; threaded_napi (default on, as before) selects the NAPI mode at load time.
-- debugfs econet_eth/fe_regs (0600): raw 32-bit access to the frame engine register window, the file offset being the register offset, for bringing up blocks the driver does not drive yet (the PPE).
+基于上游 9644850（2026-10-14）。上游 a2adcbf（环满返回 NETDEV_TX_BUSY 前不释放 skb）、9f70de5（tx_int_delay 清零）、bcc4062（完成后复查 done 队列、wait_time=1）、f84e3fe（清 bootloader 留下的 CPU 保护限速器）、a955371（TX 完成轮询定时器）、f756396（短帧补齐）原样保留或按下文并入；9dc4685（完成时唤醒全部 256 个软队列）与 b3d66a2（BQL 下限 200000 字节）由本补丁的单队列与正确的 BQL 记账取代。
+
+- 每端口一个 TX/RX netdev 队列。所有包都进同一个硬件 TX 环；256 个软队列只是把 qdisc（256 个 fq_codel）与 BQL 状态乘了 256 倍，到硬件的东西不变，而且一个队列可能在自己没有任何在途包时被停住、再没有人唤醒它（上游 9dc4685 改为每次完成唤醒全部队列，单队列下不需要）。
+- 环满（-EBUSY，什么都没入队）时保留 skb 返回 NETDEV_TX_BUSY（同上游 a2adcbf）；停队列后在环锁下复查空位，关闭与 TX 完成 NAPI 之间的 stop/wake 竞态；环里放不下一个最大 skb 时立即停队列，完成路径在空位足够时唤醒。
+- BQL：在环锁内、写门铃前记账已发字节；每次 TX 完成 poll 汇总一次；open 时复位队列。上游 b3d66a2 为绕开约 3 ms 的完成时延把 BQL 下限抬到 200000 字节（大于整个环，等于关掉 BQL）；完成时延已由上游的完成轮询定时器（a955371，150 µs）与 bcc4062 的复查从根上解决，这里不再设下限，BQL 与其上的 fq_codel 照常起作用。
+- 上游 a955371 的 TX 完成轮询定时器保留：门铃写入时启动，poll 结束时环里仍有在途描述符就再启动；"在途"直接由环的空闲项数判断（空闲数小于环长，写入方在环锁内 WRITE_ONCE、读取方 READ_ONCE），不另设逐包原子计数。停机时先停 TX 完成 NAPI、再取消定时器：反过来时正在跑的 poll 会在取消之后重新启动定时器，定时器再对已禁用的 NAPI 调度一次。
+- 短帧按上游 f756396 补齐到 ETH_ZLEN；补齐失败不释放 skb，走统一的丢弃路径（补写门铃、计数）。
+- TX 完成：NAPI 与停机路径共用；成功发送的包用 napi_consume_skb；对已空闲表项的完成记录只消费、不动空闲链表。
+- 停机：等硬件发完 TX 环，消费全部完成记录，释放未发出的包并复位环，下次 open 既不会处理指向已释放表项的记录，也不会重发指向已释放缓冲的描述符。
+- 打开：先 napi_enable，再开 RX/TX DMA，解除 DONE 中断屏蔽并主动 poll 一次。DMA 打开与 napi_enable 之间到达的 RX 中断会屏蔽自己的位，而调度因 NAPI 仍禁用被拒，收包从此停摆、环满（一次带 WAN 流量的重启后实际遇到）。
+- 不再用 PPE 表项号设 skb->hash：PPE 关闭时它对所有包相同，常量 L4 哈希把所有流都送到同一个 RPS CPU。
+- RX 缓冲留 NET_SKB_PAD 的 headroom，QDMA 再把帧后移 2 字节写入（RX_2B_OFFSET）。原来帧从缓冲起点写起，18 字节带 MediaTek 标签的头之后 IP 头只 2 字节对齐，MIPS 在异常处理里模拟每一次非对齐访存（每包约 17 次，一小时基准累计 8.25 亿次），转发时也没有空间压入新头。加偏移后模拟计数为 0，GS2107 部署配置下经路由的 4 流 TCP 从 370–500 提到 761–925 Mb/s（同一网桥发卡基准，改前改后各 4 轮）。MTU 上限取一个 RX 缓冲能装下的长度（1708），GDM 不会放过需要第二个描述符的帧。
+- 每条链 512 个 RX 描述符（128 个在 1 Gb/s 转发时会被用光）。
+- TX：IPv4 TCP/UDP 校验和卸载、SG 与 TSO，做法同原厂 qdma_bm_transmit_packet_tso：每个缓冲一个描述符，除最后一个外都置 NLS（每个描述符各自完成，skb 挂在最后一个上），TX 消息里置 ICO/TCO/UCO，TSO 位（bit 28，原先误名 SCO）并把 MSS 写进 TCP 校验和字段。只有 DMA 解析 MediaTek 标签（CDMA_VLAN_CTRL bit 0，原厂 macEN7512STagEnable）时硬件才能正确解析帧；不置位时校验和算错、TSO 帧会让 TX DMA 卡死。开机时 DSA 先挂接、conduit 后打开，在 ndo_open 里置位；驱动重载且交换机后绑定时，在 ndo_features_check 第一次看到帧时补置。该位未置或端口不是 DSA conduit 时对每帧剥掉校验和/GSO 特性，纯 IPv4/IPv6 以外的帧也一样；停机时等 TX DMA 停下后才清位。GS2107 上路由器本机发出的单条 TCP 从约 300（ethtool 关掉卸载）提到 360–440 Mb/s；转发的 TCP 仍停在基准的 1 Gb/s 链路上限（fraglist GRO 按原始分段发出）。
+- RX 校验和：原来所有收包都不经检查标成 CHECKSUM_UNNECESSARY，TCP/UDP/ICMP 校验和错误的帧被路由器本机接受（GRO 还可能把它们合并成出口重新算校验和的聚合包）。GDM 只有在解析 MediaTek 标签时（stag_en bit0，原厂 GDMA1_VLAN_CHECK）才查校验和，本补丁不置它（补丁 002 为 PPE 置位）。收包改为 CHECKSUM_NONE，由协议栈校验。
+- IPv6 TCP 同样做 TX 校验和卸载与 TSO（置 TCO 不置 ICO，TSO6），在 GS2107 上按同样方法验证；原厂没有先例。IPv6 UDP 用软件校验和：算出的 0 在那里必须发成 0xffff，硬件是否这样做没有验证；非 TCP/UDP 的 IPv4 校验和请求同样退回软件。
+- TX 门铃按批写（netdev_xmit_more()）；环放不下一个最大 skb 时、批末一帧被丢弃时都立即写。
+- ndo_open 不再在寄存器自旋锁内调用 en75_qdma_use()（会拿 mutex、napi_enable）。
+- NAPI 以实际完成的工作量结束，napi_defer_hard_irqs 与 gro_flush_timeout（运行期模块参数）因此生效；threaded_napi（默认开，同原来）在加载时选择 NAPI 模式。
+- debugfs econet_eth/fe_regs（0600）：按 32 位读写帧引擎寄存器窗口，文件偏移即寄存器偏移，用于驱动尚未接管的模块（PPE）的调试。
 
 diff --git a/econet_eth.c b/econet_eth.c
 index 16ba1c0..a07648c 100644
@@ -180,7 +184,7 @@ index a169b7a..6679d87 100644
  	for (int i = 0; i < ARRAY_SIZE(debug->qdma); i++) {
  		char qdma_dirname[8] = {0};
 diff --git a/econet_port.c b/econet_port.c
-index 9004073..660139a 100644
+index f920492..c0b5e70 100644
 --- a/econet_port.c
 +++ b/econet_port.c
 @@ -6,6 +6,10 @@
@@ -231,7 +235,7 @@ index 9004073..660139a 100644
  	fc = en75_rreg(&port->regs->fwd_cfg);
  	set_gdm_fwd_cfg_mymac_fport(&fc, val);
  	set_gdm_fwd_cfg_mcast_fport(&fc, val);
-@@ -138,26 +145,38 @@ static int en75_dev_init(struct net_device *dev)
+@@ -138,40 +145,38 @@ static int en75_dev_init(struct net_device *dev)
  	return 0;
  }
  
@@ -258,6 +262,20 @@ index 9004073..660139a 100644
 +	netdev_tx_reset_queue(netdev_get_tx_queue(dev, 0));
  	netif_tx_start_all_queues(dev);
  
+-	/* TX-done completions are reported with ~3 ms latency. BQL reacts
+-	 * by clamping each queue's limit to a single packet, serializing
+-	 * TX to one packet per completion round-trip (~314 pps). Keep the
+-	 * per-queue floor above the TX ring capacity so the ring stays
+-	 * full; this takes TX from ~3.6 Mbit/s to ~92 Mbit/s. */
+-#ifdef CONFIG_BQL
+-	{
+-		unsigned int i;
+-
+-		for (i = 0; i < dev->num_tx_queues; i++)
+-			netdev_get_tx_queue(dev, i)->dql.min_limit = 200000;
+-	}
+-#endif
+-
 -	// TODO DSA
 -	// if (netdev_uses_dsa(dev))
 -	// 	airoha_fe_set(qdma->eth, REG_GDM_INGRESS_CFG(port->id),
@@ -282,7 +300,7 @@ index 9004073..660139a 100644
  
  	return en75_qdma_use(port->qdma);
  }
-@@ -166,9 +185,14 @@ static int en75_dev_stop(struct net_device *dev)
+@@ -180,9 +185,14 @@ static int en75_dev_stop(struct net_device *dev)
  {
  	struct en75_gdm_port *port = netdev_priv(dev);
  
@@ -298,7 +316,7 @@ index 9004073..660139a 100644
  }
  
  static int en75_dev_change_mtu(struct net_device *dev, int mtu)
-@@ -176,7 +200,7 @@ static int en75_dev_change_mtu(struct net_device *dev, int mtu)
+@@ -190,7 +200,7 @@ static int en75_dev_change_mtu(struct net_device *dev, int mtu)
  	struct en75_gdm_port *port = netdev_priv(dev);
  	struct gdm_len_th rlt;
  
@@ -307,7 +325,7 @@ index 9004073..660139a 100644
  	rlt = en75_rreg(&port->regs->rx_len_threshold);
  	set_gdm_len_th_oversize_len(&rlt, ETH_HLEN + mtu + ETH_FCS_LEN);
  	en75_wreg(rlt, &port->regs->rx_len_threshold);
-@@ -186,48 +210,97 @@ static int en75_dev_change_mtu(struct net_device *dev, int mtu)
+@@ -200,66 +210,101 @@ static int en75_dev_change_mtu(struct net_device *dev, int mtu)
  	return 0;
  }
  
@@ -364,7 +382,34 @@ index 9004073..660139a 100644
 -	if (skb_linearize(skb))
 -		goto error;
 -
+-	/* QDMA/GDM does not reliably pad runt frames. A default PPPoE PADI
+-	 * over VLAN35 is shorter than ETH_ZLEN and is visible on the local
+-	 * netdev but not on the wire unless it is padded here. eth_skb_pad()
+-	 * frees the skb on error, so do not fall through to the common error
+-	 * path in that case. */
+-	if (eth_skb_pad(skb)) {
+-		dev->stats.tx_dropped++;
+-		return NETDEV_TX_OK;
+-	}
+-	len = skb->len;
+-
 -	netdev_tx_sent_queue(txq, len);
+-
+-	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0);
+-
+-	if (ret < 0) {
+-		netdev_tx_completed_queue(txq, 1, len);
+-		if (ret == -EBUSY) {
+-			/* The TX ring is full and en75_qdma_xmit() did not consume
+-			 * the skb. A NETDEV_TX_BUSY return makes the qdisc layer
+-			 * requeue this same skb, so it must stay alive: stop the
+-			 * queue and return without freeing. Freeing it here and
+-			 * returning NETDEV_TX_BUSY requeues freed memory into
+-			 * q->gso_skb -> use-after-free in __qdisc_run() under
+-			 * sustained TX.
+-			 */
+-			netif_tx_stop_queue(txq);
+-			return NETDEV_TX_BUSY;
 +	/* en75_features_check() lets only IPv4/IPv6 reach here with CHECKSUM_PARTIAL or GSO, and the core only hands over TCP/UDP checksums right behind the IP header; the hardware parses the headers itself. IPv6 UDP is checksummed in software: a computed zero must go out as 0xffff there (RFC 8200 8.1), which the hardware was not verified to do. */
 +	if (skb->ip_summed == CHECKSUM_PARTIAL) {
 +		bool v4 = skb->protocol == htons(ETH_P_IP);
@@ -378,8 +423,9 @@ index 9004073..660139a 100644
 +			set_etx_ico(&msg.etx, true);
 +		} else if (skb_checksum_help(skb)) {
 +			goto drop;
-+		}
-+	}
+ 		}
+-		goto error;
+ 	}
 +	if (skb_is_gso(skb)) {
 +		if (skb_cow_head(skb, 0))
 +			goto drop;
@@ -390,21 +436,21 @@ index 9004073..660139a 100644
 +		set_etx_tco(&msg.etx, true);
 +		set_etx_tso(&msg.etx, true);
 +	}
- 
--	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0);
++
++	/* 上游 f756396：QDMA/GDM 不可靠地填充短帧，补到 ETH_ZLEN（与上游 eth_skb_pad() 同义，失败时不释放，由 drop 统一处理门铃与计数）。 */
++	if (__skb_put_padto(skb, ETH_ZLEN, false))
++		goto drop;
++
 +	/* Each buffer goes out as its own descriptor, and an empty linear part cannot. */
 +	if (unlikely(!skb_headlen(skb)) && skb_linearize(skb))
 +		goto drop;
- 
--	if (ret < 0) {
--		netdev_tx_completed_queue(txq, 1, len);
--		goto error;
++
 +	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0, txq);
 +	if (ret == -EBUSY) {
 +		/* Ring full, nothing queued: the stack requeues this skb, so it must not be freed. Not expected, since the queue is stopped as soon as the ring has no room left. */
 +		en75_stop_queue_if_full(port, txq);
 +		return NETDEV_TX_BUSY;
- 	}
++	}
 +	if (ret < 0)
 +		goto drop;
  
@@ -422,15 +468,10 @@ index 9004073..660139a 100644
  	dev_kfree_skb_any(skb);
  	dev->stats.tx_dropped++;
 -
--	if (ret == -EBUSY) {
--		netif_tx_stop_queue(txq);
--		return NETDEV_TX_BUSY;
--	}
--
  	return NETDEV_TX_OK;
  }
  
-@@ -397,6 +470,7 @@ static const struct net_device_ops en75_netdev_ops = {
+@@ -429,6 +474,7 @@ static const struct net_device_ops en75_netdev_ops = {
  	.ndo_stop		= en75_dev_stop,
  	.ndo_change_mtu		= en75_dev_change_mtu,
  	.ndo_start_xmit		= en75_dev_xmit,
@@ -438,7 +479,7 @@ index 9004073..660139a 100644
  	.ndo_get_stats64        = en75_dev_get_stats64,
  	.ndo_set_mac_address	= en75_dev_set_macaddr,
  };
-@@ -418,9 +492,8 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+@@ -450,9 +496,8 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
  	struct net_device *ndev;
  	int err;
  
@@ -450,7 +491,7 @@ index 9004073..660139a 100644
  	if (!ndev) {
  		dev_err(eth->dev, "alloc_etherdev failed\n");
  		return ERR_PTR(-ENOMEM);
-@@ -428,24 +501,18 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+@@ -460,24 +505,18 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
  
  	ndev->netdev_ops = &en75_netdev_ops;
  	ndev->ethtool_ops = &en75_ethtool_ops;
@@ -484,10 +525,10 @@ index 9004073..660139a 100644
  	ndev->features |= ndev->hw_features;
  	ndev->vlan_features = ndev->hw_features;
 diff --git a/econet_qdma.c b/econet_qdma.c
-index 555d0d6..63090d6 100644
+index 6c43531..d0294ac 100644
 --- a/econet_qdma.c
 +++ b/econet_qdma.c
-@@ -7,6 +7,8 @@
+@@ -8,6 +8,8 @@
  #include <net/dsa.h>
  #include <linux/platform_device.h>
  #include <linux/of_reserved_mem.h>
@@ -496,7 +537,7 @@ index 555d0d6..63090d6 100644
  
  #include "asm-generic/int-ll64.h"
  #include "linux/bitmap.h"
-@@ -39,12 +41,13 @@ struct en75_q_rx {
+@@ -40,12 +42,13 @@ struct en75_q_rx {
  	struct page_pool		*page_pool;
  };
  
@@ -511,15 +552,18 @@ index 555d0d6..63090d6 100644
  };
  
  struct en75_q_tx {
-@@ -58,6 +61,7 @@ struct en75_q_tx {
+@@ -59,9 +62,7 @@ struct en75_q_tx {
  	/* FIFO of free entries because they complete out of order. */
  	u16				freelist_head;
  	u16				freelist_tail;
+-
+-	/* Packets submitted but not yet completed. */
+-	atomic_t			inflight;
 +	u16				nfree;
  
  	/* Not modified after init */
  	struct en75_qdma		*qdma;
-@@ -114,6 +118,56 @@ struct en75_qdma {
+@@ -121,6 +122,56 @@ struct en75_qdma {
  	const struct en75_soc_data	*soc;
  };
  
@@ -576,7 +620,7 @@ index 555d0d6..63090d6 100644
  static void en75_fill_rx_queue(struct en75_q_rx *q, u32 end_i)
  {
  	u32 ndesc = q->ndesc;
-@@ -134,8 +188,8 @@ static void en75_fill_rx_queue(struct en75_q_rx *q, u32 end_i)
+@@ -141,8 +192,8 @@ static void en75_fill_rx_queue(struct en75_q_rx *q, u32 end_i)
  
  		WARN_ON_ONCE(e->dma_addr);
  		e->buf = page_address(page) + offset;
@@ -587,7 +631,7 @@ index 555d0d6..63090d6 100644
  
  		WRITE_ONCE(pdesc->info, ((struct desc_info) {
  			.word = FIELD_PREP(DESC_INFO_PKT_LEN_MASK, e->dma_len)
-@@ -158,14 +212,14 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+@@ -165,14 +216,14 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
  	struct sk_buff *skb;
  	struct page *page;
  	struct desc desc;
@@ -604,7 +648,7 @@ index 555d0d6..63090d6 100644
  	
  	/* Not needed but a couple of WARN_ON_ONCE() check this later */
  	e->dma_addr = 0;
-@@ -174,7 +228,7 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+@@ -181,7 +232,7 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
  	WRITE_ONCE(q->desc[cpu_i].pkt_addr, 0);
  
  	len = get_desc_info_pkt_len(&desc.info);
@@ -613,7 +657,7 @@ index 555d0d6..63090d6 100644
  		goto return_page;
  
  	if (WARN_ON_ONCE(is_desc_info_nls(&desc.info)))
-@@ -184,13 +238,12 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+@@ -191,13 +242,12 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
  	if (!skb)
  		goto return_page;
  
@@ -630,7 +674,7 @@ index 555d0d6..63090d6 100644
  
  	/* TODO: When we begin supporting the PPE, we will handle
  	 *       PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED here. */
-@@ -354,7 +407,7 @@ static int en75_qdma_rx_napi_poll(struct napi_struct *napi, int budget)
+@@ -361,7 +411,7 @@ static int en75_qdma_rx_napi_poll(struct napi_struct *napi, int budget)
  		done += cur;
  	} while (cur && done < budget);
  
@@ -639,13 +683,13 @@ index 555d0d6..63090d6 100644
  		union en75_irq_purpose purpose;
  		union irq_bit b;
  		
-@@ -425,24 +478,37 @@ static irqreturn_t en75_irq_handler(int irq_num, void *dev_instance)
- #define IRQ_RING_IDX_MASK		GENMASK(20, 16)
- #define IRQ_DESC_IDX_MASK		GENMASK(15, 0)
+@@ -461,25 +511,37 @@ static void en75_tx_done_kick_arm(struct en75_tx_doneq *done_q)
+ 			      HRTIMER_MODE_REL);
+ }
  
 -static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
 +static void en75_tx_unmap(struct en75_qdma *qdma, struct en75_q_tx_ent *e)
-+{
+ {
 +	if (e->dma_page)
 +		dma_unmap_page(qdma->dev, e->dma_addr, e->dma_len,
 +			       DMA_TO_DEVICE);
@@ -660,7 +704,7 @@ index 555d0d6..63090d6 100644
 +/* Consume up to limit TX completion records. Runs in the TX-done NAPI and, with that NAPI disabled, from en75_qdma_unuse() to drain the queue (napi_budget 0: skbs are freed outside NAPI). BQL is completed once per call: completions are serialised by the single TX-done NAPI, and BQL allows them to run concurrently with xmit. */
 +static u32 en75_tx_done_process(struct en75_tx_doneq *done_q, u32 limit,
 +				int napi_budget)
- {
++{
 +	struct en75_qdma *qdma = done_q->qdma;
 +	struct netdev_queue *done_txq = NULL;
 +	struct en75_q_tx *done_q_tx = NULL;
@@ -669,6 +713,7 @@ index 555d0d6..63090d6 100644
 -	struct en75_tx_doneq *done_q;
 -	struct en75_qdma *qdma;
 -	int id, irq_queued;
+-	struct net_device *wake_dev = NULL;
  	u32 done = 0, head;
 -
 -	done_q = container_of(napi, struct en75_tx_doneq, napi);
@@ -686,7 +731,7 @@ index 555d0d6..63090d6 100644
  		u32 index, qid, val = done_q->q[head];
  		struct en75_q_tx_ent *e;
  		struct en75_q_tx *q;
-@@ -481,8 +547,11 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
+@@ -518,8 +580,11 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
  		e = &q->entry[index];
  		skb = e->skb;
  
@@ -700,22 +745,18 @@ index 555d0d6..63090d6 100644
  		memset(e, 0, sizeof(*e));
  
  		/* Completion ring can report out of order when hw QoS is
-@@ -493,14 +562,33 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
+@@ -530,15 +595,33 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
  		e->freelist_next = 0xffff;
  		q->entry[q->freelist_tail].freelist_next = index;
  		q->freelist_tail = index;
-+		q->nfree++;
++		WRITE_ONCE(q->nfree, q->nfree + 1);
 +		done_q_tx = q;
- 
--		txq = netdev_get_tx_queue(skb->dev,
--					  skb_get_queue_mapping(skb));
--		netdev_tx_completed_queue(txq, 1, skb->len);
--		if (netif_tx_queue_stopped(txq))
--			netif_tx_wake_queue(txq);
++
 +		/* Every buffer of a packet completes on its own; the skb hangs off the last one. */
 +		if (!skb)
 +			continue;
-+
+ 
+-		atomic_dec(&q->inflight);
 +		/* every packet was queued on TX queue 0 (en75_dev_xmit()) */
 +		txq = netdev_get_tx_queue(skb->dev, 0);
 +		if (txq != done_txq) {
@@ -728,10 +769,14 @@ index 555d0d6..63090d6 100644
 +		pkts++;
 +		bytes += skb->len;
  
--		dev_kfree_skb_any(skb);
+-		txq = netdev_get_tx_queue(skb->dev,
+-					  skb_get_queue_mapping(skb));
+-		netdev_tx_completed_queue(txq, 1, skb->len);
+-		wake_dev = skb->dev;
 +		napi_consume_skb(skb, napi_budget);
 +	}
-+
+ 
+-		dev_kfree_skb_any(skb);
 +	if (done_txq) {
 +		netdev_tx_completed_queue(done_txq, pkts, bytes);
 +		if (netif_tx_queue_stopped(done_txq) && done_q_tx &&
@@ -740,11 +785,17 @@ index 555d0d6..63090d6 100644
  	}
  
  	if (done) {
-@@ -514,7 +602,18 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
+@@ -552,15 +635,20 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
  		en75_wreg(done & 0x7f, &qdma->regs->done_queue.pop_back);
  	}
  
--	if (done < budget && napi_complete(napi)) {
+-	/* The hardware TX ring is shared by all soft queues, but waking only
+-	 * the queue a completed skb came from leaves every other queue that
+-	 * was stopped on ring-full stopped forever: no completion ever maps
+-	 * to it, so the flows hashed there stall permanently. Wake them all;
+-	 * en75_dev_xmit re-stops queues while the ring is still full. */
+-	if (wake_dev)
+-		netif_tx_wake_all_queues(wake_dev);
 +	return done;
 +}
 +
@@ -755,12 +806,34 @@ index 555d0d6..63090d6 100644
 +	struct en75_qdma *qdma = done_q->qdma;
 +	int id = done_q - &qdma->q_tx_done[0];
 +	int done = en75_tx_done_process(done_q, budget, budget);
-+
++	struct qregs_doneq_state state;
++	int i;
+ 
+-	if (done < budget && napi_complete(napi)) {
 +	if (done < budget && napi_complete_done(napi, done)) {
  		union en75_irq_purpose purpose = IRQ_PURPOSE(DONE, TX, id);
  		union irq_bit b = en751221_irq_bit(purpose);
  
-@@ -524,50 +623,88 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
+@@ -581,67 +669,102 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
+ 
+ 	/* Completions of in-flight packets will not interrupt us; keep
+ 	 * the poll timer running until everything has completed. */
+-	{
+-		int i;
++	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
++		struct en75_q_tx *q = &qdma->q_tx[i];
+ 
+-		for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
+-			if (atomic_read(&qdma->q_tx[i].inflight) > 0) {
+-				en75_tx_done_kick_arm(done_q);
+-				break;
+-			}
++		if (q->ndesc && READ_ONCE(q->nfree) < q->ndesc) {
++			en75_tx_done_kick_arm(done_q);
++			break;
+ 		}
+ 	}
+ 
  	return done;
  }
  
@@ -865,21 +938,25 @@ index 555d0d6..63090d6 100644
 +	}
 +
 +	q->freelist_head = index;
-+	q->nfree -= nr;
++	WRITE_ONCE(q->nfree, q->nfree - nr);
  
  	skb_tx_timestamp(skb);
  
 -	en75_wreg((u32)next_index, &q->qchain_regs->tx_cpui);
 +	/* BQL accounting under the ring lock and before the doorbell: the TX-done NAPI can only see this packet's completion after taking the same lock, so the sent bytes are always accounted before they are completed. */
 +	netdev_tx_sent_queue(txq, skb->len);
-+
+ 
+-	atomic_inc(&q->inflight);
+-	en75_tx_done_kick_arm(&qdma->q_tx_done[0]);
 +	ret = q->nfree < EN75_TX_ROOM ? EBUSY : 0;
-+	if (ret || !netdev_xmit_more())
++	if (ret || !netdev_xmit_more()) {
 +		en75_wreg((u32)index, &q->qchain_regs->tx_cpui);
++		en75_tx_done_kick_arm(&qdma->q_tx_done[0]);
++	}
  
  	if (q->debug_tx_cnt) {
  		int chq;
-@@ -578,8 +715,26 @@ int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
+@@ -652,8 +775,27 @@ int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
  		q->debug_tx_cnt[chq]++;
  	}
  
@@ -895,6 +972,7 @@ index 555d0d6..63090d6 100644
 +
 +	guard(spinlock_bh)(&q->lock_bh);
 +	en75_wreg((u32)q->freelist_head, &q->qchain_regs->tx_cpui);
++	en75_tx_done_kick_arm(&qdma->q_tx_done[0]);
 +}
 +
 +/* True when en75_qdma_xmit() on this ring would accept any skb. */
@@ -908,7 +986,15 @@ index 555d0d6..63090d6 100644
  }
  
  /* Init functions, no locks, assumed non-concurrent */
-@@ -758,6 +913,7 @@ static int en75_init_tx_queue(struct en75_q_tx *q,
+@@ -817,7 +959,6 @@ static int en75_init_tx_queue(struct en75_q_tx *q,
+ 
+ 	spin_lock_init(&q->lock_bh);
+ 	q->ndesc = size;
+-	atomic_set(&q->inflight, 0);
+ 	q->qdma = qdma;
+ 	q->qchain_regs = (qid == 0) ?
+ 			 &qdma->regs->qchain0 :
+@@ -841,6 +982,7 @@ static int en75_init_tx_queue(struct en75_q_tx *q,
  	q->entry[q->ndesc - 1].freelist_next = 0xffff;
  	q->freelist_tail = q->ndesc - 1;
  	q->freelist_head = 0;
@@ -916,15 +1002,15 @@ index 555d0d6..63090d6 100644
  
  	en75_wreg(dma_addr, &q->qchain_regs->txbase);
  
-@@ -921,6 +1077,7 @@ static int en75_init_final(struct en75_qdma *qdma)
+@@ -1004,6 +1146,7 @@ static int en75_init_final(struct en75_qdma *qdma)
  	set_qregs_qcfg_check_done(&qcfg, true);
  	set_qregs_qcfg_tx_wb_done(&qcfg, true);
  	set_qregs_qcfg_burst_size(&qcfg, QREGS_QCFG_BURST_SIZE_128_BYTES);
 +	set_qregs_qcfg_rx_2b_offset(&qcfg, true);
  	en75_wreg(qcfg, &qdma->regs->qdma_cfg);
  
- 	en75_wreg(0U, &qdma->regs->rx_int_delay);
-@@ -992,7 +1149,8 @@ static void en75_qdma_destroy_rxq_locked(struct en75_q_rx *q)
+ 	en75_wreg(0U, &qdma->regs->tx_int_delay);
+@@ -1083,7 +1226,8 @@ static void en75_qdma_destroy_rxq_locked(struct en75_q_rx *q)
  		if (WARN_ON_ONCE(!e->dma_addr))
  			continue;
  
@@ -934,7 +1020,7 @@ index 555d0d6..63090d6 100644
  					page_pool_get_dma_dir(q->page_pool));
  		page_pool_put_full_page(q->page_pool, page, false);
  	}
-@@ -1010,6 +1168,12 @@ static int en75_qdma_destroy_locked(struct en75_qdma *qdma)
+@@ -1101,6 +1245,12 @@ static int en75_qdma_destroy_locked(struct en75_qdma *qdma)
  		return 0;
  	}
  
@@ -947,7 +1033,7 @@ index 555d0d6..63090d6 100644
  	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
  		struct en75_q_rx *q = &qdma->q_rx[i];
  		en75_qdma_destroy_rxq_locked(q);
-@@ -1048,16 +1212,32 @@ int en75_qdma_use(struct en75_qdma *qdma)
+@@ -1141,16 +1291,32 @@ int en75_qdma_use(struct en75_qdma *qdma)
  	if (qdma->users++ > 0)
  		return 0;
  
@@ -983,7 +1069,7 @@ index 555d0d6..63090d6 100644
  
  	return 0;
  }
-@@ -1072,6 +1252,21 @@ int en75_qdma_unuse(struct en75_qdma *qdma)
+@@ -1165,6 +1331,21 @@ int en75_qdma_unuse(struct en75_qdma *qdma)
  	if (--qdma->users > 0)
  		return 0;
  
@@ -1005,9 +1091,16 @@ index 555d0d6..63090d6 100644
  	qcfg = en75_rreg(&qdma->regs->qdma_cfg);
  	set_qregs_qcfg_rx_dma_en(&qcfg, false);
  	set_qregs_qcfg_tx_dma_en(&qcfg, false);
-@@ -1083,26 +1278,37 @@ int en75_qdma_unuse(struct en75_qdma *qdma)
- 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++)
+@@ -1173,32 +1354,43 @@ int en75_qdma_unuse(struct en75_qdma *qdma)
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++)
+ 		napi_disable(&qdma->q_rx[i].napi);
+ 
++	/* NAPI 先停：正在跑的 poll 还可能因环里有在途项再启动定时器，停了 NAPI 之后再取消就不会留下一个对已禁用 NAPI 的调度（发送队列此前已停，不会再有别处启动它） */
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++) {
+-		hrtimer_cancel(&qdma->q_tx_done[i].kick);
  		napi_disable(&qdma->q_tx_done[i].napi);
++		hrtimer_cancel(&qdma->q_tx_done[i].kick);
+ 	}
  
 +	/* Consume every completion record now: a record left in the done queue would be processed after the next open against an entry freed below, or reused by then. */
 +	local_bh_disable();
@@ -1047,15 +1140,16 @@ index 555d0d6..63090d6 100644
 -			q->freelist_tail = j;
 +			e->freelist_next = (j < q->ndesc - 1) ? j + 1 : 0xffff;
  		}
+-		atomic_set(&q->inflight, 0);
 +		q->freelist_head = 0;
 +		q->freelist_tail = q->ndesc - 1;
-+		q->nfree = q->ndesc;
++		WRITE_ONCE(q->nfree, q->ndesc);
 +		en75_wreg(0U, &q->qchain_regs->tx_cpui);
 +		en75_wreg(0U, &q->qchain_regs->tx_hwi);
  	}
  
  	if (qdma->destroying)
-@@ -1139,7 +1345,9 @@ struct en75_qdma *en75_qdma_new(struct en75_eth *eth,
+@@ -1235,7 +1427,9 @@ struct en75_qdma *en75_qdma_new(struct en75_eth *eth,
  	if (!qdma->napi_dev)
  		return ERR_PTR(-ENOMEM);
  
@@ -1066,7 +1160,7 @@ index 555d0d6..63090d6 100644
  	snprintf(qdma->napi_dev->name, sizeof qdma->napi_dev->name, "qdma%d_eth", id);
  
  	err = en75_init(eth->dev, qdma, irqs, num_irqs);
-@@ -1148,6 +1356,12 @@ struct en75_qdma *en75_qdma_new(struct en75_eth *eth,
+@@ -1244,6 +1438,12 @@ struct en75_qdma *en75_qdma_new(struct en75_eth *eth,
  		return ERR_PTR(err);
  	}
  
@@ -1079,7 +1173,7 @@ index 555d0d6..63090d6 100644
  	if (!debug)
  		return qdma;
  
-@@ -1164,6 +1378,7 @@ struct en75_qdma *en75_qdma_new(struct en75_eth *eth,
+@@ -1260,6 +1460,7 @@ struct en75_qdma *en75_qdma_new(struct en75_eth *eth,
  		debug->chains[i].tx_per_ch_q = cntr;
  		qdma->q_tx[i].debug_tx_cnt = cntr;
  
