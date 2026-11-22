@@ -3,6 +3,12 @@
 # 按 band 认 radio，不按段名：段名由 phy 注册顺序决定。每个 phy 一次 add 事件，第二次时值已一致，不再提交、不再重载。
 [ "$ACTION" = "add" ] || exit 0
 
+# 本脚本在 target 共用的 base-files 里，每台 econet 设备都会装上，只在 GS2107 上动作。
+case "$(board_name)" in
+chinamobile,gs2107) ;;
+*) exit 0 ;;
+esac
+
 . /lib/functions/gs2107.sh
 gs2107_recovery_mode || exit 0
 

@@ -15,6 +15,11 @@ mark_boot_ok() {
 }
 
 boot() {
-	# 起来一段时间后才算这次启动成功；放到后台，不拖住排在后面的 init 脚本。
-	( sleep 10; mark_boot_ok ) &
+	# 本脚本在 target 共用的 base-files 里，每台 econet 设备都会装上，只在 GS2107 上动作。
+	case "$(board_name)" in
+	chinamobile,gs2107)
+		# 起来一段时间后才算这次启动成功；放到后台，不拖住排在后面的 init 脚本。
+		( sleep 10; mark_boot_ok ) &
+		;;
+	esac
 }

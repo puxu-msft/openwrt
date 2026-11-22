@@ -12,6 +12,16 @@
 # env 写入走 gs2107_env_set、启动计数清零走 gs2107_bootcount_clear：只在 env 读回来是 GS2107 的 env 时写，只写有变化的值、合成一次 fw_setenv；保留内存里的计数经 uboot-bootcount 驱动清。
 
 . /lib/functions.sh
+
+# 本命令在 target 共用的 base-files 里，每台 econet 设备都会装上；在别的板上写 env 会先把那块板的 fw_env.config 改成 GS2107 的偏移（gs2107_env_config），所以只在 GS2107 上运行。
+case "$(board_name)" in
+chinamobile,gs2107) ;;
+*)
+	echo "gs2107-recovery: this board is $(board_name), not chinamobile,gs2107" >&2
+	exit 1
+	;;
+esac
+
 . /lib/functions/gs2107.sh
 
 HOLD="${GS2107_RECOVERY_HOLD:-/tmp/gs2107-recovery.hold}"
