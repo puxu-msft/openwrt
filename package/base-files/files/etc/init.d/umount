@@ -9,5 +9,8 @@ restart() {
 
 stop() {
 	sync
+	# overlayfs 经私有克隆挂载引用上层文件系统：摘掉可见的 /overlay 照样成功、超级块却没释放，而 -r 只在卸载返回 EBUSY 时才重挂只读，于是上层一直读写挂着直到复位：UBIFS 与 ext4 下次开机要做日志恢复，JFFS2 的写缓冲也没冲下去。趁可见挂载点还在先把它重挂只读，让它干净落盘。
+	grep -qs '^[^ ]* /overlay ' /proc/mounts &&
+		mount -o remount,ro /overlay
 	/bin/umount -a -d -r
 }
