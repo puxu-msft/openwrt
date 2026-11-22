@@ -88,7 +88,8 @@ define Device/chinamobile_gs2107
 	#   退回 tmpfs overlay（/tmp/root），配置每次重启全丢。
 	#   DTS 里 rootfs_data（mtd7 @0x980000，15MB）和内核 CONFIG_MTD_UBI=y
 	#   都已就位，缺的只是用户态这一环。
+	# kmod-uboot-bootcount：U-Boot 把启动计数放在保留内存时（DTS 的 bootcount 节点），gs2107-bootok 经它清零；镜像里少了它，计数清不掉，连续 bootlimit 次热复位后就会改走自救镜像。
 	DEVICE_PACKAGES := kmod-usb2 kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap \
-		block-mount uboot-envtools
+		block-mount uboot-envtools kmod-uboot-bootcount
 endef
 TARGET_DEVICES += chinamobile_gs2107

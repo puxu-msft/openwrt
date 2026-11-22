@@ -1,5 +1,5 @@
 #!/bin/sh /etc/rc.common
-# 自救模式（内核命令行带 gs2107.recovery=1）下空闲时自动回主系统：连续 N 秒（默认 1800，gs2107.recovery_return=<秒> 可改，供测试缩短）既没有 gs2107-recovery hold、也没有登录后的 SSH 会话，就清掉 env 里的 recovery 与 bootcount 并重启；每 15 秒检查一次，看到 hold 或会话就重新计时。计时与判据在 gs2107-recovery auto-return 里。
+# 自救模式（内核命令行带 gs2107.recovery=1）下空闲时自动回主系统：连续 N 秒（默认 1800，gs2107.recovery_return=<秒> 可改，供测试缩短）既没有 gs2107-recovery hold、也没有登录后的 SSH 会话，就把 env 的 recovery 置 0、清掉启动计数并重启；每 15 秒检查一次，看到 hold 或会话就重新计时。计时与判据在 gs2107-recovery auto-return 里。
 # 主系统下不起任何进程。
 START=99
 USE_PROCD=1

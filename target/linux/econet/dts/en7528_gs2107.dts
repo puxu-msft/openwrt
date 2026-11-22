@@ -62,6 +62,18 @@
 			console-size = <0x40000>;
 			ecc-size = <16>;
 		};
+
+		/* U-Boot 启动计数（CONFIG_BOOTCOUNT_GENERIC，CONFIG_SYS_BOOTCOUNT_ADDR = 0xB8100000，即本处经 KSEG1 不缓存的地址）：两个小端 32 位字，偏移 0 是计数、偏移 4 是魔数 0xB001C041；U-Boot 每次启动读出加 1 再存，超过 bootlimit 走 altbootcmd，魔数不符（冷启动）按 0 算，热复位 DRAM 内容保持。紧跟 ramoops 之后，留一页。no-map：内核不把它当普通内存分配，由下面的 bootcount 节点（uboot-bootcount 驱动）按不缓存映射读写。 */
+		bootcount_mem: bootcount@18100000 {
+			reg = <0x18100000 0x1000>;
+			no-map;
+		};
+	};
+
+	/* 系统起来后由 gs2107-bootok 经这里把 U-Boot 的启动计数清零：uboot-bootcount 驱动给本设备一个 sysfs 属性 count（经 /sys/bus/platform/drivers/uboot-bootcount/ 下的设备链接访问），读出计数（魔数不符时为 0），写入 N 存计数 N 与魔数并读回核对。 */
+	bootcount {
+		compatible = "u-boot,bootcount-mem";
+		memory-region = <&bootcount_mem>;
 	};
 
 	chosen {

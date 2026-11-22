@@ -1,15 +1,15 @@
 #!/bin/sh
 # GS2107 单槽 U-Boot 的 recovery 辅助命令，不需要串口。
-# U-Boot 在 env 里 recovery=1 时走 gs_recovery：依次试网络（TFTP boot.scr）→ U 盘 → mtd8 上的自救镜像 → 主系统 NAND。连续 bootlimit（3）次启动没被清掉 bootcount 时，altbootcmd → gs_fallback 在主系统与自救镜像之间轮流（recovery 是 1 就清掉，否则置 1）。主系统的 gs2107-bootok 每次开机清 bootcount；自救模式不清，自救系统反复崩溃时也会轮回主系统。
-# 自救镜像（内核命令行带 gs2107.recovery=1）整个在内存里跑；gs2107-recovery-return 服务在连续 N 秒（默认 1800，内核命令行 gs2107.recovery_return=<秒> 可改）既没有 hold、也没有登录后的 SSH 会话时，清掉 recovery 与 bootcount 并重启，重试主系统。
+# U-Boot 在 env 里 recovery=1 时走 gs_recovery：依次试 U 盘 → 网络（TFTP boot.scr）→ mtd8 上的自救镜像 → 主系统 NAND（U-Boot local/0030 之前的构建是网络在 U 盘之前）。启动计数（新 U-Boot 在保留内存，旧 U-Boot 在 env 的 bootcount）超过 bootlimit（3）时，altbootcmd → gs_fallback 在主系统与自救镜像之间轮流（recovery 是 1 就清掉，否则置 1）。主系统的 gs2107-bootok 每次开机清启动计数；自救模式不清，自救系统反复崩溃时也会轮回主系统。
+# 自救镜像（内核命令行带 gs2107.recovery=1）整个在内存里跑；gs2107-recovery-return 服务在连续 N 秒（默认 1800，内核命令行 gs2107.recovery_return=<秒> 可改）既没有 hold、也没有登录后的 SSH 会话时，清掉 recovery 与启动计数并重启，重试主系统。
 # 子命令：
 #   reboot   置 recovery=1 并重启，下次启动走 gs_recovery
-#   clear    清掉 recovery 与 bootcount（下次启动走正常顺序）
-#   status   打印当前模式、hold 状态与 env 里的 recovery/bootcount/bootok
+#   clear    清掉 recovery 与启动计数（下次启动走正常顺序）
+#   status   打印当前模式、hold 状态、env 里的 recovery/bootcount 与保留内存里的启动计数
 #   hold     阻止自救模式自动回主系统（标记在 /tmp，重启即失）
 #   release  撤销 hold
 #   auto-return  由 gs2107-recovery-return 服务调用，不手动运行
-# env 写入走 gs2107_env_set：只在 env 读回来是 GS2107 的 env 时写，只写有变化的值、合成一次 fw_setenv。
+# env 写入走 gs2107_env_set、启动计数清零走 gs2107_bootcount_clear：只在 env 读回来是 GS2107 的 env 时写，只写有变化的值、合成一次 fw_setenv；保留内存里的计数经 uboot-bootcount 驱动清。
 
 . /lib/functions.sh
 . /lib/functions/gs2107.sh
@@ -56,9 +56,9 @@ auto_return() {
 		fi
 	done
 
-	# 写不进 env 时不重启：recovery 仍是 1，重启只会再进自救镜像；留在这里等人处理。
-	if ! gs2107_env_set gs2107-recovery recovery=0 bootcount=0; then
-		logger -t gs2107-recovery "could not clear recovery in the U-Boot env; staying in recovery mode"
+	# 写不进去时不重启：env 的 recovery 仍是 1 时重启只会再进自救镜像，启动计数没清时可能又被 gs_fallback 翻回自救镜像；留在这里等人处理。
+	if ! gs2107_bootcount_clear gs2107-recovery recovery=0; then
+		logger -t gs2107-recovery "could not clear recovery and the boot counter; staying in recovery mode"
 		return 1
 	fi
 	logger -t gs2107-recovery "idle for $((now - last))s (no hold, no SSH session); rebooting into the main system"
@@ -76,8 +76,8 @@ case "$1" in
 		reboot
 		;;
 	clear)
-		gs2107_env_set gs2107-recovery recovery=0 bootcount=0 || {
-			echo "U-Boot env not written (see logread -e gs2107-recovery)" >&2
+		gs2107_bootcount_clear gs2107-recovery recovery=0 || {
+			echo "recovery or the boot counter not cleared (see logread -e gs2107-recovery)" >&2
 			exit 1
 		}
 		;;
@@ -92,7 +92,12 @@ case "$1" in
 		else
 			echo "hold: no"
 		fi
-		fw_printenv recovery bootcount bootok 2>/dev/null
+		fw_printenv recovery bootcount 2>/dev/null
+		if ram="$(gs2107_bootcount_ram)"; then
+			echo "boot counter in RAM: $(cat "$ram" 2>/dev/null)"
+		else
+			echo "boot counter in RAM: not available (uboot-bootcount not bound)"
+		fi
 		;;
 	hold)
 		touch "$HOLD"
