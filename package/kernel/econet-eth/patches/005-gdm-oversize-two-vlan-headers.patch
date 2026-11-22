@@ -1,0 +1,62 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: GDM 收包超长门限给两层 802.1Q 头留位
+
+超长门限原为 ETH_HLEN + mtu + ETH_FCS_LEN。DSA conduit 的 MTU（1504）含 MediaTek 标签、不含 VLAN 头，而交换机把 VLAN 帧送 CPU 口时 802.1Q 头跟在特殊标签之后（mt7530 CPU 口 egress 为 MT7530_VLAN_EGRESS_STACK），满长的 802.1Q 帧在 GDM 处为 14 + 4 + 4 + 1500 + 4 = 1526 字节、QinQ 为 1530 字节，按寄存器的字面语义都超过原门限 1522（也是寄存器复位值）。门限改为 ETH_HLEN + 2 × VLAN_HLEN + mtu + ETH_FCS_LEN，max_mtu 按同一长度推出，使这样一帧仍装得进一个 RX 缓冲（conduit 的 max_mtu 1708 → 1700）。
+
+GS2107 实测里旧门限没有可观察的丢弃：2026-11-14 单层 VLAN 的 1526 字节帧在旧门限 1522 下照收；2026-11-22 把 lan3 MTU 设为 1504（conduit 1508，交换机收包上限 1536）后，满长 QinQ 帧（GDM 处 1530 字节）在旧门限 1526 与新门限 1534 下都进了 GDM、到达 VLAN 接口。即寄存器的实际计数比驱动注释写的少至少 4 字节（可能不计 MediaTek 标签），主机网卡发不出更长的帧，再往上未测。本改动按寄存器的设计语义给两层 VLAN 留出余量。
+
+diff --git a/econet_eth.h b/econet_eth.h
+index fe4249f..e23d0a9 100644
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -6,6 +6,7 @@
+ #include <linux/skbuff.h>
+ #include <linux/platform_device.h>
+ #include <linux/netdevice.h>
++#include <linux/if_vlan.h>
+ 
+ #include "asm-generic/int-ll64.h"
+ #include "qdma_desc.h"
+@@ -36,8 +37,10 @@ struct en75_soc_data {
+ /* RX buffers start with NET_SKB_PAD of headroom and the QDMA writes each frame 2 more bytes in (RX_2B_OFFSET), so the IP header behind a 14-byte Ethernet header or an 18-byte MediaTek-tagged one is 4-byte aligned (MIPS traps on unaligned loads and emulates them) and forwarding pushes its headers without reallocating the skb. */
+ #define EN75_RX_HW_OFFSET	2
+ #define EN75_RX_HEADROOM	(NET_SKB_PAD + EN75_RX_HW_OFFSET)
+-/* Largest frame (with FCS) one RX buffer holds. The MTU is capped so that the GDM, which drops frames longer than ETH_HLEN + mtu + ETH_FCS_LEN, never passes a frame that would need a second descriptor. */
++/* Largest frame (with FCS) one RX buffer holds. */
+ #define EN75_RX_MAX_FRAME	(SKB_WITH_OVERHEAD(EN75_MAX_PACKET_SIZE) - EN75_RX_HEADROOM)
++/* GDM 收包超长门限（rx_len_threshold.oversize_len，按原驱动注释含 FCS）：MTU 之外再留两个 802.1Q 头，满长的单层 VLAN 与 QinQ 帧都放得下。DSA conduit 的 MTU 已含 MediaTek 标签（DSA 把标签开销加在 conduit MTU 上），带 VLAN 的帧在标签之后仍保留自己的 802.1Q 头（交换机 CPU 口按 MT7530_VLAN_EGRESS_STACK 把它放在特殊标签之后，tag_mtk 只去掉标签）。MTU 上限按同一长度算，使这样一帧连同 FCS 仍装得进一个 RX 缓冲。 */
++#define EN75_RX_FRAME_LEN(mtu)	(ETH_HLEN + 2 * VLAN_HLEN + (mtu) + ETH_FCS_LEN)
+ 
+ /* TX descriptors one skb can take: the linear part plus every page fragment. */
+ #define EN75_TX_MAX_DESCS	(MAX_SKB_FRAGS + 1)
+diff --git a/econet_port.c b/econet_port.c
+index 07ff45a..d52301e 100644
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -187,7 +187,7 @@ static int en75_dev_open(struct net_device *dev)
+ 	scoped_guard(spinlock_bh, &port->reg_lock) {
+ 		rlt = en75_rreg(&port->regs->rx_len_threshold);
+ 		set_gdm_len_th_runt_len(&rlt, 60);
+-		set_gdm_len_th_oversize_len(&rlt, ETH_HLEN + dev->mtu + ETH_FCS_LEN);
++		set_gdm_len_th_oversize_len(&rlt, EN75_RX_FRAME_LEN(dev->mtu));
+ 		en75_wreg(rlt, &port->regs->rx_len_threshold);
+ 	}
+ 
+@@ -215,7 +215,7 @@ static int en75_dev_change_mtu(struct net_device *dev, int mtu)
+ 
+ 	guard(spinlock_bh)(&port->reg_lock);
+ 	rlt = en75_rreg(&port->regs->rx_len_threshold);
+-	set_gdm_len_th_oversize_len(&rlt, ETH_HLEN + mtu + ETH_FCS_LEN);
++	set_gdm_len_th_oversize_len(&rlt, EN75_RX_FRAME_LEN(mtu));
+ 	en75_wreg(rlt, &port->regs->rx_len_threshold);
+ 
+ 	WRITE_ONCE(dev->mtu, mtu);
+@@ -545,7 +545,7 @@ struct net_device *en75_alloc_gdm_port(struct en75_eth *eth,
+ 
+ 	ndev->netdev_ops = &en75_netdev_ops;
+ 	ndev->ethtool_ops = &en75_ethtool_ops;
+-	ndev->max_mtu = EN75_RX_MAX_FRAME - ETH_HLEN - ETH_FCS_LEN;
++	ndev->max_mtu = EN75_RX_MAX_FRAME - EN75_RX_FRAME_LEN(0);
+ 	ndev->watchdog_timeo = 5 * HZ;
+ 
+ 	/*
