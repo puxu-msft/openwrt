@@ -1,0 +1,13 @@
+#!/bin/sh
+# 建 netconsole 的配置段（缺省不启用），已有的不动；启用方法见 /etc/init.d/netconsole 的头注。
+
+uci -q get system.netconsole >/dev/null && exit 0
+uci -q batch <<'EOF'
+set system.netconsole=netconsole
+set system.netconsole.enabled='0'
+set system.netconsole.interface='lan'
+set system.netconsole.remote_port='6666'
+set system.netconsole.local_port='6665'
+commit system
+EOF
+exit 0

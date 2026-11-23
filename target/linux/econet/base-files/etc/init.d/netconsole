@@ -1,0 +1,52 @@
+#!/bin/sh /etc/rc.common
+# netconsole 按需启用：读 /etc/config/system 的 netconsole 段，接口 up 与配置变化时带参重新加载模块。
+# OpenWrt 的 modprobe 不传命令行上的模块参数，开机 kmodloader 按 /etc/modules.d 加载时网桥还不存在，所以目标要等接口 up 后由这里 insmod 带参；enabled 为 0 时卸掉模块。
+# 选项：enabled（缺省 0）、remote_ip（必填）、remote_mac（缺省空，即以太网广播）、remote_port（缺省 6666）、local_port（缺省 6665）、interface（逻辑接口，缺省 lan）。
+# 崩溃时内核会把控制台级别提到最高，oops 与 panic 全文都会送出；平时只送控制台级别以内的消息（/proc/sys/kernel/printk 第一项）。
+# 依赖 econet-eth 包补丁 008：没有它时，经 DSA 用户口（如 br-lan 下的 lan1）发出的第一帧就让 TX 完成路径在 dql_completed() 里 BUG 致 panic（GS2107 实测）。
+
+START=99
+USE_PROCD=1
+
+load_netconsole() {
+	local enabled iface rip rmac rport lport dev lip
+	config_load system
+	config_get_bool enabled netconsole enabled 0
+	config_get iface netconsole interface lan
+	config_get rip netconsole remote_ip
+	config_get rmac netconsole remote_mac
+	config_get rport netconsole remote_port 6666
+	config_get lport netconsole local_port 6665
+	rmmod netconsole 2>/dev/null
+	[ "$enabled" = 1 ] || return 0
+	[ -n "$rip" ] || { logger -t netconsole "system.netconsole.remote_ip 未配置，不启用"; return 0; }
+	. /lib/functions/network.sh
+	network_get_device dev "$iface" && network_get_ipaddr lip "$iface" ||
+		{ logger -t netconsole "接口 $iface 未就绪，等它 up 后再加载"; return 0; }
+	if insmod netconsole "netconsole=${lport}@${lip}/${dev},${rport}@${rip}/${rmac}"; then
+		logger -t netconsole "已启用：$lip:$lport（$dev）→ $rip:$rport${rmac:+（$rmac）}"
+	else
+		logger -t netconsole "netconsole 加载失败，原因见 dmesg"
+	fi
+}
+
+start_service() {
+	load_netconsole
+}
+
+reload_service() {
+	load_netconsole
+}
+
+stop_service() {
+	rmmod netconsole 2>/dev/null
+	return 0
+}
+
+service_triggers() {
+	local iface
+	config_load system
+	config_get iface netconsole interface lan
+	procd_add_reload_trigger system
+	procd_add_reload_interface_trigger "$iface"
+}
