@@ -157,6 +157,13 @@
 		status = "disabled";
 	};
 
+	crypto: crypto@1fb70000 {
+		compatible = "inside-secure,safexcel-eip93ies";
+		reg = <0x1fb70000 0x1000>;
+		interrupt-parent = <&gic>;
+		interrupts = <GIC_SHARED 28 IRQ_TYPE_LEVEL_HIGH>;
+	};
+
 	uart: serial@1fbf0000 {
 		compatible = "airoha,en7523-uart";
 		reg = <0x1fbf0000 0x30>;

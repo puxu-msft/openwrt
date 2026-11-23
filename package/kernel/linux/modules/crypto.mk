@@ -523,8 +523,9 @@ $(eval $(call KernelPackage,crypto-hw-talitos))
 
 define KernelPackage/crypto-hw-eip93
   TITLE:=MTK EIP93 crypto module
-  DEPENDS:=@(TARGET_ramips_mt7621||TARGET_airoha) \
+  DEPENDS:=@(TARGET_ramips_mt7621||TARGET_airoha||TARGET_econet_en7528) \
 	+kmod-crypto-authenc \
+	+kmod-crypto-cbc \
 	+kmod-crypto-des \
 	+kmod-crypto-md5 \
 	+kmod-crypto-sha1 \
