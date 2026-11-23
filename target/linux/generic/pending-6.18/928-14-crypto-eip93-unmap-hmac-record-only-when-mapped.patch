@@ -1,0 +1,39 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xp <a.xp@live.com>
+Date: Mon, 23 Nov 2026 19:48:40 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20=E5=8F=AA=E6=92=A4?=
+ =?utf-8?q?=E9=94=80=E6=98=A0=E5=B0=84=E8=BF=87=E7=9A=84=20HMAC=20?=
+ =?utf-8?q?=E6=9C=AB=E5=9D=97=20SA=20=E8=AE=B0=E5=BD=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：hmac(md5/sha1/sha224/sha256)-eip93 每次放了描述符的 update 完成时，eip93_hash_handle_result() 经 eip93_hash_free_sa_record() 撤销 rctx->sa_record_hmac_base，而这份记录只在交最后一块（final、finup、digest）时才映射；update 时它没有映射过，第一次 update 时这个字段还是请求上下文里未初始化的值（ahash_request_alloc 不清零）。开 CONFIG_DMA_API_DEBUG 时每次都会报撤销未分配的映射；有 swiotlb 的平台会把这个垃圾地址交给 swiotlb 去撤销。上游原样驱动同样如此（评审指出，读码）。
+
+根因：撤销的条件只看 IS_HMAC，映射的条件是 IS_HMAC 且 finalize 且不是 partial_hash（eip93_send_hash_req()）。
+
+改法：撤销用与映射相同的条件；完成回调里 finalize、partial_hash 仍是交最后一块时的值。
+
+实测（EN7528）：本平台 dma-direct、没有 swiotlb，撤销 TO_DEVICE 映射不做 cache 操作，修前修后功能相同；testmgr FULL（含 hmac 的分段 update）、repro 的 hmac 长密钥一项与压力测试里的 hmac 变体通过；本内核没开 DMA_API_DEBUG，修前的报错没有上机复现（读码）。详见 build/research/eip93-driver-fixes.md。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-hash.c | 3 ++-
+ 1 file changed, 2 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index ecea141..a089bf4 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -47,7 +47,8 @@ static void eip93_hash_free_sa_record(struct ahash_request *req)
+ 	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
+ 	struct eip93_device *eip93 = ctx->eip93;
+ 
+-	if (IS_HMAC(ctx->flags))
++	/* HMAC 末块用的记录只在交最后一块时映射（eip93_send_hash_req()），条件与那里相同；update 完成时它没有映射，sa_record_hmac_base 是未初始化的值 */
++	if (IS_HMAC(ctx->flags) && rctx->finalize && !rctx->partial_hash)
+ 		dma_unmap_single(eip93->dev, rctx->sa_record_hmac_base,
+ 				 sizeof(rctx->sa_record_hmac), DMA_TO_DEVICE);
+ 
+-- 
+2.56.1
+

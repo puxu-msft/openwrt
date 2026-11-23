@@ -1,0 +1,99 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 15:54:56 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20authenc=20=E7=9A=84?=
+ =?utf-8?q?=E9=95=BF=E8=AE=A4=E8=AF=81=E5=AF=86=E9=92=A5=E6=8C=89=20hash?=
+ =?utf-8?q?=20=E7=9A=84=E6=91=98=E8=A6=81=E9=95=BF=E5=BA=A6=E6=88=AA?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：authenc(hmac(sha256),cbc(aes)) 的认证密钥超过 64 字节时 ICV 全错。实测（EN7528，0001–0004 的驱动，crypto-atomic 对照 authenc(hmac-sha256-lib,cbc(aes-generic))，1504 B、64 个请求）：认证密钥 64 字节全部一致；65 字节、100 字节时 64 个请求全部不一致，只差在最后 16 字节（ICV）。单独的 hmac(sha256-eip93) 用 100 字节密钥一致。
+
+根因：HMAC 的密钥长于块长（64 字节）时先换成它的摘要（RFC 2104），eip93_hmac_setkey() 把换后的长度设成调用方传入的 hashlen。hmac 的 setkey 传的是摘要长度，对；authenc 的 setkey（eip93_aead_setkey()）传的却是 ctx->authsize，即 ICV 截断长度（ESP 常用 16），而且 setkey 时 setauthsize 往往还没调，这个值是 0。于是 SHA-256 的 32 字节摘要只用了前 16（或 0）个字节当密钥。
+
+改法：eip93_hmac_setkey() 用它自己分配的 sha*-eip93 的 crypto_ahash_digestsize() 作为换后的密钥长度，去掉 hashlen 参数，两个调用方随之改。
+
+实测：见 build/research/eip93-driver-fixes.md（同样的 65、100 字节认证密钥全部一致）。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-aead.c   | 4 ++--
+ drivers/crypto/inside-secure/eip93/eip93-common.c | 6 +++---
+ drivers/crypto/inside-secure/eip93/eip93-common.h | 3 +--
+ drivers/crypto/inside-secure/eip93/eip93-hash.c   | 5 ++---
+ 4 files changed, 8 insertions(+), 10 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-aead.c b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+index 41962de..18c1c0e 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-aead.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+@@ -145,8 +145,8 @@ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+ 
+ 	/* authentication key */
+ 	ret = eip93_hmac_setkey(ctx->flags, keys.authkey, keys.authkeylen,
+-				ctx->authsize, sa_record->sa_i_digest,
+-				sa_record->sa_o_digest, false);
++				sa_record->sa_i_digest, sa_record->sa_o_digest,
++				false);
+ 	eip93_sa_records_end_update(ctx);
+ 
+ 	return ret;
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.c b/drivers/crypto/inside-secure/eip93/eip93-common.c
+index 0b12e78..7e46ee8 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.c
+@@ -947,8 +947,7 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx
+ }
+ 
+ int eip93_hmac_setkey(u32 ctx_flags, const u8 *key, unsigned int keylen,
+-		      unsigned int hashlen, u8 *dest_ipad, u8 *dest_opad,
+-		      bool skip_ipad)
++		      u8 *dest_ipad, u8 *dest_opad, bool skip_ipad)
+ {
+ 	u8 ipad[SHA256_BLOCK_SIZE], opad[SHA256_BLOCK_SIZE];
+ 	struct crypto_ahash *ahash_tfm;
+@@ -1002,7 +1001,8 @@ int eip93_hmac_setkey(u32 ctx_flags, const u8 *key, unsigned int keylen,
+ 		if (ret)
+ 			goto err_req;
+ 
+-		keylen = hashlen;
++		/* 长密钥换成它的摘要（RFC 2104），长度是这个 hash 的摘要长度 */
++		keylen = crypto_ahash_digestsize(ahash_tfm);
+ 	} else {
+ 		memcpy(ipad, key, keylen);
+ 	}
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.h b/drivers/crypto/inside-secure/eip93/eip93-common.h
+index 44cc29c..4e5304d 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.h
+@@ -40,7 +40,6 @@ void eip93_set_sa_record(struct sa_record *sa_record, const unsigned int keylen,
+ int eip93_parse_ctrl_stat_err(struct eip93_device *eip93, int err);
+ 
+ int eip93_hmac_setkey(u32 ctx_flags, const u8 *key, unsigned int keylen,
+-		      unsigned int hashlen, u8 *ipad, u8 *opad,
+-		      bool skip_ipad);
++		      u8 *ipad, u8 *opad, bool skip_ipad);
+ 
+ #endif /* _EIP93_COMMON_H_ */
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index d3a6ade..ae56a2e 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -804,12 +804,11 @@ void eip93_hash_work(struct work_struct *work)
+ static int eip93_hash_hmac_setkey(struct crypto_ahash *ahash, const u8 *key,
+ 				  u32 keylen)
+ {
+-	unsigned int digestsize = crypto_ahash_digestsize(ahash);
+ 	struct crypto_tfm *tfm = crypto_ahash_tfm(ahash);
+ 	struct eip93_hash_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	return eip93_hmac_setkey(ctx->flags, key, keylen, digestsize,
+-				 ctx->ipad, ctx->opad, true);
++	return eip93_hmac_setkey(ctx->flags, key, keylen, ctx->ipad, ctx->opad,
++				 true);
+ }
+ 
+ static int eip93_hash_cra_init(struct crypto_tfm *tfm)
+-- 
+2.56.1
+

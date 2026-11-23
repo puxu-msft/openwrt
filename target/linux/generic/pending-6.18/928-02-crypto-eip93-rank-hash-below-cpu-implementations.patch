@@ -1,0 +1,119 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 09:21:04 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20=E5=8D=95=E7=8B=AC?=
+ =?utf-8?q?=E7=9A=84=20hash/hmac=20=E6=8E=92=E5=88=B0=20CPU=20=E5=AE=9E?=
+ =?utf-8?q?=E7=8E=B0=E4=B9=8B=E5=90=8E?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：eip93 的 md5、sha1、sha224、sha256 及对应 hmac 的 cra_priority 是 300，与 CPU 上的库实现（crypto/md5.c、sha1.c、sha256.c 的 *-lib 与 hmac-*-lib）相同。同优先级时后注册的胜出（crypto/algapi.c 把新算法插在 crypto_alg_list 头部，crypto/api.c 只在优先级严格更高时换人），驱动后装载，按通用名字取 hash/hmac 就会选中引擎。
+
+依据：引擎做单独的 hash 时按 64 字节块各发一个描述符、每块先拷进单独分配的缓冲，实测（EN7528，6.18.60，发请求的线程钉在 CPU2）HMAC-SHA256 在 64、256、1500 B 都比 CPU 慢，每核效率约为 CPU 的 0.6。补丁前按通用名字取 hmac(sha256) 选中 hmac(sha256-eip93)，1500 B 单在途 102.4 Mbps、合计占用 1.20 个 VPE；补丁后选中 hmac-sha256-lib，157.4 Mbps、占用 1.01 个 VPE。
+
+改法：单独的 hash/hmac 优先级改为 200（EIP93_CRA_HASH_PRIORITY），低于库实现的 300；kmod-crypto-hw-eip93 依赖 kmod-crypto-md5/sha1/sha256，库实现总在，没有装载时仍会选中引擎。authenc 组合仍是 1500，它在大包上远快于 CPU；authenc 的 setkey 按驱动名 sha*-eip93 预算 HMAC 的 ipad/opad，不受优先级影响。
+
+上游：torvalds/master 截至 2026-11-23 仍是 300。2026-07 的 “crypto: introduce generic dynamic software fallback and EIP93 support” 想按包长动态改选软件实现，Herbert Xu 回复这类取舍用算法优先级调整即可（https://lore.kernel.org/linux-crypto/anmEDI6cQxS1wGtH@gondor.apana.org.au/）。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-hash.c | 16 ++++++++--------
+ drivers/crypto/inside-secure/eip93/eip93-main.h |  6 ++++++
+ 2 files changed, 14 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index f241e9b..d9fe9d4 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -883,7 +883,7 @@ struct eip93_alg_template eip93_alg_md5 = {
+ 			.base = {
+ 				.cra_name = "md5",
+ 				.cra_driver_name = "md5-eip93",
+-				.cra_priority = 300,
++				.cra_priority = EIP93_CRA_HASH_PRIORITY,
+ 				.cra_flags = CRYPTO_ALG_ASYNC |
+ 						CRYPTO_ALG_KERN_DRIVER_ONLY |
+ 						CRYPTO_ALG_ALLOCATES_MEMORY,
+@@ -913,7 +913,7 @@ struct eip93_alg_template eip93_alg_sha1 = {
+ 			.base = {
+ 				.cra_name = "sha1",
+ 				.cra_driver_name = "sha1-eip93",
+-				.cra_priority = 300,
++				.cra_priority = EIP93_CRA_HASH_PRIORITY,
+ 				.cra_flags = CRYPTO_ALG_ASYNC |
+ 						CRYPTO_ALG_KERN_DRIVER_ONLY |
+ 						CRYPTO_ALG_ALLOCATES_MEMORY,
+@@ -943,7 +943,7 @@ struct eip93_alg_template eip93_alg_sha224 = {
+ 			.base = {
+ 				.cra_name = "sha224",
+ 				.cra_driver_name = "sha224-eip93",
+-				.cra_priority = 300,
++				.cra_priority = EIP93_CRA_HASH_PRIORITY,
+ 				.cra_flags = CRYPTO_ALG_ASYNC |
+ 						CRYPTO_ALG_KERN_DRIVER_ONLY |
+ 						CRYPTO_ALG_ALLOCATES_MEMORY,
+@@ -973,7 +973,7 @@ struct eip93_alg_template eip93_alg_sha256 = {
+ 			.base = {
+ 				.cra_name = "sha256",
+ 				.cra_driver_name = "sha256-eip93",
+-				.cra_priority = 300,
++				.cra_priority = EIP93_CRA_HASH_PRIORITY,
+ 				.cra_flags = CRYPTO_ALG_ASYNC |
+ 						CRYPTO_ALG_KERN_DRIVER_ONLY |
+ 						CRYPTO_ALG_ALLOCATES_MEMORY,
+@@ -1004,7 +1004,7 @@ struct eip93_alg_template eip93_alg_hmac_md5 = {
+ 			.base = {
+ 				.cra_name = "hmac(md5)",
+ 				.cra_driver_name = "hmac(md5-eip93)",
+-				.cra_priority = 300,
++				.cra_priority = EIP93_CRA_HASH_PRIORITY,
+ 				.cra_flags = CRYPTO_ALG_ASYNC |
+ 						CRYPTO_ALG_KERN_DRIVER_ONLY |
+ 						CRYPTO_ALG_ALLOCATES_MEMORY,
+@@ -1035,7 +1035,7 @@ struct eip93_alg_template eip93_alg_hmac_sha1 = {
+ 			.base = {
+ 				.cra_name = "hmac(sha1)",
+ 				.cra_driver_name = "hmac(sha1-eip93)",
+-				.cra_priority = 300,
++				.cra_priority = EIP93_CRA_HASH_PRIORITY,
+ 				.cra_flags = CRYPTO_ALG_ASYNC |
+ 						CRYPTO_ALG_KERN_DRIVER_ONLY |
+ 						CRYPTO_ALG_ALLOCATES_MEMORY,
+@@ -1066,7 +1066,7 @@ struct eip93_alg_template eip93_alg_hmac_sha224 = {
+ 			.base = {
+ 				.cra_name = "hmac(sha224)",
+ 				.cra_driver_name = "hmac(sha224-eip93)",
+-				.cra_priority = 300,
++				.cra_priority = EIP93_CRA_HASH_PRIORITY,
+ 				.cra_flags = CRYPTO_ALG_ASYNC |
+ 						CRYPTO_ALG_KERN_DRIVER_ONLY |
+ 						CRYPTO_ALG_ALLOCATES_MEMORY,
+@@ -1097,7 +1097,7 @@ struct eip93_alg_template eip93_alg_hmac_sha256 = {
+ 			.base = {
+ 				.cra_name = "hmac(sha256)",
+ 				.cra_driver_name = "hmac(sha256-eip93)",
+-				.cra_priority = 300,
++				.cra_priority = EIP93_CRA_HASH_PRIORITY,
+ 				.cra_flags = CRYPTO_ALG_ASYNC |
+ 						CRYPTO_ALG_KERN_DRIVER_ONLY |
+ 						CRYPTO_ALG_ALLOCATES_MEMORY,
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-main.h b/drivers/crypto/inside-secure/eip93/eip93-main.h
+index cbc37fd..63e3eaf 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-main.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-main.h
+@@ -25,6 +25,12 @@
+ #define EIP93_REQ_ID_NUM		(FIELD_MAX(EIP93_PE_USER_ID_CRYPTO_IDR) + 1)
+ #define EIP93_RING_BUSY			32
+ #define EIP93_CRA_PRIORITY		1500
++/*
++ * 单独的 hash/hmac 排在 CPU 上的库实现（md5-lib、sha1-lib、sha256-lib 及其 hmac，优先级 300）后面：引擎按 64 字节块
++ * 各发一个描述符、每块先拷进单独分配的缓冲，实测（EN7528）各种长度都比 CPU 慢。CPU 实现没有装载时仍会选中引擎。
++ * 按驱动名取用不受影响（如 authenc 的 setkey 里算 HMAC 的 ipad/opad）
++ */
++#define EIP93_CRA_HASH_PRIORITY		200
+ 
+ #define EIP93_RING_SA_STATE_ADDR(base, idx)	((base) + (idx))
+ #define EIP93_RING_SA_STATE_DMA(dma_base, idx)	((u32 __force)(dma_base) + \
+-- 
+2.56.1
+

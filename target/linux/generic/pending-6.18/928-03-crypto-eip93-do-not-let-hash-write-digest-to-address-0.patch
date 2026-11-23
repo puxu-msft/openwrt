@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 14:25:45 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20hash=20=E4=B8=8D=E5=86=8D?=
+ =?utf-8?q?=E8=AE=A9=E5=BC=95=E6=93=8E=E6=8A=8A=E6=91=98=E8=A6=81=E5=86=99?=
+ =?utf-8?q?=E5=88=B0=E7=89=A9=E7=90=86=E5=9C=B0=E5=9D=80=200?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：EN7528（内核 6.18.60）上用 EIP-93 做 hash，或做 authenc/hmac 的 setkey 时，物理地址 0x00000000 起的一段（摘要长度，SHA-256 为 32 字节）被反复改写成随机样的内容。EN7528 的物理页 0 是普通内存，页缓存把某个可执行文件或共享库的页放在那里时就被写坏：实测三次，init（procd）执行到坏页收到 SIGILL、内核 panic；/lib/libc.so 第 0 页（ELF 头）坏后任何动态程序 exec 都返回 -ELIBBAD（musl 打成 “No error information”），SSH 再也进不去；/sbin/procd 第 17 页的前 32 字节被改。三次都没有任何内核告警。
+
+根因：eip93_send_hash_req() 的描述符以 `= { }` 初始化后不设 dst_addr，输出地址是 0；__eip93_hash_init() 经 eip93_set_sa_record() 得到的 SA 记录带 EIP93_SA_CMD_COPY_DIGEST 与 EIP93_SA_CMD_COPY_PAD（该函数对带 hash 的算法都置这两位，authenc 需要它们把 ICV 写进输出），引擎于是把摘要写进输出地址 0。驱动取摘要用的是 SAVE_HASH 存进 sa_state 的那一份（eip93_hash_handle_result()），从不读输出。authenc 的 setkey 经 eip93_hmac_setkey() 用 sha*-eip93 对 ipad、opad 各做一次部分 hash（hmac 的 setkey 只做 opad；认证密钥超过 64 字节时还要先做一次摘要），所以每装一个 IPsec SA 至少写两次物理地址 0。
+
+改法：hash 的 SA 记录清掉 COPY_DIGEST 与 COPY_PAD；HMAC 末块用的 sa_record_hmac 是它的副本，一并不带。
+
+实测（EN7528，同一次启动，物理页 0 恰好是 /sbin/procd 的页缓存页，经 /dev/mem 读物理 0x0..0x1f）：补丁前，cbc(aes-eip93) 跑 1 s（16212 个请求）不变，sha256-eip93 跑 1 s 后变，authenc(hmac(sha256-eip93),cbc(aes-eip93)) 跑 1 s 后又变；原样上游驱动跑 sha256-eip93 同样会变。补丁后上述三项以及 hmac(sha256)、ecb(aes)、md5/sha1/sha224 各跑 1 s 都不变；testmgr FULL 32/32；软中断里压满环的原子上下文压力测试 10 轮共 140 个变体全部通过，其间常驻的页缓存核对没有发现任何改写。
+
+上游：torvalds/master（drivers/crypto/inside-secure/eip93 最新提交 4dd10fbbeb9c，2026-11-06）的 eip93-hash.c 同样不设 dst_addr、eip93-common.c 同样对 hash 置这两位；lore linux-crypto 上没有见到针对它的补丁。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-hash.c | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index d9fe9d4..6ece415 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -166,6 +166,12 @@ static void __eip93_hash_init(struct ahash_request *req)
+ 	digestsize = crypto_ahash_digestsize(ahash);
+ 
+ 	eip93_set_sa_record(sa_record, 0, ctx->flags);
++	/*
++	 * hash 的描述符没有输出缓冲（dst_addr 为 0），摘要由 SAVE_HASH 存进 sa_state，结果从那里取。
++	 * eip93_set_sa_record() 给带 hash 的 SA 置的 COPY_DIGEST、COPY_PAD 会让引擎把摘要（SHA-256 为 32 字节）写进输出，即物理地址 0。
++	 * 这里清掉这两位；HMAC 末块用的 sa_record_hmac 由下面复制，一并不带。
++	 */
++	sa_record->sa_cmd1_word &= ~(EIP93_SA_CMD_COPY_DIGEST | EIP93_SA_CMD_COPY_PAD);
+ 	sa_record->sa_cmd0_word |= EIP93_SA_CMD_HASH_FROM_STATE;
+ 	sa_record->sa_cmd0_word |= EIP93_SA_CMD_SAVE_HASH;
+ 	sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_OPCODE;
+-- 
+2.56.1
+

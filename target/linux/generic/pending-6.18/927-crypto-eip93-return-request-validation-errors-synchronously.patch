@@ -1,0 +1,69 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Gleb Pesin <dormancygrace@gmail.com>
+Date: Fri, 20 Nov 2026 19:37:18 +0000
+Subject: [PATCH] crypto: eip93 - return request validation errors
+ synchronously
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+The skcipher and AEAD paths validate requests before submitting them
+to the hardware. On validation failure they invoke the completion
+callback and return the same error. Callers handle that return value
+as a synchronous failure and can complete the request a second time.
+
+Return the validation error directly in both paths. Keep completion
+callbacks in the hardware result handlers.
+
+Codex (gpt-6.2-sol) assisted with comparing the two paths, preparing the
+change and writing the changelog. The corresponding OpenWrt 6.18.64
+driver object was cross-compiled on MIPS.
+
+[本地回移说明] 回移自 linux-crypto 上在审的补丁（2026-11-20 发出；截至 2026-11-23 未进 herbert/cryptodev-2.6、linux-next 与 torvalds/master）；OpenWrt PR #26838 以 target/linux/generic/pending-6.18/927 携带同一改动（未合并）。现象：skcipher/aead 的请求校验失败（含反弹缓冲分配失败的 -ENOMEM）时既调完成回调又返回错误，调用方按同步失败处理后同一请求被完成两次。本组下一个补丁让 GFP_ATOMIC 分配失败、环满等情况同步返回错误，依赖本补丁不再在同步出错时调完成回调。原文照录，未改动。
+
+Fixes: 9739f5f93b78 ("crypto: eip93 - Add Inside Secure SafeXcel EIP-93 crypto engine support")
+Reported-by: Herbert Xu <herbert@gondor.apana.org.au>
+Closes: https://lore.kernel.org/linux-crypto/aXxmIuU9PKJiDs7n@gondor.apana.org.au/
+Signed-off-by: Gleb Pesin <dormancygrace@gmail.com>
+Link: https://lore.kernel.org/linux-crypto/20261120-eip93-sync-errors-v1-1-1a83ae607181@gmail.com/
+Link: https://github.com/openwrt/openwrt/pull/26838
+---
+ drivers/crypto/inside-secure/eip93/eip93-aead.c   | 4 +---
+ drivers/crypto/inside-secure/eip93/eip93-cipher.c | 4 +---
+ 2 files changed, 2 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-aead.c b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+index 18dd8a9..89e230d 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-aead.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+@@ -47,10 +47,8 @@ static int eip93_aead_send_req(struct crypto_async_request *async)
+ 	int err;
+ 
+ 	err = check_valid_request(rctx);
+-	if (err) {
+-		aead_request_complete(req, err);
++	if (err)
+ 		return err;
+-	}
+ 
+ 	return eip93_send_req(async, req->iv, rctx);
+ }
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.c b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+index 1f2d684..26c2884 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+@@ -38,10 +38,8 @@ static int eip93_skcipher_send_req(struct crypto_async_request *async)
+ 
+ 	err = check_valid_request(rctx);
+ 
+-	if (err) {
+-		skcipher_request_complete(req, err);
++	if (err)
+ 		return err;
+-	}
+ 
+ 	return eip93_send_req(async, req->iv, rctx);
+ }
+-- 
+2.56.1
+

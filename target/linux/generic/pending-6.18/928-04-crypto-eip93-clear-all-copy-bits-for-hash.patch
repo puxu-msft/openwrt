@@ -1,0 +1,46 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 15:50:18 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20hash=20=E7=9A=84=20SA=20?=
+ =?utf-8?q?=E8=AE=B0=E5=BD=95=E4=B8=8D=E5=B8=A6=E4=BB=BB=E4=BD=95=20COPY?=
+ =?utf-8?q?=20=E4=BD=8D?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：0004 之后，hash 的 SA 记录仍保留 eip93_set_sa_record() 给 HMAC 置的 EIP93_SA_CMD_COPY_HEADER（eip93-common.c 的 IS_HMAC 分支），而 hash 描述符的输出地址（dst_addr）仍是 0。现在没有写物理地址 0，只是因为 hash 请求的 header 长度为 0（HASH_CRYPT_OFFSET 为 0、描述符不设 bypass）；hmac(sha256-eip93) 跑 1 s 后物理 0 不变是实测，但它依赖这个长度恰好为 0。
+
+根因：eip93_set_sa_record() 按算法组合置 COPY 位，是为有输出缓冲的 aead 路径设计的：aead 加密要 COPY_DIGEST 把 ICV 写进输出（eip93-regs.h 注明它要求同时置 COPY_PAD），要 COPY_HEADER 把关联数据带到输出。hash 路径没有输出缓冲，摘要只经 SAVE_HASH 存进 sa_state（eip93_hash_handle_result() 从那里取），PAD、PAYLOAD、HEADER、DIGEST 四个 COPY 位一个都用不上。上游 ESP 包模式后端的提案（lore 20260523121522.3023992-1-hurryman2212@gmail.com）配置 SA 时同样先把这四位一并清掉，再按方向置需要的那一位。
+
+改法：__eip93_hash_init() 里把四个 COPY 位一起清掉，让“hash 描述符不产生输出”不再依赖 header 长度；HMAC 末块用的 sa_record_hmac 是它的副本，一并不带。
+
+实测：见 build/research/eip93-driver-fixes.md（testmgr FULL 的 hash/hmac 向量全过；hmac 跑 1 s 前后物理 0 不变）。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-hash.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index 6ece415..d3a6ade 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -167,11 +167,12 @@ static void __eip93_hash_init(struct ahash_request *req)
+ 
+ 	eip93_set_sa_record(sa_record, 0, ctx->flags);
+ 	/*
+-	 * hash 的描述符没有输出缓冲（dst_addr 为 0），摘要由 SAVE_HASH 存进 sa_state，结果从那里取。
+-	 * eip93_set_sa_record() 给带 hash 的 SA 置的 COPY_DIGEST、COPY_PAD 会让引擎把摘要（SHA-256 为 32 字节）写进输出，即物理地址 0。
+-	 * 这里清掉这两位；HMAC 末块用的 sa_record_hmac 由下面复制，一并不带。
++	 * hash 的描述符没有输出缓冲（dst_addr 为 0），摘要由 SAVE_HASH 存进 sa_state，结果从那里取，所以四个 COPY 位都不该置。
++	 * eip93_set_sa_record() 给带 hash 的 SA 置的 COPY_DIGEST、COPY_PAD 会让引擎把摘要（SHA-256 为 32 字节）写进输出，即物理地址 0；给 HMAC 置的 COPY_HEADER 只因 header 长度为 0 才没写。
++	 * 这里全部清掉；HMAC 末块用的 sa_record_hmac 由下面复制，一并不带。
+ 	 */
+-	sa_record->sa_cmd1_word &= ~(EIP93_SA_CMD_COPY_DIGEST | EIP93_SA_CMD_COPY_PAD);
++	sa_record->sa_cmd1_word &= ~(EIP93_SA_CMD_COPY_DIGEST | EIP93_SA_CMD_COPY_PAD |
++				     EIP93_SA_CMD_COPY_HEADER | EIP93_SA_CMD_COPY_PAYLOAD);
+ 	sa_record->sa_cmd0_word |= EIP93_SA_CMD_HASH_FROM_STATE;
+ 	sa_record->sa_cmd0_word |= EIP93_SA_CMD_SAVE_HASH;
+ 	sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_OPCODE;
+-- 
+2.56.1
+

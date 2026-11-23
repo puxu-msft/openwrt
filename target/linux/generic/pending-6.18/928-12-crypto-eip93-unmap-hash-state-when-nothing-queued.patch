@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xp <a.xp@live.com>
+Date: Mon, 23 Nov 2026 19:16:38 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20hash=20update=20=E6=B2=A1?=
+ =?utf-8?q?=E6=94=BE=E6=8F=8F=E8=BF=B0=E7=AC=A6=E6=97=B6=E6=92=A4=E9=94=80?=
+ =?utf-8?q?=E7=8A=B6=E6=80=81=E4=B8=8E=20SA=20=E7=9A=84=E6=98=A0=E5=B0=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：md5/sha1/sha224/sha256-eip93 做 update，累计数据不超过一个块（64 字节）时，eip93_hash_do_update() 先把请求上下文里的 sa_state、sa_record 映射给设备，__eip93_hash_update() 把数据留在 rctx->data 里、不放描述符、返回 0，函数随即返回 0，两份映射都没有撤销。同一请求的下一次 update/final 再映射同一块内存；开 CONFIG_DMA_API_DEBUG 时会报重叠映射（sa_state 按双向映射后，dma-debug 跟踪它的 cache 行）。HMAC 的第一次 update 不走这条路（init 之后 data_used 已是 64），之后累计不足一块的 update 同样会走。上游原样驱动同样如此（返回 0 时不撤销）。
+
+根因：撤销映射只在完成回调（有描述符时）与出错路径上做，“没放描述符、成功返回”这条路漏了。
+
+改法：__eip93_hash_update() 返回 0 时与出错一样落到撤销映射的标签上，再 eip93_hash_finish()，返回 0。
+
+实测（EN7528）：testmgr FULL 全过（hash 向量含小于一个块的分段 update）；本平台是 dma-direct、没有 swiotlb/IOMMU，泄漏的映射不占资源，修前修后功能相同；本内核没开 DMA_API_DEBUG，修前的报错没有上机复现（读码）。详见 build/research/eip93-driver-fixes.md。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-hash.c | 12 ++++--------
+ 1 file changed, 4 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index 35b2a26..ecea141 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -553,15 +553,11 @@ static int eip93_hash_do_update(struct ahash_request *req, bool may_sleep)
+ 	ret = __eip93_hash_update(req, true);
+ 	if (ret == -EINPROGRESS)
+ 		return ret;
+-	if (ret)
+-		goto free_sa_record;
+-
+-	/* 数据都留在 rctx->data 里，没有放描述符 */
+-	eip93_hash_finish(req);
+-
+-	return 0;
+ 
+-free_sa_record:
++	/*
++	 * 出错，或者数据都留在 rctx->data 里、没有放描述符（返回 0）：两种情况都没有完成回调来撤销映射，在这里撤销。
++	 * 已知边界（原有）：出错若发生在前面几块已经放进环之后（只有后面某块的数据映射失败会这样，dma-direct 上不会发生），撤销后引擎仍会访问这些内存。
++	 */
+ 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
+ 			 sizeof(*sa_record), DMA_TO_DEVICE);
+ 
+-- 
+2.56.1
+

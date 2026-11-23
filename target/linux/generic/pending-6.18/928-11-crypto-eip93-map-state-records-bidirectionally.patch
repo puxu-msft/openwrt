@@ -1,0 +1,147 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xp <a.xp@live.com>
+Date: Mon, 23 Nov 2026 18:07:54 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20=E5=BC=95=E6=93=8E?=
+ =?utf-8?q?=E8=AF=BB=E5=86=99=E7=9A=84=E7=8A=B6=E6=80=81=E8=AE=B0=E5=BD=95?=
+ =?utf-8?q?=E6=8C=89=E5=8F=8C=E5=90=91=E6=98=A0=E5=B0=84?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：skcipher/aead 的 sa_state、CTR 回绕用的 sa_state_ctr 与 hash 的 sa_state 映射时用 DMA_TO_DEVICE，撤销时用 DMA_FROM_DEVICE（hash 的出错路径用 DMA_TO_DEVICE）；同一块映射前后方向不一致，开 CONFIG_DMA_API_DEBUG 时会报方向不符。
+
+根因：引擎既从状态记录读（IV、hash 的中间摘要），又把结果写回（SAVE_IV、SAVE_HASH），这是双向的用法。EN7528（MIPS 1004Kc，非一致 DMA）上 TO_DEVICE 映射做的是 cache 写回并作废（r4k 的 dma_cache_wback 即 wback_inv），所以 CPU 之后读到的是引擎写回的内容，结果正确；在 TO_DEVICE 只写回不作废、又会预取的平台上，CPU 可能在撤销前把旧内容取进 cache。
+
+改法：这几处映射与撤销一律用 DMA_BIDIRECTIONAL。在 EN7528 上映射仍是写回并作废、撤销不做 cache 操作，与原来相同。
+
+实测：testmgr FULL 全过；软中断里压满环的压力测试与吞吐同改前。详见 build/research/eip93-driver-fixes.md。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-common.c | 13 +++++++------
+ drivers/crypto/inside-secure/eip93/eip93-hash.c   | 14 +++++++-------
+ 2 files changed, 14 insertions(+), 13 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.c b/drivers/crypto/inside-secure/eip93/eip93-common.c
+index 648c7ca..81db168 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.c
+@@ -619,15 +619,16 @@ int eip93_send_req(struct crypto_async_request *async,
+ 
+ 			rctx->sa_state_ctr_base = dma_map_single(eip93->dev, rctx->sa_state_ctr,
+ 								 sizeof(*rctx->sa_state_ctr),
+-								 DMA_TO_DEVICE);
++								 DMA_BIDIRECTIONAL);
+ 			err = dma_mapping_error(eip93->dev, rctx->sa_state_ctr_base);
+ 			if (err)
+ 				goto free_sa_state_ctr;
+ 		}
+ 	}
+ 
++	/* 引擎从状态记录取 IV，处理完把输出 IV 存回去（SAVE_IV），所以按双向映射 */
+ 	rctx->sa_state_base = dma_map_single(eip93->dev, rctx->sa_state,
+-					     sizeof(*rctx->sa_state), DMA_TO_DEVICE);
++					     sizeof(*rctx->sa_state), DMA_BIDIRECTIONAL);
+ 	err = dma_mapping_error(eip93->dev, rctx->sa_state_base);
+ 	if (err)
+ 		goto free_sa_state_ctr_dma;
+@@ -681,13 +682,13 @@ free_sa_state_ctr_dma:
+ 	if (rctx->sa_state_ctr)
+ 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
+ 				 sizeof(*rctx->sa_state_ctr),
+-				 DMA_TO_DEVICE);
++				 DMA_BIDIRECTIONAL);
+ free_sa_state_ctr:
+ 	kfree(rctx->sa_state_ctr);
+ 	if (rctx->sa_state)
+ 		dma_unmap_single(eip93->dev, rctx->sa_state_base,
+ 				 sizeof(*rctx->sa_state),
+-				 DMA_TO_DEVICE);
++				 DMA_BIDIRECTIONAL);
+ free_sa_state:
+ 	kfree(rctx->sa_state);
+ 
+@@ -945,12 +946,12 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx
+ 	if (rctx->sa_state_ctr)
+ 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
+ 				 sizeof(*rctx->sa_state_ctr),
+-				 DMA_FROM_DEVICE);
++				 DMA_BIDIRECTIONAL);
+ 
+ 	if (rctx->sa_state)
+ 		dma_unmap_single(eip93->dev, rctx->sa_state_base,
+ 				 sizeof(*rctx->sa_state),
+-				 DMA_FROM_DEVICE);
++				 DMA_BIDIRECTIONAL);
+ 
+ 	/*
+ 	 * 输出 IV 与软件实现一致：CBC 是最后一个密文块，CTR 是下一个计数器。
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index ae56a2e..35b2a26 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -67,7 +67,7 @@ void eip93_hash_handle_result(struct crypto_async_request *async, int err)
+ 	int i;
+ 
+ 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
+-			 sizeof(*sa_state), DMA_FROM_DEVICE);
++			 sizeof(*sa_state), DMA_BIDIRECTIONAL);
+ 
+ 	/*
+ 	 * With partial_hash assume SHA256_DIGEST_SIZE buffer is passed.
+@@ -538,7 +538,7 @@ static int eip93_hash_do_update(struct ahash_request *req, bool may_sleep)
+ 
+ 	rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
+ 					     sizeof(*sa_state),
+-					     DMA_TO_DEVICE);
++					     DMA_BIDIRECTIONAL);
+ 	ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
+ 	if (ret)
+ 		goto finish;
+@@ -567,7 +567,7 @@ free_sa_record:
+ 
+ free_sa_state:
+ 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
+-			 sizeof(*sa_state), DMA_TO_DEVICE);
++			 sizeof(*sa_state), DMA_BIDIRECTIONAL);
+ finish:
+ 	eip93_hash_finish(req);
+ 
+@@ -621,7 +621,7 @@ static int __eip93_hash_final(struct ahash_request *req, bool map_dma)
+ 	if (map_dma) {
+ 		rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
+ 						     sizeof(*sa_state),
+-						     DMA_TO_DEVICE);
++						     DMA_BIDIRECTIONAL);
+ 		ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
+ 		if (ret)
+ 			return ret;
+@@ -650,7 +650,7 @@ free_blocks:
+ 
+ free_sa_state:
+ 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
+-			 sizeof(*sa_state), DMA_TO_DEVICE);
++			 sizeof(*sa_state), DMA_BIDIRECTIONAL);
+ 
+ 	return ret;
+ }
+@@ -698,7 +698,7 @@ static int eip93_hash_do_finup(struct ahash_request *req, bool may_sleep)
+ 	if (data) {
+ 		rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
+ 						     sizeof(*sa_state),
+-						     DMA_TO_DEVICE);
++						     DMA_BIDIRECTIONAL);
+ 		ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
+ 		if (ret)
+ 			goto finish;
+@@ -726,7 +726,7 @@ free_sa_record:
+ 			 sizeof(*sa_record), DMA_TO_DEVICE);
+ free_sa_state:
+ 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
+-			 sizeof(*sa_state), DMA_TO_DEVICE);
++			 sizeof(*sa_state), DMA_BIDIRECTIONAL);
+ finish:
+ 	eip93_hash_finish(req);
+ 
+-- 
+2.56.1
+

@@ -1,0 +1,86 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xp <a.xp@live.com>
+Date: Mon, 23 Nov 2026 19:16:38 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20=E7=8A=B6=E6=80=81?=
+ =?utf-8?q?=E8=AE=B0=E5=BD=95=E6=98=A0=E5=B0=84=E5=A4=B1=E8=B4=A5=E6=97=B6?=
+ =?utf-8?q?=E6=8C=89=E6=98=A0=E5=B0=84=E7=9A=84=E5=8F=8D=E5=BA=8F=E6=92=A4?=
+ =?utf-8?q?=E9=94=80?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：eip93_send_req() 里 sa_state_ctr（CTR 计数器回绕时的第二份状态记录）映射失败时跳到 free_sa_state_ctr，那里会撤销还没映射的 sa_state；sa_state 映射失败时跳到 free_sa_state_ctr_dma，那里会撤销这个映射失败的句柄。两处都会对无效的 DMA 地址调 dma_unmap_single()。上游原样驱动同样如此（评审指出，读码）。
+
+根因：出错标签的顺序是“先撤销 sa_state_ctr、释放它，再撤销 sa_state”，与映射顺序（先 sa_state_ctr、后 sa_state）不是反序，失败点之后还没映射的那一份也被撤销。
+
+改法：标签改成映射的反序：unmap_sa_state → unmap_sa_state_ctr → free_sa_state_ctr → free_sa_state；sa_state_ctr 映射失败跳到 free_sa_state_ctr（只释放两块内存），sa_state 映射失败跳到 unmap_sa_state_ctr，请求 ID 分配失败跳到 unmap_sa_state。释放后把两个指针清成 NULL。
+
+实测：EN7528 上是 dma-direct、低端内存，映射不会失败，这两条路走不到；修前修后功能相同，testmgr FULL、压力测试通过（读码定性，未上机触发）。详见 build/research/eip93-driver-fixes.md。
+
+---
+ .../crypto/inside-secure/eip93/eip93-common.c | 20 +++++++++++--------
+ 1 file changed, 12 insertions(+), 8 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.c b/drivers/crypto/inside-secure/eip93/eip93-common.c
+index 81db168..2db02be 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.c
+@@ -622,7 +622,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ 								 DMA_BIDIRECTIONAL);
+ 			err = dma_mapping_error(eip93->dev, rctx->sa_state_ctr_base);
+ 			if (err)
+-				goto free_sa_state_ctr;
++				goto free_sa_state_ctr;	/* sa_state 还没映射 */
+ 		}
+ 	}
+ 
+@@ -631,7 +631,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ 					     sizeof(*rctx->sa_state), DMA_BIDIRECTIONAL);
+ 	err = dma_mapping_error(eip93->dev, rctx->sa_state_base);
+ 	if (err)
+-		goto free_sa_state_ctr_dma;
++		goto unmap_sa_state_ctr;
+ 
+ skip_iv:
+ 
+@@ -645,7 +645,7 @@ skip_iv:
+ 					     EIP93_REQ_ID_NUM, GFP_ATOMIC);
+ 	if (crypto_async_idr < 0) {
+ 		err = crypto_async_idr;
+-		goto free_sa_state_ctr_dma;
++		goto unmap_sa_state;
+ 	}
+ 
+ 	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, crypto_async_idr) |
+@@ -678,19 +678,23 @@ free_sg_dma:
+ free_idr:
+ 	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+ 		idr_remove(&eip93->ring->crypto_async_idr, crypto_async_idr);
+-free_sa_state_ctr_dma:
++	/* 按映射的反序撤销：sa_state 最后映射，先撤销；ECB 两者都为 NULL */
++unmap_sa_state:
++	if (rctx->sa_state)
++		dma_unmap_single(eip93->dev, rctx->sa_state_base,
++				 sizeof(*rctx->sa_state),
++				 DMA_BIDIRECTIONAL);
++unmap_sa_state_ctr:
+ 	if (rctx->sa_state_ctr)
+ 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
+ 				 sizeof(*rctx->sa_state_ctr),
+ 				 DMA_BIDIRECTIONAL);
+ free_sa_state_ctr:
+ 	kfree(rctx->sa_state_ctr);
+-	if (rctx->sa_state)
+-		dma_unmap_single(eip93->dev, rctx->sa_state_base,
+-				 sizeof(*rctx->sa_state),
+-				 DMA_BIDIRECTIONAL);
++	rctx->sa_state_ctr = NULL;
+ free_sa_state:
+ 	kfree(rctx->sa_state);
++	rctx->sa_state = NULL;
+ 
+ 	return err;
+ }
+-- 
+2.56.1
+

@@ -1,0 +1,1089 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 09:19:16 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20=E8=AF=B7=E6=B1=82?=
+ =?utf-8?q?=E4=B8=8D=E5=B8=A6=20MAY=5FSLEEP=20=E6=97=B6=E4=B8=8D=E7=9D=A1?=
+ =?utf-8?q?=E7=9C=A0=EF=BC=8C=E7=8E=AF=E6=BB=A1=E8=BF=94=E5=9B=9E=20-ENOSP?=
+ =?utf-8?q?C=20=E6=88=96=E8=BF=9B=E7=A7=AF=E5=8E=8B=E9=98=9F=E5=88=97?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：ESP 在软中断或关 BH 的上下文里以标志 0 发 aead 请求（net/ipv4/esp4.c 的 esp_output_tail()、esp_input()），而驱动在请求路径里无条件用 GFP_KERNEL 分配 sa_state 与反弹缓冲，描述符环满时在调用方的上下文里 usleep_range() 等空位。环一满（511 个描述符），软中断里就会睡眠，内核报 “BUG: scheduling while atomic”。
+
+根因：请求路径没有看 CRYPTO_TFM_REQ_MAY_SLEEP，把调用方都当成可睡眠的进程上下文；环满时又只能等，因为一个请求的描述符是逐个放进环的，放到一半时前面的已经交给引擎，既撤不回，也不能返回错误。不能睡眠时改成原地自旋也不行：发请求的若是 CPU0 上的软中断，腾出环位的完成 tasklet 也只在 CPU0 上跑（中断落在 CPU0），自旋永远等不到。
+
+改法：
+- 分配标志按 CRYPTO_TFM_REQ_MAY_SLEEP 选 GFP_KERNEL 或 GFP_ATOMIC（sa_state、CTR 计数器回绕时的第二个 sa_state、反弹缓冲）。
+- skcipher/aead 一个请求的全部描述符在一次持写锁里放进环：先用 eip93_ring_free() 按上限（src、dst 段数之和加 2，原地时取两者较大者加 2）确认放得下，放不下就一个都不放，撤销 DMA 映射、请求 ID 与分配，返回 -ENOSPC；段数多到整个环都放不下时改用反弹缓冲合成一段。环满只在 eip93_ring_free() 里判断，eip93_put_descriptor() 改为只写不判。CD_COUNT 仍在解锁之后写。
+- 带 CRYPTO_TFM_REQ_MAY_BACKLOG 的 skcipher/aead 请求放不下时挂到驱动自己的积压链表、返回 -EBUSY；完成 tasklet 处理完结果后按先后顺序以 GFP_ATOMIC 补交，补交成功后先发 -EINPROGRESS（完成只在这个 tasklet 里处理，所以它一定先于结果）。链表由空变非空时排一次 tasklet，防止在途请求恰好在入队前全部完成、再没有完成来触发补交。积压链表非空时新来的可积压请求直接排到后面。不带 MAY_BACKLOG 的返回 -ENOSPC（ESP 按丢包处理）。入队判断内联在 skcipher/aead 的提交函数里，每个请求只多一次标志判断与链表判空。
+- 请求没交出去时释放 check_valid_request() 的反弹缓冲，src、dst 指回请求自己的，同一个请求可以原样再交（原来这些出错路径漏释放反弹缓冲）。
+- hash 一次操作的数据按 64 字节块分几次放进环，放到一半不能停：放第一块之前先分配请求 ID；不能睡眠的请求再按块数一次预留环位（ring->reserved，skcipher/aead 计算空位时扣掉它），预留不到时带 MAY_BACKLOG 的转给每设备一个的工作队列、在可睡眠的上下文里重做这次操作（返回 -EBUSY，开始前发 -EINPROGRESS），不带的返回 -ENOSPC；可以睡眠的照旧逐个描述符等空位。最后一块交出去之后不再碰请求（原来还会写 data_dma、沿块链表往下走，请求可能已在别的 CPU 上完成并释放）。
+- skcipher/aead 的请求 ID 检查分配失败（原来没检查，失败时把负的错误码当 ID 写进描述符）；ID 范围取满描述符里的 16 位（原来是 511 个，可睡眠的 hash 等环位时也持有 ID，个数不受环容量限制）。
+- eip93_hmac_setkey() 自用的 hash 请求加 CRYPTO_TFM_REQ_MAY_SLEEP：它在 setkey 的进程上下文里，紧接着就在 crypto_wait_req() 里睡眠等结果。
+
+开销：skcipher/aead 每个请求取一次写锁（原来每个描述符一次），另加一次空位计算与一次积压链表判空；请求上下文大小不变（hash 新增的字段放在 eip93_hash_reqctx 原有的填充里，仍是 512 字节）；每个设备的 struct eip93_ring 从 104 字节增到 144 字节。没有改用 crypto_engine：它把每个请求都转到内核线程里提交，ESP 的热路径上每个请求多一次线程切换，还要常驻一个内核线程。
+
+上游：截至 2026-11-23，torvalds/master、linux-next 与 herbert/cryptodev-2.6 里 eip93 没有这类修复。lore 上 Qingfang Deng 的 “crypto: eip93: fix sleep inside atomic”（2026-01-20）按 MAY_SLEEP 选分配标志、环满时 cpu_relax() 自旋，Herbert Xu 回复同步路径里调完成回调是错的，并建议给驱动加 crypto_engine（https://lore.kernel.org/linux-crypto/aXxmIuU9PKJiDs7n@gondor.apana.org.au/），未合并；前一个补丁（return request validation errors synchronously）处理了完成回调那一半。Jihong Min 的 “crypto: eip93: fix request lifetime and completion handling” v2（2026-07-07）里的 “handle request ID exhaustion” 在 ID 用完时也是 usleep_range() 等待，未合并。
+
+验证（GS2107，EN7528，6.18.60，出树模块；数据与日志见 devices/gs2107/build/research/eip93-atomic-fix.md）：在 TIMER_SOFTIRQ 里以标志 0 压满环，原样驱动打出 “BUG: scheduling while atomic” 后在完成 tasklet 里空指针 Oops、panic；打补丁后同类压力测试（aead/skcipher/hmac，加解密、反弹缓冲、多描述符、积压）先后 4 轮全部通过，testmgr FULL 档通过（ctr(aes) 偶发失败是驱动原有问题，原样驱动同样复现）；第 5 轮在上述 panic 之后的新启动里跑第一个变体时出现一次原因未定的崩溃（init 收到 SIGILL，期间没有内核告警），定性之前不要当作已充分验证。吞吐与原样驱动交替各测 3 轮：1504 B 差 0 至 -1.5%，64 B 差 -0.8% 至 -2.1%。
+
+---
+ .../crypto/inside-secure/eip93/eip93-aead.c   |  15 +-
+ .../crypto/inside-secure/eip93/eip93-cipher.c |  16 +-
+ .../crypto/inside-secure/eip93/eip93-cipher.h |  44 ++-
+ .../crypto/inside-secure/eip93/eip93-common.c | 191 +++++++++---
+ .../crypto/inside-secure/eip93/eip93-common.h |  24 +-
+ .../crypto/inside-secure/eip93/eip93-hash.c   | 284 ++++++++++++++++--
+ .../crypto/inside-secure/eip93/eip93-hash.h   |   9 +
+ .../crypto/inside-secure/eip93/eip93-main.c   |   7 +
+ .../crypto/inside-secure/eip93/eip93-main.h   |  14 +
+ 9 files changed, 520 insertions(+), 84 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-aead.c b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+index 89e230d..db4e2a6 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-aead.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+@@ -40,17 +40,20 @@ void eip93_aead_handle_result(struct crypto_async_request *async, int err)
+ 	aead_request_complete(req, err);
+ }
+ 
+-static int eip93_aead_send_req(struct crypto_async_request *async)
++/* 没交给引擎（出错或环满）时释放反弹缓冲，请求可以原样再交一次（积压队列补交） */
++int eip93_aead_send_req(struct crypto_async_request *async, gfp_t gfp)
+ {
+ 	struct aead_request *req = aead_request_cast(async);
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+ 	int err;
+ 
+-	err = check_valid_request(rctx);
+-	if (err)
+-		return err;
++	err = check_valid_request(rctx, gfp);
++	if (!err)
++		err = eip93_send_req(async, req->iv, rctx, gfp);
++	if (unlikely(err != -EINPROGRESS))
++		eip93_free_sg_copies(rctx, req->src, req->dst);
+ 
+-	return eip93_send_req(async, req->iv, rctx);
++	return err;
+ }
+ 
+ /* Crypto aead API functions */
+@@ -208,7 +211,7 @@ static int eip93_aead_crypt(struct aead_request *req)
+ 	if (IS_DECRYPT(rctx->flags))
+ 		rctx->textsize -= rctx->authsize;
+ 
+-	return eip93_aead_send_req(async);
++	return eip93_queue_req(async, ctx->eip93, eip93_aead_send_req);
+ }
+ 
+ static int eip93_aead_encrypt(struct aead_request *req)
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.c b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+index 26c2884..dfb8365 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+@@ -30,18 +30,20 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
+ 	skcipher_request_complete(req, err);
+ }
+ 
+-static int eip93_skcipher_send_req(struct crypto_async_request *async)
++/* 没交给引擎（出错或环满）时释放反弹缓冲，请求可以原样再交一次（积压队列补交） */
++int eip93_skcipher_send_req(struct crypto_async_request *async, gfp_t gfp)
+ {
+ 	struct skcipher_request *req = skcipher_request_cast(async);
+ 	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
+ 	int err;
+ 
+-	err = check_valid_request(rctx);
++	err = check_valid_request(rctx, gfp);
++	if (!err)
++		err = eip93_send_req(async, req->iv, rctx, gfp);
++	if (unlikely(err != -EINPROGRESS))
++		eip93_free_sg_copies(rctx, req->src, req->dst);
+ 
+-	if (err)
+-		return err;
+-
+-	return eip93_send_req(async, req->iv, rctx);
++	return err;
+ }
+ 
+ /* Crypto skcipher API functions */
+@@ -167,7 +169,7 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
+ 	rctx->desc_flags = EIP93_DESC_SKCIPHER;
+ 	rctx->sa_record_base = ctx->sa_record_base;
+ 
+-	return eip93_skcipher_send_req(async);
++	return eip93_queue_req(async, ctx->eip93, eip93_skcipher_send_req);
+ }
+ 
+ static int eip93_skcipher_encrypt(struct skcipher_request *req)
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.h b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
+index 6e2545e..845b8f4 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
+@@ -44,7 +44,17 @@ struct eip93_cipher_reqctx {
+ 	dma_addr_t			sa_state_ctr_base;
+ };
+ 
+-int check_valid_request(struct eip93_cipher_reqctx *rctx);
++/*
++ * eip93_scatter_combine() 给一个请求生成的描述符数的上限：每个描述符结束在 src 或 dst 一段的末尾，
++ * 或者结束在数据末尾、CTR 计数器回绕的分界上，后两种各至多一次；原地处理时 src、dst 是同一组段
++ */
++#define EIP93_REQ_MAX_DESC(inplace, src_nents, dst_nents) \
++	((inplace) ? max(src_nents, dst_nents) + 2 : (src_nents) + (dst_nents) + 2)
++
++int check_valid_request(struct eip93_cipher_reqctx *rctx, gfp_t gfp);
++
++void eip93_free_sg_copies(struct eip93_cipher_reqctx *rctx,
++			  struct scatterlist *reqsrc, struct scatterlist *reqdst);
+ 
+ void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 		     struct scatterlist *reqsrc, struct scatterlist *reqdst);
+@@ -52,7 +62,37 @@ void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rct
+ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err);
+ 
+ int eip93_send_req(struct crypto_async_request *async,
+-		   const u8 *reqiv, struct eip93_cipher_reqctx *rctx);
++		   const u8 *reqiv, struct eip93_cipher_reqctx *rctx, gfp_t gfp);
++
++int eip93_skcipher_send_req(struct crypto_async_request *async, gfp_t gfp);
++int eip93_aead_send_req(struct crypto_async_request *async, gfp_t gfp);
++
++int eip93_backlog_req(struct crypto_async_request *async);
++void eip93_dequeue_backlog(struct eip93_device *eip93);
++
++/*
++ * 把 skcipher/aead 请求交给 send()（eip93_skcipher_send_req 或 eip93_aead_send_req），分配标志按请求能否睡眠选。
++ * 环里放不下时：带 CRYPTO_TFM_REQ_MAY_BACKLOG 的进积压链表、返回 -EBUSY，由完成 tasklet 腾出位置后补交；
++ * 不带的返回 -ENOSPC（ESP 在软中断里以标志 0 发请求，按丢包处理）。积压链表非空时，新来的可积压请求直接排到后面，保持先后顺序。
++ * 内联进调用方：每个请求都走这里，send 成为直接调用
++ */
++static __always_inline int
++eip93_queue_req(struct crypto_async_request *async, struct eip93_device *eip93,
++		int (*send)(struct crypto_async_request *async, gfp_t gfp))
++{
++	bool may_backlog = async->flags & CRYPTO_TFM_REQ_MAY_BACKLOG;
++	int err;
++
++	if (unlikely(may_backlog && !list_empty(&eip93->ring->backlog)))
++		return eip93_backlog_req(async);
++
++	err = send(async, async->flags & CRYPTO_TFM_REQ_MAY_SLEEP ?
++		   GFP_KERNEL : GFP_ATOMIC);
++	if (unlikely(err == -ENOSPC) && may_backlog)
++		return eip93_backlog_req(async);
++
++	return err;
++}
+ 
+ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 			 u8 *reqiv);
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.c b/drivers/crypto/inside-secure/eip93/eip93-common.c
+index 43a2df5..05a11b9 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.c
+@@ -70,10 +70,6 @@ static void *eip93_ring_next_wptr(struct eip93_device *eip93,
+ {
+ 	void *ptr = ring->write;
+ 
+-	if ((ring->write == ring->read - ring->offset) ||
+-	    (ring->read == ring->base && ring->write == ring->base_end))
+-		return ERR_PTR(-ENOMEM);
+-
+ 	if (ring->write == ring->base_end)
+ 		ring->write = ring->base;
+ 	else
+@@ -90,33 +86,28 @@ static void *eip93_ring_next_rptr(struct eip93_device *eip93,
+ 	if (ring->write == ring->read)
+ 		return ERR_PTR(-ENOENT);
+ 
++	/* 生产者在 eip93_ring_free() 里不持读锁读它 */
+ 	if (ring->read == ring->base_end)
+-		ring->read = ring->base;
++		WRITE_ONCE(ring->read, ring->base);
+ 	else
+-		ring->read += ring->offset;
++		WRITE_ONCE(ring->read, ring->read + ring->offset);
+ 
+ 	return ptr;
+ }
+ 
+-int eip93_put_descriptor(struct eip93_device *eip93,
+-			 struct eip93_descriptor *desc)
++/* 调用方持 write_lock 且已用 eip93_ring_free() 确认放得下 */
++void eip93_put_descriptor(struct eip93_device *eip93,
++			  struct eip93_descriptor *desc)
+ {
+ 	struct eip93_descriptor *cdesc;
+ 	struct eip93_descriptor *rdesc;
+ 
+ 	rdesc = eip93_ring_next_wptr(eip93, &eip93->ring->rdr);
+-	if (IS_ERR(rdesc))
+-		return -ENOENT;
+-
+ 	cdesc = eip93_ring_next_wptr(eip93, &eip93->ring->cdr);
+-	if (IS_ERR(cdesc))
+-		return -ENOENT;
+ 
+ 	memset(rdesc, 0, sizeof(struct eip93_descriptor));
+ 
+ 	memcpy(cdesc, desc, sizeof(struct eip93_descriptor));
+-
+-	return 0;
+ }
+ 
+ void *eip93_get_descriptor(struct eip93_device *eip93)
+@@ -148,15 +139,15 @@ static void eip93_free_sg_copy(const int len, struct scatterlist **sg)
+ }
+ 
+ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+-			      const u32 len, const bool copy)
++			      const u32 len, const bool copy, gfp_t gfp)
+ {
+ 	void *pages;
+ 
+-	*dst = kmalloc(sizeof(**dst), GFP_KERNEL);
++	*dst = kmalloc(sizeof(**dst), gfp);
+ 	if (!*dst)
+ 		return -ENOMEM;
+ 
+-	pages = (void *)__get_free_pages(GFP_KERNEL | GFP_DMA,
++	pages = (void *)__get_free_pages(gfp | GFP_DMA,
+ 					 get_order(len));
+ 	if (!pages) {
+ 		kfree(*dst);
+@@ -198,7 +189,7 @@ static bool eip93_is_sg_aligned(struct scatterlist *sg, u32 len,
+ 	return false;
+ }
+ 
+-int check_valid_request(struct eip93_cipher_reqctx *rctx)
++int check_valid_request(struct eip93_cipher_reqctx *rctx, gfp_t gfp)
+ {
+ 	struct scatterlist *src = rctx->sg_src;
+ 	struct scatterlist *dst = rctx->sg_dst;
+@@ -265,15 +256,24 @@ int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 			dst_align = eip93_is_sg_aligned(dst, totlen_dst, blksize);
+ 	}
+ 
++	/*
++	 * 一个请求的描述符要一次放进环（eip93_scatter_combine()），段数多到环放不下时
++	 * 改用反弹缓冲，src、dst 各合成一段
++	 */
++	if (EIP93_REQ_MAX_DESC(src == dst, src_nents, dst_nents) > EIP93_RING_NUM - 1) {
++		src_align = false;
++		dst_align = false;
++	}
++
+ 	copy_len = max(totlen_src, totlen_dst);
+ 	if (!src_align) {
+-		err = eip93_make_sg_copy(src, &rctx->sg_src, copy_len, true);
++		err = eip93_make_sg_copy(src, &rctx->sg_src, copy_len, true, gfp);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	if (!dst_align) {
+-		err = eip93_make_sg_copy(dst, &rctx->sg_dst, copy_len, false);
++		err = eip93_make_sg_copy(dst, &rctx->sg_dst, copy_len, false, gfp);
+ 		if (err)
+ 			return err;
+ 	}
+@@ -292,6 +292,21 @@ int check_valid_request(struct eip93_cipher_reqctx *rctx)
+ 	return 0;
+ }
+ 
++/* 请求没交给引擎时，释放 check_valid_request() 分配的反弹缓冲，src、dst 指回请求自己的 */
++void eip93_free_sg_copies(struct eip93_cipher_reqctx *rctx,
++			  struct scatterlist *reqsrc, struct scatterlist *reqdst)
++{
++	u32 len = rctx->assoclen + rctx->textsize + rctx->authsize;
++
++	if (rctx->sg_src != reqsrc)
++		eip93_free_sg_copy(len, &rctx->sg_src);
++	if (rctx->sg_dst != reqdst)
++		eip93_free_sg_copy(len, &rctx->sg_dst);
++
++	rctx->sg_src = reqsrc;
++	rctx->sg_dst = reqdst;
++}
++
+ /*
+  * Set sa_record function:
+  * Even sa_record is set to "0", keep " = 0" for readability.
+@@ -393,7 +408,8 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 	bool nextin = false;
+ 	bool nextout = false;
+ 	int offsetout = 0;
+-	int err;
++	unsigned long irqflags;
++	unsigned int ndesc = 0;
+ 
+ 	if (IS_ECB(rctx->flags))
+ 		rctx->sa_state_base = 0;
+@@ -406,6 +422,17 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 		n = datalen;
+ 	}
+ 
++	/*
++	 * 一个请求的描述符在同一次持锁里全部放进环：放到一半时环满既不能睡眠等待（调用方可能在软中断里），
++	 * 也撤不回已经交给引擎的部分。放不下就一个都不放，返回 -ENOSPC 由调用方撤销映射。
++	 */
++	spin_lock_irqsave(&eip93->ring->write_lock, irqflags);
++	if (unlikely(eip93_ring_free(eip93) <
++		     EIP93_REQ_MAX_DESC(sgsrc == sgdst, rctx->src_nents, rctx->dst_nents))) {
++		spin_unlock_irqrestore(&eip93->ring->write_lock, irqflags);
++		return -ENOSPC;
++	}
++
+ 	do {
+ 		if (nextin) {
+ 			sgsrc = sg_next(sgsrc);
+@@ -489,27 +516,28 @@ static int eip93_scatter_combine(struct eip93_device *eip93,
+ 			cdesc->user_id |= FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS,
+ 						     EIP93_DESC_LAST);
+ 
+-		/*
+-		 * Loop - Delay - No need to rollback
+-		 * Maybe refine by slowing down at EIP93_RING_BUSY
+-		 */
+-again:
+-		scoped_guard(spinlock_irqsave, &eip93->ring->write_lock)
+-			err = eip93_put_descriptor(eip93, cdesc);
+-		if (err) {
+-			usleep_range(EIP93_RING_BUSY_DELAY,
+-				     EIP93_RING_BUSY_DELAY * 2);
+-			goto again;
+-		}
+-		/* Writing new descriptor count starts DMA action */
+-		writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
++		eip93_put_descriptor(eip93, cdesc);
++		ndesc++;
+ 	} while (n);
++	spin_unlock_irqrestore(&eip93->ring->write_lock, irqflags);
++
++	/*
++	 * 计数在解锁之后再写：解锁时的内存屏障不必等这次非缓存写落地；别的 CPU 先写了计数也无妨，
++	 * 环里排在前面的描述符都已写完
++	 */
++	/* Writing new descriptor count starts DMA action */
++	while (ndesc--)
++		writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
+ 
+ 	return -EINPROGRESS;
+ }
+ 
++/*
++ * 环里放不下时返回 -ENOSPC，这时本函数做过的分配与映射都已撤销，check_valid_request() 的反弹缓冲由调用方释放。
++ * 分配标志 gfp 由调用方按请求能否睡眠给出。
++ */
+ int eip93_send_req(struct crypto_async_request *async,
+-		   const u8 *reqiv, struct eip93_cipher_reqctx *rctx)
++		   const u8 *reqiv, struct eip93_cipher_reqctx *rctx, gfp_t gfp)
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
+ 	struct eip93_device *eip93 = ctx->eip93;
+@@ -533,7 +561,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ 
+ 	memcpy(iv, reqiv, rctx->ivsize);
+ 
+-	rctx->sa_state = kzalloc(sizeof(*rctx->sa_state), GFP_KERNEL);
++	rctx->sa_state = kzalloc(sizeof(*rctx->sa_state), gfp);
+ 	if (!rctx->sa_state)
+ 		return -ENOMEM;
+ 
+@@ -562,7 +590,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ 			crypto_inc((u8 *)iv, AES_BLOCK_SIZE);
+ 
+ 			rctx->sa_state_ctr = kzalloc(sizeof(*rctx->sa_state_ctr),
+-						     GFP_KERNEL);
++						     gfp);
+ 			if (!rctx->sa_state_ctr) {
+ 				err = -ENOMEM;
+ 				goto free_sa_state;
+@@ -595,9 +623,13 @@ skip_iv:
+ 
+ 	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+ 		crypto_async_idr = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
+-					     EIP93_RING_NUM - 1, GFP_ATOMIC);
++					     EIP93_REQ_ID_NUM, GFP_ATOMIC);
++	if (crypto_async_idr < 0) {
++		err = crypto_async_idr;
++		goto free_sa_state_ctr_dma;
++	}
+ 
+-	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, (u16)crypto_async_idr) |
++	cdesc.user_id = FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, crypto_async_idr) |
+ 			FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, rctx->desc_flags);
+ 
+ 	rctx->cdesc = &cdesc;
+@@ -607,7 +639,7 @@ skip_iv:
+ 	 */
+ 	if (!dma_map_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL)) {
+ 		err = -ENOMEM;
+-		goto free_sa_state_ctr_dma;
++		goto free_idr;
+ 	}
+ 
+ 	if (src != dst &&
+@@ -616,10 +648,17 @@ skip_iv:
+ 		goto free_sg_dma;
+ 	}
+ 
+-	return eip93_scatter_combine(eip93, rctx, datalen, split, offsetin);
++	err = eip93_scatter_combine(eip93, rctx, datalen, split, offsetin);
++	if (err == -EINPROGRESS)
++		return err;
+ 
++	if (src != dst)
++		dma_unmap_sg(eip93->dev, src, rctx->src_nents, DMA_TO_DEVICE);
+ free_sg_dma:
+ 	dma_unmap_sg(eip93->dev, dst, rctx->dst_nents, DMA_BIDIRECTIONAL);
++free_idr:
++	scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
++		idr_remove(&eip93->ring->crypto_async_idr, crypto_async_idr);
+ free_sa_state_ctr_dma:
+ 	if (rctx->sa_state_ctr)
+ 		dma_unmap_single(eip93->dev, rctx->sa_state_ctr_base,
+@@ -637,6 +676,68 @@ free_sa_state:
+ 	return err;
+ }
+ 
++static int eip93_send_cipher_req(struct crypto_async_request *async, gfp_t gfp)
++{
++	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
++
++	if (ctx->type == EIP93_ALG_TYPE_AEAD)
++		return eip93_aead_send_req(async, gfp);
++
++	return eip93_skcipher_send_req(async, gfp);
++}
++
++/* 可积压的请求挂进积压链表，由完成 tasklet 补交（eip93_queue_req()） */
++int eip93_backlog_req(struct crypto_async_request *async)
++{
++	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
++	struct eip93_ring *ring = ctx->eip93->ring;
++	bool first;
++
++	scoped_guard(spinlock_bh, &ring->backlog_lock) {
++		first = list_empty(&ring->backlog);
++		list_add_tail(&async->list, &ring->backlog);
++	}
++	/*
++	 * 补交只在完成 tasklet 里做。链表原本为空时，放不下之后在途的请求可能已经全部完成、不会再有完成来触发它，
++	 * 所以这里排一次；原本非空时，队首放不下说明环里还有在途的描述符（或 hash 的预留，退还时会排 tasklet）
++	 */
++	if (first)
++		tasklet_schedule(&ring->done_task);
++
++	return -EBUSY;
++}
++
++/*
++ * 完成 tasklet 调用：按先后顺序补交积压的请求，直到环里再放不下。完成只在这个 tasklet 里处理，
++ * 所以补交成功后再发的 -EINPROGRESS 通知一定先于这个请求的结果送到调用方。
++ */
++void eip93_dequeue_backlog(struct eip93_device *eip93)
++{
++	struct eip93_ring *ring = eip93->ring;
++	struct crypto_async_request *async;
++	int err;
++
++	/* 只有这里摘除，看到非空时队首一定在；入队方随后会再排一次 tasklet，看漏的下一轮补上 */
++	while (!list_empty(&ring->backlog)) {
++		scoped_guard(spinlock_bh, &ring->backlog_lock)
++			async = list_first_entry(&ring->backlog,
++						 struct crypto_async_request,
++						 list);
++
++		/* tasklet 里不能睡眠，不论请求带不带 CRYPTO_TFM_REQ_MAY_SLEEP */
++		err = eip93_send_cipher_req(async, GFP_ATOMIC);
++		if (err == -ENOSPC)
++			return;
++
++		scoped_guard(spinlock_bh, &ring->backlog_lock)
++			list_del(&async->list);
++
++		crypto_request_complete(async, -EINPROGRESS);
++		if (err != -EINPROGRESS)
++			crypto_request_complete(async, err);
++	}
++}
++
+ void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 		     struct scatterlist *reqsrc, struct scatterlist *reqdst)
+ {
+@@ -743,7 +844,9 @@ int eip93_hmac_setkey(u32 ctx_flags, const u8 *key, unsigned int keylen,
+ 
+ 	rctx = ahash_request_ctx_dma(req);
+ 	crypto_init_wait(&wait);
+-	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_BACKLOG,
++	/* setkey 在进程上下文里，下面也在 crypto_wait_req() 里睡眠等结果 */
++	ahash_request_set_callback(req, CRYPTO_TFM_REQ_MAY_SLEEP |
++				   CRYPTO_TFM_REQ_MAY_BACKLOG,
+ 				   crypto_req_done, &wait);
+ 
+ 	/* Hash the key if > SHA256_BLOCK_SIZE */
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.h b/drivers/crypto/inside-secure/eip93/eip93-common.h
+index 80964cf..44cc29c 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.h
+@@ -9,8 +9,30 @@
+ #ifndef _EIP93_COMMON_H_
+ #define _EIP93_COMMON_H_
+ 
++#include "eip93-main.h"
++#include "eip93-regs.h"
++
+ void *eip93_get_descriptor(struct eip93_device *eip93);
+-int eip93_put_descriptor(struct eip93_device *eip93, struct eip93_descriptor *desc);
++/*
++ * 环里还能放几个描述符（扣掉 hash 请求的预留），调用方持 write_lock。环满的判断只在这里做：
++ * 写指针与读指针之间始终空着一格，消费者刚推进读指针、还在读的那一格要等读指针再前进一格才会被重新写入。
++ */
++static inline int eip93_ring_free(struct eip93_device *eip93)
++{
++	struct eip93_ring *ring = eip93->ring;
++	struct eip93_desc_ring *rdr = &ring->rdr;
++	int used;
++
++	/* 消费者先推进 cdr 的读指针、再推进 rdr 的，按 rdr 算得的是两个环里空位较少的那个 */
++	used = (rdr->write - READ_ONCE(rdr->read)) /
++	       (int)sizeof(struct eip93_descriptor);
++	if (used < 0)
++		used += EIP93_RING_NUM;
++
++	return EIP93_RING_NUM - 1 - used - (int)ring->reserved;
++}
++
++void eip93_put_descriptor(struct eip93_device *eip93, struct eip93_descriptor *desc);
+ 
+ void eip93_set_sa_record(struct sa_record *sa_record, const unsigned int keylen,
+ 			 const u32 flags);
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.c b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+index ac13d90..f241e9b 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.c
+@@ -205,6 +205,112 @@ static void __eip93_hash_init(struct ahash_request *req)
+ 	INIT_LIST_HEAD(&rctx->blocks);
+ }
+ 
++enum eip93_hash_op {
++	EIP93_HASH_OP_UPDATE = 1,
++	EIP93_HASH_OP_FINAL,
++	EIP93_HASH_OP_FINUP,
++};
++
++/* 这次 update 要放进环的数据块数：总数据里留最后 1..64 字节在 rctx->data，其余每 64 字节一块 */
++static u32 eip93_hash_blocks(struct eip93_hash_reqctx *rctx, unsigned int nbytes)
++{
++	u32 total = rctx->data_used + nbytes;
++
++	return total ? (total - 1) / SHA256_BLOCK_SIZE : 0;
++}
++
++/*
++ * 一次操作要放 n 个描述符进环之前调用。hash 请求的数据按 64 字节块各占一个描述符，分几次放进环；块一进环就会被引擎处理，
++ * 放到一半时既不能撤回、也不能因 ID 分配失败或环满而停下，所以请求 ID 先拿好；不能睡眠的请求还要一次预留够 n 个环位，
++ * 放不下返回 -ENOSPC。可以睡眠的请求不预留，逐个描述符等空位。
++ */
++static int eip93_hash_prepare(struct ahash_request *req, u32 n, bool may_sleep)
++{
++	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
++	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
++	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
++	struct eip93_ring *ring = ctx->eip93->ring;
++	int id;
++
++	rctx->desc_reserved = 0;
++	rctx->req_id = -1;
++	if (!n)
++		return 0;
++
++	scoped_guard(spinlock_bh, &ring->idr_lock)
++		id = idr_alloc(&ring->crypto_async_idr, &req->base, 0,
++			       EIP93_REQ_ID_NUM, GFP_ATOMIC);
++	if (id < 0)
++		return id;
++
++	if (!may_sleep) {
++		scoped_guard(spinlock_irqsave, &ring->write_lock) {
++			if (eip93_ring_free(ctx->eip93) >= (int)n) {
++				ring->reserved += n;
++				rctx->desc_reserved = n;
++			}
++		}
++		if (!rctx->desc_reserved) {
++			scoped_guard(spinlock_bh, &ring->idr_lock)
++				idr_remove(&ring->crypto_async_idr, id);
++			return -ENOSPC;
++		}
++	}
++
++	rctx->req_id = id;
++	return 0;
++}
++
++/*
++ * 操作没有交出最后一块（同步结束或出错）时退还预留与请求 ID。交出最后一块之后请求随时可能完成并被调用方释放，
++ * 不能再调这里，也不能再碰 rctx。
++ */
++static void eip93_hash_finish(struct ahash_request *req)
++{
++	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
++	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
++	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
++	struct eip93_ring *ring = ctx->eip93->ring;
++
++	if (rctx->desc_reserved) {
++		scoped_guard(spinlock_irqsave, &ring->write_lock)
++			ring->reserved -= rctx->desc_reserved;
++		rctx->desc_reserved = 0;
++		/* 退还的环位可能正是积压队首在等的 */
++		if (!list_empty(&ring->backlog))
++			tasklet_schedule(&ring->done_task);
++	}
++
++	if (rctx->req_id >= 0) {
++		scoped_guard(spinlock_bh, &ring->idr_lock)
++			idr_remove(&ring->crypto_async_idr, rctx->req_id);
++		rctx->req_id = -1;
++	}
++}
++
++/*
++ * 不能睡眠又预留不到环位时：带 CRYPTO_TFM_REQ_MAY_BACKLOG 的请求交给工作队列，在可睡眠的上下文里重做这次操作，
++ * 返回 -EBUSY；不带的返回 -ENOSPC
++ */
++static int eip93_hash_defer(struct ahash_request *req, u8 op)
++{
++	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
++	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
++	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
++	struct eip93_ring *ring = ctx->eip93->ring;
++
++	if (!(req->base.flags & CRYPTO_TFM_REQ_MAY_BACKLOG))
++		return -ENOSPC;
++
++	rctx->deferred_op = op;
++	scoped_guard(spinlock_bh, &ring->backlog_lock)
++		list_add_tail(&req->base.list, &ring->hash_backlog);
++	/* 工作里会逐个描述符睡眠等环位，用给长时间工作的队列 */
++	queue_work(system_long_wq, &ring->hash_work);
++
++	return -EBUSY;
++}
++
+ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
+ 			       dma_addr_t *data_dma, u32 len, bool last)
+ {
+@@ -214,6 +320,7 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
+ 	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
+ 	struct eip93_device *eip93 = ctx->eip93;
+ 	struct eip93_descriptor cdesc = { };
++	unsigned long irqflags;
+ 	dma_addr_t src_addr;
+ 	int ret;
+ 
+@@ -222,6 +329,8 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
+ 	ret = dma_mapping_error(eip93->dev, src_addr);
+ 	if (ret)
+ 		return ret;
++	/* 描述符交出去之前记下：最后一块交出去后请求可能已完成并被释放 */
++	*data_dma = src_addr;
+ 
+ 	cdesc.pe_ctrl_stat_word = FIELD_PREP(EIP93_PE_CTRL_PE_READY_DES_TRING_OWN,
+ 					     EIP93_PE_CTRL_HOST_READY);
+@@ -238,8 +347,6 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
+ 	cdesc.user_id |= FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, EIP93_DESC_HASH);
+ 
+ 	if (last) {
+-		int crypto_async_idr;
+-
+ 		if (rctx->finalize && !rctx->partial_hash) {
+ 			/* For last block, pass sa_record with CMD_HMAC enabled */
+ 			if (IS_HMAC(ctx->flags)) {
+@@ -259,27 +366,41 @@ static int eip93_send_hash_req(struct crypto_async_request *async, u8 *data,
+ 			cdesc.pe_ctrl_stat_word |= EIP93_PE_CTRL_PE_HASH_FINAL;
+ 		}
+ 
+-		scoped_guard(spinlock_bh, &eip93->ring->idr_lock)
+-			crypto_async_idr = idr_alloc(&eip93->ring->crypto_async_idr, async, 0,
+-						     EIP93_RING_NUM - 1, GFP_ATOMIC);
+-
+-		cdesc.user_id |= FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, (u16)crypto_async_idr) |
++		/* 请求 ID 已在 eip93_hash_prepare() 分配好，交给描述符后就归结果处理释放 */
++		cdesc.user_id |= FIELD_PREP(EIP93_PE_USER_ID_CRYPTO_IDR, rctx->req_id) |
+ 				 FIELD_PREP(EIP93_PE_USER_ID_DESC_FLAGS, EIP93_DESC_LAST);
++		rctx->req_id = -1;
+ 	}
+ 
+-again:
+-	scoped_guard(spinlock_irqsave, &eip93->ring->write_lock)
+-		ret = eip93_put_descriptor(eip93, &cdesc);
+-	if (ret) {
++	for (;;) {
++		spin_lock_irqsave(&eip93->ring->write_lock, irqflags);
++		if (rctx->desc_reserved) {
++			rctx->desc_reserved--;
++			eip93->ring->reserved--;
++			/*
++			 * 预留按块数精确算，放最后一块时应已用完；万一还有剩，交出之后再没有机会退还，
++			 * 这里一并退掉，免得环容量永久变小
++			 */
++			if (last && WARN_ON_ONCE(rctx->desc_reserved)) {
++				eip93->ring->reserved -= rctx->desc_reserved;
++				rctx->desc_reserved = 0;
++			}
++			break;
++		}
++		if (eip93_ring_free(eip93) > 0)
++			break;
++		spin_unlock_irqrestore(&eip93->ring->write_lock, irqflags);
++		/* 只有可以睡眠的请求会走到这里，不能睡眠的已在 eip93_hash_prepare() 预留 */
+ 		usleep_range(EIP93_RING_BUSY_DELAY,
+ 			     EIP93_RING_BUSY_DELAY * 2);
+-		goto again;
+ 	}
+ 
++	eip93_put_descriptor(eip93, &cdesc);
++	spin_unlock_irqrestore(&eip93->ring->write_lock, irqflags);
++
+ 	/* Writing new descriptor count starts DMA action */
+ 	writel(1, eip93->base + EIP93_REG_PE_CD_COUNT);
+ 
+-	*data_dma = src_addr;
+ 	return 0;
+ }
+ 
+@@ -376,9 +497,12 @@ static int __eip93_hash_update(struct ahash_request *req, bool complete_req)
+ 					  SHA256_BLOCK_SIZE, wait_req);
+ 		if (ret)
+ 			goto free_blocks;
++		/* 最后一块交出去后请求可能已完成并释放了这些块，不能再走链表 */
++		if (wait_req)
++			return -EINPROGRESS;
+ 	}
+ 
+-	return wait_req ? -EINPROGRESS : 0;
++	return 0;
+ 
+ free_blocks:
+ 	eip93_hash_free_data_blocks(req);
+@@ -386,7 +510,7 @@ free_blocks:
+ 	return ret;
+ }
+ 
+-static int eip93_hash_update(struct ahash_request *req)
++static int eip93_hash_do_update(struct ahash_request *req, bool may_sleep)
+ {
+ 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+ 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
+@@ -399,12 +523,18 @@ static int eip93_hash_update(struct ahash_request *req)
+ 	if (!req->nbytes)
+ 		return 0;
+ 
++	ret = eip93_hash_prepare(req, eip93_hash_blocks(rctx, req->nbytes), may_sleep);
++	if (ret == -ENOSPC && !may_sleep)
++		return eip93_hash_defer(req, EIP93_HASH_OP_UPDATE);
++	if (ret)
++		return ret;
++
+ 	rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
+ 					     sizeof(*sa_state),
+ 					     DMA_TO_DEVICE);
+ 	ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
+ 	if (ret)
+-		return ret;
++		goto finish;
+ 
+ 	rctx->sa_record_base = dma_map_single(eip93->dev, sa_record,
+ 					      sizeof(*sa_record),
+@@ -414,10 +544,15 @@ static int eip93_hash_update(struct ahash_request *req)
+ 		goto free_sa_state;
+ 
+ 	ret = __eip93_hash_update(req, true);
+-	if (ret && ret != -EINPROGRESS)
++	if (ret == -EINPROGRESS)
++		return ret;
++	if (ret)
+ 		goto free_sa_record;
+ 
+-	return ret;
++	/* 数据都留在 rctx->data 里，没有放描述符 */
++	eip93_hash_finish(req);
++
++	return 0;
+ 
+ free_sa_record:
+ 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
+@@ -426,6 +561,8 @@ free_sa_record:
+ free_sa_state:
+ 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
+ 			 sizeof(*sa_state), DMA_TO_DEVICE);
++finish:
++	eip93_hash_finish(req);
+ 
+ 	return ret;
+ }
+@@ -511,12 +648,28 @@ free_sa_state:
+ 	return ret;
+ }
+ 
+-static int eip93_hash_final(struct ahash_request *req)
++static int eip93_hash_do_final(struct ahash_request *req, bool may_sleep)
+ {
+-	return __eip93_hash_final(req, true);
++	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
++	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
++	struct eip93_hash_ctx *ctx = crypto_ahash_ctx(ahash);
++	int ret;
++
++	/* 空消息的非 HMAC 摘要直接给常量，不放描述符（__eip93_hash_final()） */
++	ret = eip93_hash_prepare(req, rctx->len || IS_HMAC(ctx->flags), may_sleep);
++	if (ret == -ENOSPC && !may_sleep)
++		return eip93_hash_defer(req, EIP93_HASH_OP_FINAL);
++	if (ret)
++		return ret;
++
++	ret = __eip93_hash_final(req, true);
++	if (ret != -EINPROGRESS)
++		eip93_hash_finish(req);
++
++	return ret;
+ }
+ 
+-static int eip93_hash_finup(struct ahash_request *req)
++static int eip93_hash_do_finup(struct ahash_request *req, bool may_sleep)
+ {
+ 	struct eip93_hash_reqctx *rctx = ahash_request_ctx_dma(req);
+ 	struct crypto_ahash *ahash = crypto_ahash_reqtfm(req);
+@@ -524,15 +677,24 @@ static int eip93_hash_finup(struct ahash_request *req)
+ 	struct sa_record *sa_record = &rctx->sa_record;
+ 	struct sa_state *sa_state = &rctx->sa_state;
+ 	struct eip93_device *eip93 = ctx->eip93;
++	bool data = rctx->len + req->nbytes || IS_HMAC(ctx->flags);
+ 	int ret;
+ 
+-	if (rctx->len + req->nbytes || IS_HMAC(ctx->flags)) {
++	/* 有数据时放 update 的块再加最后一块；空消息的非 HMAC 摘要不放描述符 */
++	ret = eip93_hash_prepare(req, data ? eip93_hash_blocks(rctx, req->nbytes) + 1 : 0,
++				 may_sleep);
++	if (ret == -ENOSPC && !may_sleep)
++		return eip93_hash_defer(req, EIP93_HASH_OP_FINUP);
++	if (ret)
++		return ret;
++
++	if (data) {
+ 		rctx->sa_state_base = dma_map_single(eip93->dev, sa_state,
+ 						     sizeof(*sa_state),
+ 						     DMA_TO_DEVICE);
+ 		ret = dma_mapping_error(eip93->dev, rctx->sa_state_base);
+ 		if (ret)
+-			return ret;
++			goto finish;
+ 
+ 		rctx->sa_record_base = dma_map_single(eip93->dev, sa_record,
+ 						      sizeof(*sa_record),
+@@ -546,7 +708,11 @@ static int eip93_hash_finup(struct ahash_request *req)
+ 			goto free_sa_record;
+ 	}
+ 
+-	return __eip93_hash_final(req, false);
++	ret = __eip93_hash_final(req, false);
++	if (ret != -EINPROGRESS)
++		eip93_hash_finish(req);
++
++	return ret;
+ 
+ free_sa_record:
+ 	dma_unmap_single(eip93->dev, rctx->sa_record_base,
+@@ -554,10 +720,80 @@ free_sa_record:
+ free_sa_state:
+ 	dma_unmap_single(eip93->dev, rctx->sa_state_base,
+ 			 sizeof(*sa_state), DMA_TO_DEVICE);
++finish:
++	eip93_hash_finish(req);
+ 
+ 	return ret;
+ }
+ 
++static int eip93_hash_run(struct ahash_request *req, u8 op, bool may_sleep)
++{
++	switch (op) {
++	case EIP93_HASH_OP_UPDATE:
++		return eip93_hash_do_update(req, may_sleep);
++	case EIP93_HASH_OP_FINAL:
++		return eip93_hash_do_final(req, may_sleep);
++	default:
++		return eip93_hash_do_finup(req, may_sleep);
++	}
++}
++
++static int eip93_hash_update(struct ahash_request *req)
++{
++	return eip93_hash_run(req, EIP93_HASH_OP_UPDATE,
++			      req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP);
++}
++
++static int eip93_hash_final(struct ahash_request *req)
++{
++	return eip93_hash_run(req, EIP93_HASH_OP_FINAL,
++			      req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP);
++}
++
++static int eip93_hash_finup(struct ahash_request *req)
++{
++	return eip93_hash_run(req, EIP93_HASH_OP_FINUP,
++			      req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP);
++}
++
++/*
++ * 工作队列：在可睡眠的上下文里重做 eip93_hash_defer() 转来的操作。先发 -EINPROGRESS，操作同步结束（没放描述符或出错）
++ * 时在这里补发结果，否则结果由完成 tasklet 发。
++ */
++void eip93_hash_work(struct work_struct *work)
++{
++	struct eip93_ring *ring = container_of(work, struct eip93_ring, hash_work);
++	struct crypto_async_request *async;
++	struct ahash_request *req;
++	int ret;
++	u8 op;
++
++	for (;;) {
++		scoped_guard(spinlock_bh, &ring->backlog_lock) {
++			async = list_first_entry_or_null(&ring->hash_backlog,
++							 struct crypto_async_request,
++							 list);
++			if (async)
++				list_del(&async->list);
++		}
++		if (!async)
++			return;
++
++		req = ahash_request_cast(async);
++		op = ((struct eip93_hash_reqctx *)ahash_request_ctx_dma(req))->deferred_op;
++		/* 回调与完成 tasklet 里的一样在关 BH 的上下文里调 */
++		local_bh_disable();
++		crypto_request_complete(async, -EINPROGRESS);
++		local_bh_enable();
++		ret = eip93_hash_run(req, op, true);
++		if (ret != -EINPROGRESS) {
++			local_bh_disable();
++			crypto_request_complete(async, ret);
++			local_bh_enable();
++		}
++	}
++}
++
+ static int eip93_hash_hmac_setkey(struct crypto_ahash *ahash, const u8 *key,
+ 				  u32 keylen)
+ {
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-hash.h b/drivers/crypto/inside-secure/eip93/eip93-hash.h
+index 556f22f..02b79cb 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-hash.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-hash.h
+@@ -39,6 +39,9 @@ struct eip93_hash_reqctx {
+ 	/* Set to signal interrupt is for final packet */
+ 	bool			finalize;
+ 
++	/* 本次操作为不能睡眠的请求预留、还没放进环的描述符数（eip93_hash_prepare()） */
++	u16			desc_reserved;
++
+ 	/*
+ 	 * EIP93 requires data to be accumulated in block of 64 bytes
+ 	 * for intermediate hash calculation.
+@@ -50,6 +53,11 @@ struct eip93_hash_reqctx {
+ 	dma_addr_t		data_dma;
+ 
+ 	struct list_head	blocks;
++
++	/* 本次操作的请求 ID，放最后一块时交给描述符；没放出去时为 -1（eip93_hash_prepare()） */
++	int			req_id;
++	/* 转给工作队列重做的是哪个操作（enum eip93_hash_op） */
++	u8			deferred_op;
+ };
+ 
+ struct mkt_hash_block {
+@@ -69,6 +77,7 @@ struct eip93_hash_export_state {
+ };
+ 
+ void eip93_hash_handle_result(struct crypto_async_request *async, int err);
++void eip93_hash_work(struct work_struct *work);
+ 
+ extern struct eip93_alg_template eip93_alg_md5;
+ extern struct eip93_alg_template eip93_alg_sha1;
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-main.c b/drivers/crypto/inside-secure/eip93/eip93-main.c
+index 59b19e6..f5c2d0f 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-main.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-main.c
+@@ -274,6 +274,7 @@ static void eip93_done_task(unsigned long data)
+ 	struct eip93_device *eip93 = (struct eip93_device *)data;
+ 
+ 	eip93_handle_result_descriptor(eip93);
++	eip93_dequeue_backlog(eip93);
+ }
+ 
+ static irqreturn_t eip93_irq_handler(int irq, void *data)
+@@ -395,6 +396,7 @@ static int eip93_desc_init(struct eip93_device *eip93)
+ 
+ static void eip93_cleanup(struct eip93_device *eip93)
+ {
++	cancel_work_sync(&eip93->ring->hash_work);
+ 	tasklet_kill(&eip93->ring->done_task);
+ 
+ 	/* Clear/ack all interrupts before disable all */
+@@ -453,6 +455,11 @@ static int eip93_crypto_probe(struct platform_device *pdev)
+ 	spin_lock_init(&eip93->ring->idr_lock);
+ 	idr_init(&eip93->ring->crypto_async_idr);
+ 
++	spin_lock_init(&eip93->ring->backlog_lock);
++	INIT_LIST_HEAD(&eip93->ring->backlog);
++	INIT_LIST_HEAD(&eip93->ring->hash_backlog);
++	INIT_WORK(&eip93->ring->hash_work, eip93_hash_work);
++
+ 	algo_flags = readl(eip93->base + EIP93_REG_PE_OPTION_1);
+ 
+ 	eip93_initialize(eip93, algo_flags);
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-main.h b/drivers/crypto/inside-secure/eip93/eip93-main.h
+index 79b078f..cbc37fd 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-main.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-main.h
+@@ -13,10 +13,16 @@
+ #include <crypto/internal/skcipher.h>
+ #include <linux/bitfield.h>
+ #include <linux/interrupt.h>
++#include <linux/workqueue.h>
+ 
+ #define EIP93_RING_BUSY_DELAY		500
+ 
+ #define EIP93_RING_NUM			512
++/*
++ * 请求 ID 写进描述符 user_id 的低 16 位，范围取满这 16 位。ID 按最小空闲值分配，占用只随同时持有 ID 的请求数增长；
++ * 持有 ID 的除了环里的请求，还有正准备放进环的、以及可睡眠且在等环位的 hash 请求，个数不受环容量限制
++ */
++#define EIP93_REQ_ID_NUM		(FIELD_MAX(EIP93_PE_USER_ID_CRYPTO_IDR) + 1)
+ #define EIP93_RING_BUSY			32
+ #define EIP93_CRA_PRIORITY		1500
+ 
+@@ -129,6 +135,14 @@ struct eip93_ring {
+ 	/* aync idr */
+ 	spinlock_t			idr_lock;
+ 	struct idr			crypto_async_idr;
++	/* 不能睡眠的 hash 请求预留、还没放进环的描述符数（受 write_lock 保护） */
++	u32				reserved;
++	/* 环满时带 CRYPTO_TFM_REQ_MAY_BACKLOG 的 skcipher/aead 请求在这里排队，由完成 tasklet 补交 */
++	spinlock_t			backlog_lock;
++	struct list_head		backlog;
++	/* 不能睡眠又预留不到环位的可积压 hash 请求，交给工作队列在可睡眠的上下文里做（也受 backlog_lock 保护） */
++	struct list_head		hash_backlog;
++	struct work_struct		hash_work;
+ };
+ 
+ enum eip93_alg_type {
+-- 
+2.56.1
+

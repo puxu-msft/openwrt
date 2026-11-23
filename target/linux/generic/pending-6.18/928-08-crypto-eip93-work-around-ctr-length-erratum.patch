@@ -1,0 +1,171 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 15:56:24 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20=E8=A7=84=E9=81=BF=20CTR?=
+ =?utf-8?q?=20=E5=9C=A8=E6=95=B0=E6=8D=AE=E9=95=BF=E5=BA=A6=20=E2=89=A1=20?=
+ =?utf-8?q?10=20(mod=201024)=20=E6=97=B6=E7=9A=84=E5=B0=BE=E9=83=A8?=
+ =?utf-8?q?=E9=94=99=E8=AF=AF?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：ctr(aes) 与 rfc3686(ctr(aes)) 的数据长度是 1024 的整数倍再加 10 字节（1034、2058、3082、4106、5130、6154、7178、8202……）时，部分请求只有倒数第 2 个字节错，其余字节与输出 IV 都对；每 64 个请求里错 1 到 64 个不等。testmgr FULL 档偶发的 ctr(aes) 随机向量失败（len=4106、5130）就是它。实测（EN7528，单 CPU、每长度 64 个请求、随机密钥与 IV，对照 ctr(aes-generic)）：基数 16、32、64、512、1024、1488、2048、4096、4112 加尾长 0..15 共 144 个长度里只有 1034、2058、4106 出错；1024k+10（k=1..8）全部出错，512 的奇数倍加 10（522、1546、2570）全对；解密、AES-256 同样出错；rfc3686(ctr(aes)) 4106 出错、4108 对；同样密文长度的 authenc(hmac(sha256),rfc3686(ctr(aes)))（引擎同时做 hash）不出错。这类长度不是块长的倍数，驱动总把 src、dst 各合成一段反弹缓冲、交一个描述符，所以按 sg 拆段、非原地、起始偏移这些变体在引擎看来都是同一种配置；计数器在第一块后回绕、请求被拆成 16 字节加 1034 字节两个描述符时（总长 1050）不出错，说明出错的条件不只是单个描述符的长度。出错字节与期望值、输入值之间看不出固定关系。
+
+根因：引擎只做加解密（BASIC_OUT_ENC/IN_DEC）时对这一类数据长度的处理有误；驱动按 API 正确交了长度。手头没有 EIP-93 的勘误资料，原因只能定到这一步，内部机理未知。
+
+改法：skcipher 的 CTR 请求长度 ≡ 10 (mod 1024) 时，交给引擎的长度多 2 个字节（≡ 12，实测全对），多出的字节放在反弹缓冲里，输出不拷回。多出的字节与尾部同在最后一个 AES 块里，计数器回绕的拆分点与输出 IV 都不变。反弹缓冲改为按它自己的长度释放。这类长度本来就走反弹缓冲，没有多出的拷贝。ESP 的载荷补齐到 4 字节，不会落在这里。
+
+实测：见 build/research/eip93-driver-fixes.md（同样的扫描、1024k+10、计数器回绕后再补 2 字节的组合全部一致，输出 IV 一致）。
+
+---
+ .../crypto/inside-secure/eip93/eip93-cipher.h |  2 +
+ .../crypto/inside-secure/eip93/eip93-common.c | 43 ++++++++++++-------
+ 2 files changed, 30 insertions(+), 15 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.h b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
+index d554453..0f4fe95 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
+@@ -39,6 +39,8 @@ struct eip93_cipher_reqctx {
+ 	unsigned int			blksize;
+ 	unsigned int			ivsize;
+ 	unsigned int			textsize;
++	/* 交给引擎的长度比请求多的字节数，只在 check_valid_request() 规避 CTR 尾部勘误时非 0，多出的部分在反弹缓冲里 */
++	unsigned int			pad;
+ 	unsigned int			assoclen;
+ 	unsigned int			authsize;
+ 	dma_addr_t			sa_record_base;
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.c b/drivers/crypto/inside-secure/eip93/eip93-common.c
+index 7e46ee8..9f91312 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.c
+@@ -130,18 +130,20 @@ void *eip93_get_descriptor(struct eip93_device *eip93)
+ 	return ptr;
+ }
+ 
+-static void eip93_free_sg_copy(const int len, struct scatterlist **sg)
++/* 反弹缓冲按它自己的长度释放（可能比请求长 rctx->pad 字节） */
++static void eip93_free_sg_copy(struct scatterlist **sg)
+ {
+-	if (!*sg || !len)
++	if (!*sg)
+ 		return;
+ 
+-	free_pages((unsigned long)sg_virt(*sg), get_order(len));
++	free_pages((unsigned long)sg_virt(*sg), get_order((*sg)->length));
+ 	kfree(*sg);
+ 	*sg = NULL;
+ }
+ 
++/* 反弹缓冲：len 字节数据（copy 时从 src 拷入）之后再留 pad 个置零的字节，交给引擎的长度是 len + pad */
+ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+-			      const u32 len, const bool copy, gfp_t gfp)
++			      const u32 len, const u32 pad, const bool copy, gfp_t gfp)
+ {
+ 	void *pages;
+ 
+@@ -150,7 +152,7 @@ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+ 		return -ENOMEM;
+ 
+ 	pages = (void *)__get_free_pages(gfp | GFP_DMA,
+-					 get_order(len));
++					 get_order(len + pad));
+ 	if (!pages) {
+ 		kfree(*dst);
+ 		*dst = NULL;
+@@ -158,11 +160,12 @@ static int eip93_make_sg_copy(struct scatterlist *src, struct scatterlist **dst,
+ 	}
+ 
+ 	sg_init_table(*dst, 1);
+-	sg_set_buf(*dst, pages, len);
++	sg_set_buf(*dst, pages, len + pad);
+ 
+ 	/* copy only as requested */
+ 	if (copy)
+ 		sg_copy_to_buffer(src, sg_nents(src), pages, len);
++	memset(pages + len, 0, pad);
+ 
+ 	return 0;
+ }
+@@ -205,6 +208,7 @@ int check_valid_request(struct eip93_cipher_reqctx *rctx, gfp_t gfp)
+ 	int src_nents, dst_nents;
+ 	int err = -EINVAL;
+ 
++	rctx->pad = 0;
+ 	if (!IS_CTR(rctx->flags)) {
+ 		if (!IS_ALIGNED(textsize, blksize))
+ 			return err;
+@@ -267,15 +271,26 @@ int check_valid_request(struct eip93_cipher_reqctx *rctx, gfp_t gfp)
+ 		dst_align = false;
+ 	}
+ 
++	/*
++	 * 引擎只做 CTR（不带 hash）时，数据长度 ≡ 10 (mod 1024) 的请求倒数第 2 个字节会错（EN7528 实测 1/64 到 64/64 不等），其余长度、同时做 hash 的 authenc 都对（见补丁说明）。
++	 * 这样的请求交给引擎的长度多 2 个字节，多出的输出不拷回；多出的字节与尾部同在最后一个 AES 块里，计数器与输出 IV 不变。
++	 * 这类长度不是块长的倍数，本来就走反弹缓冲；这里显式置上，因为多出的字节只能落在反弹缓冲里。
++	 */
++	if (IS_CTR(rctx->flags) && (rctx->desc_flags & EIP93_DESC_SKCIPHER) && textsize % 1024 == 10) {
++		rctx->pad = 2;
++		src_align = false;
++		dst_align = false;
++	}
++
+ 	copy_len = max(totlen_src, totlen_dst);
+ 	if (!src_align) {
+-		err = eip93_make_sg_copy(src, &rctx->sg_src, copy_len, true, gfp);
++		err = eip93_make_sg_copy(src, &rctx->sg_src, copy_len, rctx->pad, true, gfp);
+ 		if (err)
+ 			return err;
+ 	}
+ 
+ 	if (!dst_align) {
+-		err = eip93_make_sg_copy(dst, &rctx->sg_dst, copy_len, false, gfp);
++		err = eip93_make_sg_copy(dst, &rctx->sg_dst, copy_len, rctx->pad, false, gfp);
+ 		if (err)
+ 			return err;
+ 	}
+@@ -298,12 +313,10 @@ int check_valid_request(struct eip93_cipher_reqctx *rctx, gfp_t gfp)
+ void eip93_free_sg_copies(struct eip93_cipher_reqctx *rctx,
+ 			  struct scatterlist *reqsrc, struct scatterlist *reqdst)
+ {
+-	u32 len = rctx->assoclen + rctx->textsize + rctx->authsize;
+-
+ 	if (rctx->sg_src != reqsrc)
+-		eip93_free_sg_copy(len, &rctx->sg_src);
++		eip93_free_sg_copy(&rctx->sg_src);
+ 	if (rctx->sg_dst != reqdst)
+-		eip93_free_sg_copy(len, &rctx->sg_dst);
++		eip93_free_sg_copy(&rctx->sg_dst);
+ 
+ 	rctx->sg_src = reqsrc;
+ 	rctx->sg_dst = reqdst;
+@@ -552,7 +565,7 @@ int eip93_send_req(struct crypto_async_request *async,
+ 	struct eip93_descriptor cdesc;
+ 	u32 flags = rctx->flags;
+ 	int offsetin = 0, err;
+-	u32 datalen = rctx->assoclen + rctx->textsize;
++	u32 datalen = rctx->assoclen + rctx->textsize + rctx->pad;
+ 	u32 split = datalen;
+ 	u32 start, end, ctr, blocks;
+ 	u32 iv[AES_BLOCK_SIZE / sizeof(u32)];
+@@ -901,7 +914,7 @@ void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rct
+ 		     DMA_TO_DEVICE);
+ 
+ 	if (rctx->sg_src != reqsrc)
+-		eip93_free_sg_copy(len +  rctx->authsize, &rctx->sg_src);
++		eip93_free_sg_copy(&rctx->sg_src);
+ 
+ 	dma_unmap_sg(eip93->dev, rctx->sg_dst, rctx->dst_nents,
+ 		     DMA_BIDIRECTIONAL);
+@@ -922,7 +935,7 @@ process_tag:
+ 	if (rctx->sg_dst != reqdst) {
+ 		sg_copy_from_buffer(reqdst, sg_nents(reqdst),
+ 				    sg_virt(rctx->sg_dst), len + authsize);
+-		eip93_free_sg_copy(len + rctx->authsize, &rctx->sg_dst);
++		eip93_free_sg_copy(&rctx->sg_dst);
+ 	}
+ }
+ 
+-- 
+2.56.1
+

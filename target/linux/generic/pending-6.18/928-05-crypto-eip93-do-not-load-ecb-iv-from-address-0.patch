@@ -1,0 +1,44 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 15:50:46 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20ECB=20=E4=B8=8D=E5=86=8D?=
+ =?utf-8?q?=E8=AE=A9=E5=BC=95=E6=93=8E=E4=BB=8E=E5=9C=B0=E5=9D=80=200=20?=
+ =?utf-8?q?=E8=AF=BB=20IV?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：ECB 请求的描述符 state_addr 为 0（eip93_scatter_combine() 对 ECB 置 rctx->sa_state_base = 0，eip93_send_req() 也不为 ECB 分配 sa_state），而 eip93_set_sa_record() 无条件置 EIP93_SA_CMD_IV_FROM_STATE，引擎于是按 SA 去状态记录取 IV，即从物理地址 0 读 16 字节。只读不写，ECB 也不用这个 IV，所以结果正确、物理 0 不变（实测 ecb(aes-eip93) 跑 1 s 前后物理 0 不变），但这是一次指向地址 0 的总线访问。
+
+根因：IV 来源的设置没有区分 ECB。SAVE_IV 已经只对非 ECB 置，IV_FROM_STATE 漏了同样的条件。
+
+改法：IV_FROM_STATE 与 SAVE_IV 一起只对非 ECB 置；ECB 的 IV 来源留 IV_NO_LOAD（字段为 0），SA 里不再有任何要读写状态记录的位。
+
+实测：见 build/research/eip93-driver-fixes.md（testmgr FULL 的 ecb(aes)、ecb(des)、ecb(des3_ede) 全过；同一 tfm 上加解密交错的 ecb(aes) 一致）。读访问无法从软件侧观测，这一条的依据是代码与 eip93-regs.h 对 IV_SOURCE 各取值的定义。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-common.c | 7 +++++--
+ 1 file changed, 5 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.c b/drivers/crypto/inside-secure/eip93/eip93-common.c
+index 05a11b9..beb7820 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.c
+@@ -318,9 +318,12 @@ void eip93_set_sa_record(struct sa_record *sa_record, const unsigned int keylen,
+ 	sa_record->sa_cmd0_word = 0;
+ 	sa_record->sa_cmd1_word = 0;
+ 
+-	sa_record->sa_cmd0_word |= EIP93_SA_CMD_IV_FROM_STATE;
++	/*
++	 * ECB 不用 IV，描述符的 state_addr 为 0（eip93_scatter_combine()）；置 IV_FROM_STATE 会让引擎从物理地址 0 读 IV。
++	 * ECB 留 IV_NO_LOAD，也不存 IV，SA 里没有任何要用状态记录的位。
++	 */
+ 	if (!IS_ECB(flags))
+-		sa_record->sa_cmd0_word |= EIP93_SA_CMD_SAVE_IV;
++		sa_record->sa_cmd0_word |= EIP93_SA_CMD_IV_FROM_STATE | EIP93_SA_CMD_SAVE_IV;
+ 
+ 	sa_record->sa_cmd0_word |= EIP93_SA_CMD_OP_BASIC;
+ 
+-- 
+2.56.1
+

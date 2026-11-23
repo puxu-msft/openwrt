@@ -1,0 +1,510 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 15:53:56 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20=E5=8A=A0=E5=AF=86?=
+ =?utf-8?q?=E3=80=81=E8=A7=A3=E5=AF=86=E5=90=84=E7=94=A8=E4=B8=80=E4=BB=BD?=
+ =?utf-8?q?=20SA=20=E8=AE=B0=E5=BD=95=EF=BC=8C=E8=AF=B7=E6=B1=82=E8=B7=AF?=
+ =?utf-8?q?=E5=BE=84=E4=B8=8D=E5=86=8D=E6=94=B9=E5=86=99=20tfm=20=E7=9A=84?=
+ =?utf-8?q?=E8=AE=B0=E5=BD=95?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：同一个 tfm 上先解密、再加密，加密请求按解密方向执行；两个方向的请求并发时互相改掉对方的设置。实测（EN7528，0001–0004 的驱动，crypto-atomic mix=1：奇数号请求解密、偶数号加密，同一个 tfm）：cbc(aes) 1024 B 只交 2 个请求、两轮，第 2 轮的加密请求 1020 字节不对；512 个请求、4 个 CPU 时 cbc(aes)、ecb(aes) 各 511 个不一致，authenc(hmac(sha256),cbc(aes)) 1504 B 的加密请求从第 8 字节起整段不对；ctr(aes) 不受影响（CTR 的加解密是同一个运算）。
+
+根因：tfm 只有一份 SA 记录（ctx->sa_record），请求路径直接改它：eip93_skcipher_decrypt() 置 EIP93_SA_CMD_DIRECTION_IN，eip93_aead_decrypt() 还清掉 COPY_PAD/COPY_DIGEST，加密路径从不还原，只有下一次 setkey 才重置；引擎在处理描述符时才按 sa_addr 读 SA，所以连已交出的请求也会被后来的请求改掉。aead 的关联数据偏移（HASH_CRYPT_OFFSET）同样写在这份记录里，只在 setkey 后的第一个请求设一次，之后关联数据长度不同的请求被拒（“Request AAD length error”）。另外每个请求都对这份记录 dma_map_single() 一次，却只在 cra_exit 撤销一次。上游有同方向的提案（lore 20260707171537.467608-4-hurryman2212@gmail.com，未合并，做法是每个请求复制一份）。
+
+改法：tfm 备两份 SA 记录，[0] 加密、[1] 解密，cra_init 时整块映射给引擎，tfm 存续期间一直映射。setkey、setauthsize 只写 [0]，写完由 eip93_sync_sa_records() 派生 [1]（置 DIRECTION_IN，清 COPY_PAD/COPY_DIGEST）并 dma_sync_single_for_device()；crypto API 不允许 setkey 与同一 tfm 上的请求并发，这时没有请求在用它们。请求按方向让描述符指向其中一份，请求路径不写也不映射。aead 的关联数据偏移：setkey 之后第一个 aead 请求用 cmpxchg 占位，把自己的关联数据长度写进两份记录、同步给设备，再用 release 语义发布这个长度；之后长度相同的请求（ESP 的一个 SA 上关联数据长度固定）直接用；长度不同的、或碰上别的请求正在写的，复制一份到请求上下文、改偏移、单独映射，完成、同步失败与积压补交失败时撤销。关联数据长度不是 4 的倍数或超出 8 位字段（1020 字节）时返回 -EINVAL（原来是静默算错）。tfm 上的 set_assoc、assoclen 删掉。
+
+代价：请求上下文由 256 字节变为 384 字节（私有副本），tfm 上下文多 8 字节，每个 tfm 多一份 128 字节的解密记录。请求路径比原来少一次 128 字节的 dma_map_single()。
+
+实测（EN7528）：同样的 mix=1 复现全部一致；关联数据长度按请求号 8/12/16 轮换（crypto-atomic amix=1，单独与加解密交错各一项）全部一致；testmgr FULL 全过；软中断里压满环的压力测试 10 轮通过。同一租约里与 0001–0006 的构建交替 3 轮比吞吐（阈值 0 的构建）：aead 64 B 单在途 +1.7%、8 在途 +4.7%，cbc(aes) 64 B +3.4%、+10.5%，1504 B 单在途 +1.2%（aead）、+3.6%（cbc）。详见 build/research/eip93-driver-fixes.md。
+
+---
+ .../crypto/inside-secure/eip93/eip93-aead.c   |  73 +++------
+ .../crypto/inside-secure/eip93/eip93-cipher.c |  34 ++---
+ .../crypto/inside-secure/eip93/eip93-cipher.h |  22 ++-
+ .../crypto/inside-secure/eip93/eip93-common.c | 143 +++++++++++++++++-
+ 4 files changed, 197 insertions(+), 75 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-aead.c b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+index db4e2a6..41962de 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-aead.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+@@ -36,6 +36,7 @@ void eip93_aead_handle_result(struct crypto_async_request *async, int err)
+ 
+ 	eip93_unmap_dma(eip93, rctx, req->src, req->dst);
+ 	eip93_handle_result(eip93, rctx, req->iv);
++	eip93_put_req_sa_record(eip93, rctx);
+ 
+ 	aead_request_complete(req, err);
+ }
+@@ -69,22 +70,15 @@ static int eip93_aead_cra_init(struct crypto_tfm *tfm)
+ 	ctx->eip93 = tmpl->eip93;
+ 	ctx->flags = tmpl->flags;
+ 	ctx->type = tmpl->type;
+-	ctx->set_assoc = true;
+ 
+-	ctx->sa_record = kzalloc(sizeof(*ctx->sa_record), GFP_KERNEL);
+-	if (!ctx->sa_record)
+-		return -ENOMEM;
+-
+-	return 0;
++	return eip93_alloc_sa_records(ctx);
+ }
+ 
+ static void eip93_aead_cra_exit(struct crypto_tfm *tfm)
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	dma_unmap_single(ctx->eip93->dev, ctx->sa_record_base,
+-			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+-	kfree(ctx->sa_record);
++	eip93_free_sa_records(ctx);
+ }
+ 
+ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+@@ -136,6 +130,7 @@ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+ 
+ 	ctx->blksize = crypto_aead_blocksize(ctfm);
+ 	/* Encryption key */
++	eip93_sa_records_begin_update(ctx);
+ 	eip93_set_sa_record(sa_record, keys.enckeylen, ctx->flags);
+ 	sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_OPCODE;
+ 	sa_record->sa_cmd0_word |= FIELD_PREP(EIP93_SA_CMD_OPCODE,
+@@ -152,8 +147,7 @@ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+ 	ret = eip93_hmac_setkey(ctx->flags, keys.authkey, keys.authkeylen,
+ 				ctx->authsize, sa_record->sa_i_digest,
+ 				sa_record->sa_o_digest, false);
+-
+-	ctx->set_assoc = true;
++	eip93_sa_records_end_update(ctx);
+ 
+ 	return ret;
+ }
+@@ -165,25 +159,15 @@ static int eip93_aead_setauthsize(struct crypto_aead *ctfm,
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+ 	ctx->authsize = authsize;
++	eip93_sa_records_begin_update(ctx);
+ 	ctx->sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_DIGEST_LENGTH;
+ 	ctx->sa_record->sa_cmd0_word |= FIELD_PREP(EIP93_SA_CMD_DIGEST_LENGTH,
+ 						   ctx->authsize / sizeof(u32));
++	eip93_sa_records_end_update(ctx);
+ 
+ 	return 0;
+ }
+ 
+-static void eip93_aead_setassoc(struct eip93_crypto_ctx *ctx,
+-				struct aead_request *req)
+-{
+-	struct sa_record *sa_record = ctx->sa_record;
+-
+-	sa_record->sa_cmd1_word &= ~EIP93_SA_CMD_HASH_CRYPT_OFFSET;
+-	sa_record->sa_cmd1_word |= FIELD_PREP(EIP93_SA_CMD_HASH_CRYPT_OFFSET,
+-					      req->assoclen / sizeof(u32));
+-
+-	ctx->assoclen = req->assoclen;
+-}
+-
+ static int eip93_aead_crypt(struct aead_request *req)
+ {
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+@@ -192,11 +176,10 @@ static int eip93_aead_crypt(struct aead_request *req)
+ 	struct crypto_aead *aead = crypto_aead_reqtfm(req);
+ 	int ret;
+ 
+-	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
+-					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+-	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
+-	if (ret)
+-		return ret;
++	/* 关联数据长度按 32 位字写进 SA 的 HASH_CRYPT_OFFSET（8 位字段），不是 4 的倍数或超出字段的放不进去 */
++	if (!IS_ALIGNED(req->assoclen, sizeof(u32)) ||
++	    req->assoclen / sizeof(u32) > FIELD_MAX(EIP93_SA_CMD_HASH_CRYPT_OFFSET))
++		return -EINVAL;
+ 
+ 	rctx->textsize = req->cryptlen;
+ 	rctx->blksize = ctx->blksize;
+@@ -206,12 +189,20 @@ static int eip93_aead_crypt(struct aead_request *req)
+ 	rctx->sg_dst = req->dst;
+ 	rctx->ivsize = crypto_aead_ivsize(aead);
+ 	rctx->desc_flags = EIP93_DESC_AEAD;
+-	rctx->sa_record_base = ctx->sa_record_base;
+ 
+ 	if (IS_DECRYPT(rctx->flags))
+ 		rctx->textsize -= rctx->authsize;
+ 
+-	return eip93_queue_req(async, ctx->eip93, eip93_aead_send_req);
++	ret = eip93_get_req_sa_record(ctx, rctx);
++	if (ret)
++		return ret;
++
++	/* 同步失败（含不能积压时环满的 -ENOSPC）：请求没交出去，调用方可能原样再交，那时重新选 */
++	ret = eip93_queue_req(async, ctx->eip93, eip93_aead_send_req);
++	if (ret != -EINPROGRESS && ret != -EBUSY)
++		eip93_put_req_sa_record(ctx->eip93, rctx);
++
++	return ret;
+ }
+ 
+ static int eip93_aead_encrypt(struct aead_request *req)
+@@ -221,15 +212,6 @@ static int eip93_aead_encrypt(struct aead_request *req)
+ 
+ 	rctx->flags = ctx->flags;
+ 	rctx->flags |= EIP93_ENCRYPT;
+-	if (ctx->set_assoc) {
+-		eip93_aead_setassoc(ctx, req);
+-		ctx->set_assoc = false;
+-	}
+-
+-	if (req->assoclen != ctx->assoclen) {
+-		dev_err(ctx->eip93->dev, "Request AAD length error\n");
+-		return -EINVAL;
+-	}
+ 
+ 	return eip93_aead_crypt(req);
+ }
+@@ -239,21 +221,8 @@ static int eip93_aead_decrypt(struct aead_request *req)
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+ 
+-	ctx->sa_record->sa_cmd0_word |= EIP93_SA_CMD_DIRECTION_IN;
+-	ctx->sa_record->sa_cmd1_word &= ~(EIP93_SA_CMD_COPY_PAD |
+-					  EIP93_SA_CMD_COPY_DIGEST);
+-
+ 	rctx->flags = ctx->flags;
+ 	rctx->flags |= EIP93_DECRYPT;
+-	if (ctx->set_assoc) {
+-		eip93_aead_setassoc(ctx, req);
+-		ctx->set_assoc = false;
+-	}
+-
+-	if (req->assoclen != ctx->assoclen) {
+-		dev_err(ctx->eip93->dev, "Request AAD length error\n");
+-		return -EINVAL;
+-	}
+ 
+ 	return eip93_aead_crypt(req);
+ }
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.c b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+index dfb8365..d0a775c 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
+@@ -26,6 +26,7 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
+ 
+ 	eip93_unmap_dma(eip93, rctx, req->src, req->dst);
+ 	eip93_handle_result(eip93, rctx, req->iv);
++	eip93_put_req_sa_record(eip93, rctx);
+ 
+ 	skcipher_request_complete(req, err);
+ }
+@@ -61,20 +62,14 @@ static int eip93_skcipher_cra_init(struct crypto_tfm *tfm)
+ 	ctx->eip93 = tmpl->eip93;
+ 	ctx->type = tmpl->type;
+ 
+-	ctx->sa_record = kzalloc(sizeof(*ctx->sa_record), GFP_KERNEL);
+-	if (!ctx->sa_record)
+-		return -ENOMEM;
+-
+-	return 0;
++	return eip93_alloc_sa_records(ctx);
+ }
+ 
+ static void eip93_skcipher_cra_exit(struct crypto_tfm *tfm)
+ {
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+-	dma_unmap_single(ctx->eip93->dev, ctx->sa_record_base,
+-			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+-	kfree(ctx->sa_record);
++	eip93_free_sa_records(ctx);
+ }
+ 
+ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
+@@ -124,11 +119,13 @@ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
+ 			return ret;
+ 	}
+ 
++	eip93_sa_records_begin_update(ctx);
+ 	eip93_set_sa_record(sa_record, keylen, flags);
+ 
+ 	memcpy(sa_record->sa_key, key, keylen);
+ 	ctx->sa_nonce = nonce;
+ 	sa_record->sa_nonce = nonce;
++	eip93_sa_records_end_update(ctx);
+ 
+ 	return 0;
+ }
+@@ -153,12 +150,6 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
+ 				crypto_skcipher_blocksize(skcipher)))
+ 			return -EINVAL;
+ 
+-	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
+-					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
+-	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
+-	if (ret)
+-		return ret;
+-
+ 	rctx->assoclen = 0;
+ 	rctx->textsize = req->cryptlen;
+ 	rctx->authsize = 0;
+@@ -167,9 +158,17 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
+ 	rctx->ivsize = crypto_skcipher_ivsize(skcipher);
+ 	rctx->blksize = ctx->blksize;
+ 	rctx->desc_flags = EIP93_DESC_SKCIPHER;
+-	rctx->sa_record_base = ctx->sa_record_base;
+ 
+-	return eip93_queue_req(async, ctx->eip93, eip93_skcipher_send_req);
++	ret = eip93_get_req_sa_record(ctx, rctx);
++	if (ret)
++		return ret;
++
++	/* 同步失败（含不能积压时环满的 -ENOSPC）：请求没交出去，调用方可能原样再交，那时重新选 */
++	ret = eip93_queue_req(async, ctx->eip93, eip93_skcipher_send_req);
++	if (ret != -EINPROGRESS && ret != -EBUSY)
++		eip93_put_req_sa_record(ctx->eip93, rctx);
++
++	return ret;
+ }
+ 
+ static int eip93_skcipher_encrypt(struct skcipher_request *req)
+@@ -186,13 +185,10 @@ static int eip93_skcipher_encrypt(struct skcipher_request *req)
+ 
+ static int eip93_skcipher_decrypt(struct skcipher_request *req)
+ {
+-	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
+ 	struct eip93_cipher_reqctx *rctx = skcipher_request_ctx(req);
+ 	struct eip93_alg_template *tmpl = container_of(req->base.tfm->__crt_alg,
+ 				struct eip93_alg_template, alg.skcipher.base);
+ 
+-	ctx->sa_record->sa_cmd0_word |= EIP93_SA_CMD_DIRECTION_IN;
+-
+ 	rctx->flags = tmpl->flags;
+ 	rctx->flags |= EIP93_DECRYPT;
+ 
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.h b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
+index 845b8f4..d554453 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
+@@ -9,22 +9,31 @@
+ #define _EIP93_CIPHER_H_
+ 
+ #include "eip93-main.h"
++#include "eip93-regs.h"
+ 
+ struct eip93_crypto_ctx {
+ 	struct eip93_device		*eip93;
+ 	u32				flags;
++	/*
++	 * 两份 SA 记录，[0] 加密、[1] 解密，在 cra_init 里整块映射给引擎（sa_record_base），请求的描述符按方向指向其中一份。
++	 * setkey、setauthsize 在 eip93_sa_records_begin_update() 与 eip93_sa_records_end_update() 之间只写 [0]，后者派生 [1] 并同步给设备。
++	 * 请求路径只在一处写：aead 的关联数据偏移也在 SA 里，setkey 之后第一个 aead 请求把它写进两份记录，sa_assoclen 是写进去的关联数据长度（见 eip93_get_req_sa_record()）。
++	 */
+ 	struct sa_record		*sa_record;
++	dma_addr_t			sa_record_base;
++	int				sa_assoclen;
+ 	u32				sa_nonce;
+ 	int				blksize;
+-	dma_addr_t			sa_record_base;
+ 	/* AEAD specific */
+ 	unsigned int			authsize;
+-	unsigned int			assoclen;
+-	bool				set_assoc;
+ 	enum eip93_alg_type		type;
+ };
+ 
+ struct eip93_cipher_reqctx {
++	/* aead 请求用不了 tfm 的 SA 记录（关联数据长度不同，或别的请求正在写偏移）时的私有副本（放在最前，取请求上下文的对齐）；引擎只读它 */
++	struct sa_record		sa_record;
++	/* sa_record_base 指向上面的私有副本（单独映射过，完成时要撤销），否则指向 tfm 的记录 */
++	bool				sa_record_private;
+ 	u16				desc_flags;
+ 	u16				flags;
+ 	unsigned int			blksize;
+@@ -56,6 +65,13 @@ int check_valid_request(struct eip93_cipher_reqctx *rctx, gfp_t gfp);
+ void eip93_free_sg_copies(struct eip93_cipher_reqctx *rctx,
+ 			  struct scatterlist *reqsrc, struct scatterlist *reqdst);
+ 
++int eip93_alloc_sa_records(struct eip93_crypto_ctx *ctx);
++void eip93_free_sa_records(struct eip93_crypto_ctx *ctx);
++void eip93_sa_records_begin_update(struct eip93_crypto_ctx *ctx);
++void eip93_sa_records_end_update(struct eip93_crypto_ctx *ctx);
++int eip93_get_req_sa_record(struct eip93_crypto_ctx *ctx, struct eip93_cipher_reqctx *rctx);
++void eip93_put_req_sa_record(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx);
++
+ void eip93_unmap_dma(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx,
+ 		     struct scatterlist *reqsrc, struct scatterlist *reqdst);
+ 
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.c b/drivers/crypto/inside-secure/eip93/eip93-common.c
+index beb7820..0b12e78 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.c
+@@ -9,6 +9,8 @@
+ #include <crypto/aes.h>
+ #include <crypto/ctr.h>
+ #include <crypto/hmac.h>
++#include <crypto/internal/aead.h>
++#include <crypto/internal/skcipher.h>
+ #include <crypto/sha1.h>
+ #include <crypto/sha2.h>
+ #include <linux/kernel.h>
+@@ -689,6 +691,141 @@ static int eip93_send_cipher_req(struct crypto_async_request *async, gfp_t gfp)
+ 	return eip93_skcipher_send_req(async, gfp);
+ }
+ 
++/* sa_assoclen 的两个特殊值：记录里还没写关联数据偏移；有个请求正在写 */
++#define EIP93_SA_ASSOCLEN_UNSET		-1
++#define EIP93_SA_ASSOCLEN_WRITING	-2
++
++/* cra_init 用：分配加密、解密两份 SA 记录并整块映射给引擎，tfm 存续期间一直映射着 */
++int eip93_alloc_sa_records(struct eip93_crypto_ctx *ctx)
++{
++	ctx->sa_record = kcalloc(2, sizeof(*ctx->sa_record), GFP_KERNEL);
++	if (!ctx->sa_record)
++		return -ENOMEM;
++
++	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
++					     2 * sizeof(*ctx->sa_record), DMA_TO_DEVICE);
++	if (dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base)) {
++		kfree(ctx->sa_record);
++		ctx->sa_record = NULL;
++		return -ENOMEM;
++	}
++	ctx->sa_assoclen = EIP93_SA_ASSOCLEN_UNSET;
++
++	return 0;
++}
++
++void eip93_free_sa_records(struct eip93_crypto_ctx *ctx)
++{
++	if (!ctx->sa_record)
++		return;
++
++	dma_unmap_single(ctx->eip93->dev, ctx->sa_record_base,
++			 2 * sizeof(*ctx->sa_record), DMA_TO_DEVICE);
++	kfree(ctx->sa_record);
++}
++
++/*
++ * setkey、setauthsize 改写 tfm 的 SA 记录之前调：按 DMA API 的规程先把记录的所有权从设备收回（非一致的 MIPS 上 TO_DEVICE 的这一步不做 cache 操作）。
++ * 调用方保证 setkey、setauthsize 不与同一 tfm 上的请求并发（crypto API 的惯例，原驱动同样依赖它），这时没有请求在用这些记录。
++ */
++void eip93_sa_records_begin_update(struct eip93_crypto_ctx *ctx)
++{
++	dma_sync_single_for_cpu(ctx->eip93->dev, ctx->sa_record_base,
++				2 * sizeof(*ctx->sa_record), DMA_TO_DEVICE);
++}
++
++/*
++ * setkey、setauthsize 写好加密记录 [0] 之后调：由它派生解密记录 [1]，清掉关联数据偏移（由之后第一个 aead 请求写），再同步给设备。
++ * 方向与 aead 解密不输出 ICV 都是请求的属性；只有一份记录、由请求路径去改时，同一 tfm 上先解密后加密的请求会按解密方向执行，并发的请求会互相改掉对方的设置，所以按方向各备一份。
++ */
++void eip93_sa_records_end_update(struct eip93_crypto_ctx *ctx)
++{
++	struct sa_record *enc = &ctx->sa_record[0], *dec = &ctx->sa_record[1];
++
++	enc->sa_cmd1_word &= ~EIP93_SA_CMD_HASH_CRYPT_OFFSET;
++	memcpy(dec, enc, sizeof(*dec));
++	dec->sa_cmd0_word |= EIP93_SA_CMD_DIRECTION_IN;
++	/* aead 解密由引擎核对 ICV，不把它写进输出 */
++	dec->sa_cmd1_word &= ~(EIP93_SA_CMD_COPY_PAD | EIP93_SA_CMD_COPY_DIGEST);
++	WRITE_ONCE(ctx->sa_assoclen, EIP93_SA_ASSOCLEN_UNSET);
++
++	dma_sync_single_for_device(ctx->eip93->dev, ctx->sa_record_base,
++				   2 * sizeof(*ctx->sa_record), DMA_TO_DEVICE);
++}
++
++/*
++ * 给请求选 SA 记录，结果放进 rctx->sa_record_base；调用方先设好 rctx->flags、desc_flags 与 assoclen。
++ * skcipher 按方向直接用 tfm 的一份。
++ * aead 还要求记录里的关联数据偏移与本请求一致：setkey 之后第一个 aead 请求把自己的长度写进两份记录，之后同长度的请求（ESP 的一个 SA 上关联数据长度固定）直接用；长度不同的、或者碰上别的请求正在写的，用请求上下文里的私有副本并单独映射。
++ * 两份记录写好、同步给设备之后才发布 sa_assoclen，所以读到相同长度的请求看到的一定是写好的记录。
++ */
++int eip93_get_req_sa_record(struct eip93_crypto_ctx *ctx, struct eip93_cipher_reqctx *rctx)
++{
++	unsigned int dir = IS_DECRYPT(rctx->flags) ? 1 : 0;
++	struct device *dev = ctx->eip93->dev;
++	struct sa_record *sa;
++	int cur, i;
++
++	rctx->sa_record_private = false;
++	rctx->sa_record_base = ctx->sa_record_base + dir * sizeof(*sa);
++	if (!(rctx->desc_flags & EIP93_DESC_AEAD))
++		return 0;
++
++	/* 与下面的 smp_store_release() 配对：读到已发布的长度，就一定看得到写好的两份记录 */
++	cur = smp_load_acquire(&ctx->sa_assoclen);
++	if (cur == (int)rctx->assoclen)
++		return 0;
++
++	/* 只有从“未设”抢到“正在写”的那一个请求写记录；其余请求这时都走私有副本，没有人在用这两份记录 */
++	if (cur == EIP93_SA_ASSOCLEN_UNSET &&
++	    cmpxchg(&ctx->sa_assoclen, EIP93_SA_ASSOCLEN_UNSET,
++		    EIP93_SA_ASSOCLEN_WRITING) == EIP93_SA_ASSOCLEN_UNSET) {
++		dma_sync_single_for_cpu(dev, ctx->sa_record_base,
++					2 * sizeof(*sa), DMA_TO_DEVICE);
++		for (i = 0; i < 2; i++)
++			ctx->sa_record[i].sa_cmd1_word |=
++				FIELD_PREP(EIP93_SA_CMD_HASH_CRYPT_OFFSET,
++					   rctx->assoclen / sizeof(u32));
++		dma_sync_single_for_device(dev, ctx->sa_record_base,
++					   2 * sizeof(*sa), DMA_TO_DEVICE);
++		/* 记录写好、同步给设备之后才发布长度 */
++		smp_store_release(&ctx->sa_assoclen, rctx->assoclen);
++		return 0;
++	}
++
++	/* 复制时别的请求可能正在给 tfm 的记录写偏移：写方对 sa_cmd1_word 整字读改写（结构是 __packed，编译成 lwl/lwr 与 swl/swr），只有 HASH_CRYPT_OFFSET（bits 23:16）变，其余字节写回原值；偏移字段这里随后重写 */
++	sa = &rctx->sa_record;
++	memcpy(sa, &ctx->sa_record[dir], sizeof(*sa));
++	sa->sa_cmd1_word &= ~EIP93_SA_CMD_HASH_CRYPT_OFFSET;
++	sa->sa_cmd1_word |= FIELD_PREP(EIP93_SA_CMD_HASH_CRYPT_OFFSET,
++				       rctx->assoclen / sizeof(u32));
++	rctx->sa_record_base = dma_map_single(dev, sa, sizeof(*sa), DMA_TO_DEVICE);
++	if (dma_mapping_error(dev, rctx->sa_record_base))
++		return -ENOMEM;
++	rctx->sa_record_private = true;
++
++	return 0;
++}
++
++/* 请求完成或没交出去时调：撤销私有副本的映射（用的是 tfm 的记录时什么都不做） */
++void eip93_put_req_sa_record(struct eip93_device *eip93, struct eip93_cipher_reqctx *rctx)
++{
++	if (rctx->sa_record_private)
++		dma_unmap_single(eip93->dev, rctx->sa_record_base,
++				 sizeof(rctx->sa_record), DMA_TO_DEVICE);
++}
++
++/* 积压链表里的请求是 skcipher 还是 aead，各自的请求上下文位置不同 */
++static struct eip93_cipher_reqctx *eip93_cipher_async_rctx(struct crypto_async_request *async)
++{
++	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
++
++	if (ctx->type == EIP93_ALG_TYPE_AEAD)
++		return aead_request_ctx(aead_request_cast(async));
++
++	return skcipher_request_ctx(skcipher_request_cast(async));
++}
++
+ /* 可积压的请求挂进积压链表，由完成 tasklet 补交（eip93_queue_req()） */
+ int eip93_backlog_req(struct crypto_async_request *async)
+ {
+@@ -736,8 +873,12 @@ void eip93_dequeue_backlog(struct eip93_device *eip93)
+ 			list_del(&async->list);
+ 
+ 		crypto_request_complete(async, -EINPROGRESS);
+-		if (err != -EINPROGRESS)
++		if (err != -EINPROGRESS) {
++			struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(async->tfm);
++
++			eip93_put_req_sa_record(ctx->eip93, eip93_cipher_async_rctx(async));
+ 			crypto_request_complete(async, err);
++		}
+ 	}
+ }
+ 
+-- 
+2.56.1
+

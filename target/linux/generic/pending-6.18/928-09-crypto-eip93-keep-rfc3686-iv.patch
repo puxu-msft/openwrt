@@ -1,0 +1,41 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: homeiot <homeiot@local>
+Date: Mon, 23 Nov 2026 16:01:09 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20rfc3686=20=E4=B8=8D?=
+ =?utf-8?q?=E6=94=B9=E5=86=99=E8=B0=83=E7=94=A8=E6=96=B9=E7=9A=84=20IV?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：rfc3686(ctr(aes-eip93)) 完成后，请求的 8 字节 IV 被改成别的值，与软件实现 rfc3686(ctr(aes-generic)) 不同。实测（EN7528，crypto-atomic 对照软件实现，4106 字节、64 个请求）：数据全部一致，输出 IV 64/64 不一致。testmgr 的 rfc3686 静态向量没有 iv_out、随机向量也不比输出 IV，所以 testmgr FULL 测不出来。
+
+根因：eip93_handle_result() 对除 ECB 以外的模式都把状态记录里的 IV 前 ivsize 字节拷回 req->iv。CBC 与 CTR 这样做正好是软件实现的输出 IV（最后一个密文块、下一个计数器）；RFC 3686 的状态记录 IV 是 nonce||IV||计数器（eip93_send_req() 这样填），前 8 字节拷回去，调用方的 IV 就成了 nonce 加原 IV 的前半。软件实现（crypto/ctr.c 的 crypto_rfc3686_crypt()）用局部缓冲拼计数器块，不动 req->iv。authenc(…,rfc3686(…)) 走同一个函数，同样被改写。
+
+改法：RFC 3686 不写回 IV。
+
+实测：见 build/research/eip93-driver-fixes.md（同样的对照输出 IV 全部一致）。
+
+---
+ drivers/crypto/inside-secure/eip93/eip93-common.c | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-common.c b/drivers/crypto/inside-secure/eip93/eip93-common.c
+index 9f91312..648c7ca 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-common.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-common.c
+@@ -952,7 +952,11 @@ void eip93_handle_result(struct eip93_device *eip93, struct eip93_cipher_reqctx
+ 				 sizeof(*rctx->sa_state),
+ 				 DMA_FROM_DEVICE);
+ 
+-	if (!IS_ECB(rctx->flags))
++	/*
++	 * 输出 IV 与软件实现一致：CBC 是最后一个密文块，CTR 是下一个计数器。
++	 * RFC 3686 的 8 字节 IV 是每个包自带的，软件实现（crypto/ctr.c 的 crypto_rfc3686_crypt()）不改它；状态记录里的 IV 是 nonce||IV||计数器，前 8 字节写回去就把调用方的 IV 换成了 nonce 加原 IV 的前半。
++	 */
++	if (!IS_ECB(rctx->flags) && !IS_RFC3686(rctx->flags))
+ 		memcpy(reqiv, rctx->sa_state->state_iv, rctx->ivsize);
+ 
+ 	kfree(rctx->sa_state_ctr);
+-- 
+2.56.1
+

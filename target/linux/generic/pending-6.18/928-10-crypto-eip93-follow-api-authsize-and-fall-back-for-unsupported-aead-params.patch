@@ -1,0 +1,343 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: xp <a.xp@live.com>
+Date: Mon, 23 Nov 2026 18:07:54 +0800
+Subject: [PATCH] =?utf-8?q?crypto:=20eip93=20-=20aead=20=E7=9A=84=20ICV=20?=
+ =?utf-8?q?=E9=95=BF=E5=BA=A6=E8=B7=9F=E9=9A=8F=20crypto=20API=EF=BC=8C?=
+ =?utf-8?q?=E5=BC=95=E6=93=8E=E5=81=9A=E4=B8=8D=E4=BA=86=E7=9A=84=E5=8F=82?=
+ =?utf-8?q?=E6=95=B0=E4=BA=A4=E7=BB=99=E8=BD=AF=E4=BB=B6=E5=AE=9E=E7=8E=B0?=
+MIME-Version: 1.0
+Content-Type: text/plain; charset=utf-8
+Content-Transfer-Encoding: 8bit
+
+现象：不调 setauthsize 时，crypto API 认为 ICV 是 maxauthsize（crypto_aead_init_tfm()），驱动却按 0 处理，加密输出的 ICV 与软件实现不同，解密把 ICV 当成密文。实测（EN7528，0001–0010 的驱动，crypto-atomic asz=0：不调 setauthsize，对照 authenc(hmac-sha256-lib,cbc(aes-generic))）：authenc(hmac(sha256),cbc(aes)) 1504 B 64/64 不一致；asz=12 一致。setauthsize 也不看长度：不是 4 字节倍数时 DIGEST_LENGTH 取整，ICV 少几个字节；1..3 字节时 DIGEST_LENGTH 为 0，按寄存器定义是 3 个字，引擎写 12 字节 ICV，越过调用方给的输出长度（读码，会写坏别的内存，没有上机触发）。关联数据长度不是 4 的倍数或超过 1020 字节时返回 -EINVAL，软件实现则照常处理。
+
+根因：eip93_aead_cra_init() 不初始化 ctx->authsize（为 0），setkey 用它设 DIGEST_LENGTH、请求路径用它算 ICV 位置；SA 的 DIGEST_LENGTH 按 32 位字计、0 表示 3 个字，HASH_CRYPT_OFFSET 是按 32 位字计的 8 位字段，引擎做不出不是 4 字节倍数的 ICV，也放不下不是 4 的倍数或超过 1020 字节的关联数据。只拒收这些参数不行：testmgr FULL 的随机向量会给 1、18、23 这样的 authsize，软件实现接受，驱动拒收就判失败（实测改法第一版拒收时 16 个 authenc 全部判失败）。
+
+改法：cra_init 把 ctx->authsize 设成 maxauthsize，与 API 的缺省一致；每个 aead tfm 另分配一个同步的软件实现（mask 带 CRYPTO_ALG_ASYNC，排除本驱动这类异步实现；带 CRYPTO_ALG_NEED_FALLBACK，排除自己也要回退的实现；本驱动的 aead 也声明 CRYPTO_ALG_NEED_FALLBACK），setkey、setauthsize 同时设给它；ICV 不是 4 字节倍数、或关联数据长度引擎放不下的请求交给它，子请求按需分配、同步完成。软件实现分配不到时（内核里缺 cbc、des 等）tfm 照常可用，只是这些参数返回 -EINVAL，并打一次告警说明原因。ESP 经过本驱动的 ICV（12、16 字节）与关联数据（echainiv 加密 8 字节、解密 8 加 IV 长度，seqiv 16 字节）都是 4 的倍数，照旧走引擎。
+
+代价：每个 aead tfm 多一个软件实现的 tfm（authenc、hmac、cbc 各一层）与 setkey 时多一次软件的密钥处理；走引擎的请求不变。
+
+实测：asz=0（不调 setauthsize）、asz=12 一致，asz=13、asz=2（走软件实现，加解密交错）一致，关联数据长度 8/9/10 轮换（crypto-atomic amix=2，9、10 走软件实现）一致；testmgr FULL 全过；软中断里压满环的压力测试通过。详见 build/research/eip93-driver-fixes.md。
+
+---
+ .../crypto/inside-secure/eip93/eip93-aead.c   | 133 +++++++++++++++---
+ .../crypto/inside-secure/eip93/eip93-cipher.h |   2 +
+ 2 files changed, 114 insertions(+), 21 deletions(-)
+
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-aead.c b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+index 18c1c0e..ba46f9a 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-aead.c
++++ b/drivers/crypto/inside-secure/eip93/eip93-aead.c
+@@ -63,6 +63,7 @@ static int eip93_aead_cra_init(struct crypto_tfm *tfm)
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 	struct eip93_alg_template *tmpl = container_of(tfm->__crt_alg,
+ 				struct eip93_alg_template, alg.aead.base);
++	int ret;
+ 
+ 	crypto_aead_set_reqsize(__crypto_aead_cast(tfm),
+ 				sizeof(struct eip93_cipher_reqctx));
+@@ -70,8 +71,26 @@ static int eip93_aead_cra_init(struct crypto_tfm *tfm)
+ 	ctx->eip93 = tmpl->eip93;
+ 	ctx->flags = tmpl->flags;
+ 	ctx->type = tmpl->type;
++	/* 与 crypto API 的缺省一致：不调 setauthsize 时 ICV 取 maxauthsize（crypto_aead_init_tfm()） */
++	ctx->authsize = crypto_aead_maxauthsize(__crypto_aead_cast(tfm));
++
++	/*
++	 * 同步的软件实现：mask 里的 CRYPTO_ALG_ASYNC 排除本驱动（本驱动的 aead 都是异步的）与其它异步实现，CRYPTO_ALG_NEED_FALLBACK 排除自己也要回退的实现。
++	 * 分配不到（内核里缺 cbc、des 等软件实现）时走引擎的请求照常，只是引擎做不了的参数返回 -EINVAL。
++	 */
++	ctx->aead_fallback = crypto_alloc_aead(crypto_tfm_alg_name(tfm), 0,
++					       CRYPTO_ALG_ASYNC | CRYPTO_ALG_NEED_FALLBACK);
++	if (IS_ERR(ctx->aead_fallback)) {
++		dev_warn_once(ctx->eip93->dev, "no software fallback for %s (%ld): ICV sizes and AAD lengths the engine cannot handle will be rejected\n",
++			      crypto_tfm_alg_name(tfm), PTR_ERR(ctx->aead_fallback));
++		ctx->aead_fallback = NULL;
++	}
++
++	ret = eip93_alloc_sa_records(ctx);
++	if (ret)
++		crypto_free_aead(ctx->aead_fallback);
+ 
+-	return eip93_alloc_sa_records(ctx);
++	return ret;
+ }
+ 
+ static void eip93_aead_cra_exit(struct crypto_tfm *tfm)
+@@ -79,6 +98,7 @@ static void eip93_aead_cra_exit(struct crypto_tfm *tfm)
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+ 	eip93_free_sa_records(ctx);
++	crypto_free_aead(ctx->aead_fallback);
+ }
+ 
+ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+@@ -95,6 +115,16 @@ static int eip93_aead_setkey(struct crypto_aead *ctfm, const u8 *key,
+ 	if (crypto_authenc_extractkeys(&keys, key, len))
+ 		return -EINVAL;
+ 
++	/* 软件实现设同一把密钥：引擎做不了的请求交给它 */
++	if (ctx->aead_fallback) {
++		crypto_aead_clear_flags(ctx->aead_fallback, CRYPTO_TFM_REQ_MASK);
++		crypto_aead_set_flags(ctx->aead_fallback,
++				      crypto_aead_get_flags(ctfm) & CRYPTO_TFM_REQ_MASK);
++		ret = crypto_aead_setkey(ctx->aead_fallback, key, len);
++		if (ret)
++			return ret;
++	}
++
+ 	if (IS_RFC3686(ctx->flags)) {
+ 		if (keys.enckeylen < CTR_RFC3686_NONCE_SIZE)
+ 			return -EINVAL;
+@@ -157,8 +187,25 @@ static int eip93_aead_setauthsize(struct crypto_aead *ctfm,
+ {
+ 	struct crypto_tfm *tfm = crypto_aead_tfm(ctfm);
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
++	bool engine = IS_ALIGNED(authsize, sizeof(u32));
++	int ret;
++
++	/*
++	 * SA 的 DIGEST_LENGTH 按 32 位字计、0 表示 3 个字（eip93-regs.h 的 EIP93_SA_CMD_DIGEST_3WORD），引擎做不出不是 4 字节倍数的 ICV（1..3 字节时会写 12 字节，越过调用方给的输出长度）。
++	 * 这样的 tfm 的请求全部交给软件实现（eip93_aead_crypt()），SA 不用改；没有软件实现时拒收。
++	 */
++	if (!engine && !ctx->aead_fallback)
++		return -EINVAL;
++	if (ctx->aead_fallback) {
++		ret = crypto_aead_setauthsize(ctx->aead_fallback, authsize);
++		if (ret)
++			return ret;
++	}
+ 
+ 	ctx->authsize = authsize;
++	if (!engine)
++		return 0;
++
+ 	eip93_sa_records_begin_update(ctx);
+ 	ctx->sa_record->sa_cmd0_word &= ~EIP93_SA_CMD_DIGEST_LENGTH;
+ 	ctx->sa_record->sa_cmd0_word |= FIELD_PREP(EIP93_SA_CMD_DIGEST_LENGTH,
+@@ -168,6 +215,27 @@ static int eip93_aead_setauthsize(struct crypto_aead *ctfm,
+ 	return 0;
+ }
+ 
++/* 交给软件实现，同步完成；只用在引擎做不了的参数上，子请求按需分配 */
++static int eip93_aead_fallback(struct aead_request *req, bool decrypt)
++{
++	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(req->base.tfm);
++	u32 may_sleep = req->base.flags & CRYPTO_TFM_REQ_MAY_SLEEP;
++	struct aead_request *subreq;
++	int ret;
++
++	subreq = aead_request_alloc(ctx->aead_fallback, may_sleep ? GFP_KERNEL : GFP_ATOMIC);
++	if (!subreq)
++		return -ENOMEM;
++
++	aead_request_set_callback(subreq, may_sleep, NULL, NULL);
++	aead_request_set_crypt(subreq, req->src, req->dst, req->cryptlen, req->iv);
++	aead_request_set_ad(subreq, req->assoclen);
++	ret = decrypt ? crypto_aead_decrypt(subreq) : crypto_aead_encrypt(subreq);
++	aead_request_free(subreq);
++
++	return ret;
++}
++
+ static int eip93_aead_crypt(struct aead_request *req)
+ {
+ 	struct eip93_cipher_reqctx *rctx = aead_request_ctx(req);
+@@ -176,10 +244,17 @@ static int eip93_aead_crypt(struct aead_request *req)
+ 	struct crypto_aead *aead = crypto_aead_reqtfm(req);
+ 	int ret;
+ 
+-	/* 关联数据长度按 32 位字写进 SA 的 HASH_CRYPT_OFFSET（8 位字段），不是 4 的倍数或超出字段的放不进去 */
+-	if (!IS_ALIGNED(req->assoclen, sizeof(u32)) ||
+-	    req->assoclen / sizeof(u32) > FIELD_MAX(EIP93_SA_CMD_HASH_CRYPT_OFFSET))
+-		return -EINVAL;
++	/*
++	 * 引擎做不了的交给软件实现：ICV 不是 4 字节倍数的（见 eip93_aead_setauthsize()）；关联数据长度按 32 位字写进 SA 的 HASH_CRYPT_OFFSET（8 位字段），不是 4 的倍数或超过 1020 字节的放不进去。
++	 * ESP 经过本驱动的 ICV（12、16 字节）与关联数据（echainiv 加密 8 字节、解密 8 加 IV 长度，seqiv 16 字节）都是 4 的倍数，走引擎。
++	 */
++	if (!IS_ALIGNED(ctx->authsize, sizeof(u32)) ||
++	    !IS_ALIGNED(req->assoclen, sizeof(u32)) ||
++	    req->assoclen / sizeof(u32) > FIELD_MAX(EIP93_SA_CMD_HASH_CRYPT_OFFSET)) {
++		if (!ctx->aead_fallback)
++			return -EINVAL;
++		return eip93_aead_fallback(req, IS_DECRYPT(rctx->flags));
++	}
+ 
+ 	rctx->textsize = req->cryptlen;
+ 	rctx->blksize = ctx->blksize;
+@@ -245,7 +320,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_md5_cbc_aes = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -273,7 +349,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha1_cbc_aes = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -301,7 +378,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha224_cbc_aes = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -329,7 +407,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha256_cbc_aes = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = AES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -358,7 +437,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_md5_rfc3686_aes = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -387,7 +467,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha1_rfc3686_aes = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -416,7 +497,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha224_rfc3686_aes = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -445,7 +527,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha256_rfc3686_aes = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = 1,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -473,7 +556,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_md5_cbc_des = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -501,7 +585,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha1_cbc_des = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -529,7 +614,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha224_cbc_des = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -557,7 +643,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha256_cbc_des = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = DES_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0,
+@@ -585,7 +672,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_md5_cbc_des3_ede = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0x0,
+@@ -613,7 +701,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha1_cbc_des3_ede = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0x0,
+@@ -641,7 +730,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha224_cbc_des3_ede = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0x0,
+@@ -669,7 +759,8 @@ struct eip93_alg_template eip93_alg_authenc_hmac_sha256_cbc_des3_ede = {
+ 			.cra_priority = EIP93_CRA_PRIORITY,
+ 			.cra_flags = CRYPTO_ALG_ASYNC |
+ 					CRYPTO_ALG_KERN_DRIVER_ONLY |
+-					CRYPTO_ALG_ALLOCATES_MEMORY,
++					CRYPTO_ALG_ALLOCATES_MEMORY |
++					CRYPTO_ALG_NEED_FALLBACK,
+ 			.cra_blocksize = DES3_EDE_BLOCK_SIZE,
+ 			.cra_ctxsize = sizeof(struct eip93_crypto_ctx),
+ 			.cra_alignmask = 0x0,
+diff --git a/drivers/crypto/inside-secure/eip93/eip93-cipher.h b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
+index 0f4fe95..9fad77d 100644
+--- a/drivers/crypto/inside-secure/eip93/eip93-cipher.h
++++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
+@@ -26,6 +26,8 @@ struct eip93_crypto_ctx {
+ 	int				blksize;
+ 	/* AEAD specific */
+ 	unsigned int			authsize;
++	/* 软件实现，接引擎做不了的 aead 请求（eip93_aead_fallback()）；分配不到时为 NULL */
++	struct crypto_aead		*aead_fallback;
+ 	enum eip93_alg_type		type;
+ };
+ 
+-- 
+2.56.1
+

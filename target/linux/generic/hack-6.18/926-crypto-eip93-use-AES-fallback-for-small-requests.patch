@@ -32,7 +32,7 @@ Signed-off-by: Aviana Cruz <gwencroft@proton.me>
 +	  will fallback to software crypt of AES-128 skcipher.
 --- a/drivers/crypto/inside-secure/eip93/eip93-cipher.c
 +++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.c
-@@ -30,6 +30,13 @@ void eip93_skcipher_handle_result(struct
+@@ -31,6 +31,13 @@ void eip93_skcipher_handle_result(struct crypto_async_request *async, int err)
  	skcipher_request_complete(req, err);
  }
  
@@ -43,10 +43,10 @@ Signed-off-by: Aviana Cruz <gwencroft@proton.me>
 +		!IS_RFC3686(flags);
 +}
 +
- static int eip93_skcipher_send_req(struct crypto_async_request *async)
+ /* 没交给引擎（出错或环满）时释放反弹缓冲，请求可以原样再交一次（积压队列补交） */
+ int eip93_skcipher_send_req(struct crypto_async_request *async, gfp_t gfp)
  {
- 	struct skcipher_request *req = skcipher_request_cast(async);
-@@ -52,12 +59,21 @@ static int eip93_skcipher_cra_init(struc
+@@ -53,12 +60,21 @@ static int eip93_skcipher_cra_init(struct crypto_tfm *tfm)
  	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
  	struct eip93_alg_template *tmpl = container_of(tfm->__crt_alg,
  				struct eip93_alg_template, alg.skcipher.base);
@@ -71,16 +71,16 @@ Signed-off-by: Aviana Cruz <gwencroft@proton.me>
  	ctx->eip93 = tmpl->eip93;
  	ctx->type = tmpl->type;
  
-@@ -75,6 +91,8 @@ static void eip93_skcipher_cra_exit(stru
- 	dma_unmap_single(ctx->eip93->dev, ctx->sa_record_base,
- 			 sizeof(*ctx->sa_record), DMA_TO_DEVICE);
- 	kfree(ctx->sa_record);
+@@ -70,6 +86,8 @@ static void eip93_skcipher_cra_exit(struct crypto_tfm *tfm)
+ 	struct eip93_crypto_ctx *ctx = crypto_tfm_ctx(tfm);
+ 
+ 	eip93_free_sa_records(ctx);
 +
 +	crypto_free_skcipher(ctx->fallback);
  }
  
  static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
-@@ -117,6 +135,14 @@ static int eip93_skcipher_setkey(struct
+@@ -112,6 +130,14 @@ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
  
  	if (flags & EIP93_ALG_AES) {
  		struct crypto_aes_ctx aes;
@@ -95,7 +95,7 @@ Signed-off-by: Aviana Cruz <gwencroft@proton.me>
  
  		ctx->blksize = AES_BLOCK_SIZE;
  		ret = aes_expandkey(&aes, key, keylen);
-@@ -133,12 +159,13 @@ static int eip93_skcipher_setkey(struct
+@@ -130,12 +156,13 @@ static int eip93_skcipher_setkey(struct crypto_skcipher *ctfm, const u8 *key,
  	return 0;
  }
  
@@ -110,7 +110,7 @@ Signed-off-by: Aviana Cruz <gwencroft@proton.me>
  	int ret;
  
  	if (!req->cryptlen)
-@@ -153,6 +180,21 @@ static int eip93_skcipher_crypt(struct s
+@@ -150,6 +177,21 @@ static int eip93_skcipher_crypt(struct skcipher_request *req)
  				crypto_skcipher_blocksize(skcipher)))
  			return -EINVAL;
  
@@ -129,10 +129,10 @@ Signed-off-by: Aviana Cruz <gwencroft@proton.me>
 +				 crypto_skcipher_decrypt(&rctx->fallback_req);
 +	}
 +
- 	ctx->sa_record_base = dma_map_single(ctx->eip93->dev, ctx->sa_record,
- 					     sizeof(*ctx->sa_record), DMA_TO_DEVICE);
- 	ret = dma_mapping_error(ctx->eip93->dev, ctx->sa_record_base);
-@@ -181,7 +223,7 @@ static int eip93_skcipher_encrypt(struct
+ 	rctx->assoclen = 0;
+ 	rctx->textsize = req->cryptlen;
+ 	rctx->authsize = 0;
+@@ -180,7 +222,7 @@ static int eip93_skcipher_encrypt(struct skcipher_request *req)
  	rctx->flags = tmpl->flags;
  	rctx->flags |= EIP93_ENCRYPT;
  
@@ -141,7 +141,7 @@ Signed-off-by: Aviana Cruz <gwencroft@proton.me>
  }
  
  static int eip93_skcipher_decrypt(struct skcipher_request *req)
-@@ -196,7 +238,7 @@ static int eip93_skcipher_decrypt(struct
+@@ -192,7 +234,7 @@ static int eip93_skcipher_decrypt(struct skcipher_request *req)
  	rctx->flags = tmpl->flags;
  	rctx->flags |= EIP93_DECRYPT;
  
@@ -152,19 +152,19 @@ Signed-off-by: Aviana Cruz <gwencroft@proton.me>
  /* Available algorithms in this module */
 --- a/drivers/crypto/inside-secure/eip93/eip93-cipher.h
 +++ b/drivers/crypto/inside-secure/eip93/eip93-cipher.h
-@@ -22,6 +22,7 @@ struct eip93_crypto_ctx {
- 	unsigned int			assoclen;
- 	bool				set_assoc;
+@@ -29,6 +29,7 @@ struct eip93_crypto_ctx {
+ 	/* 软件实现，接引擎做不了的 aead 请求（eip93_aead_fallback()）；分配不到时为 NULL */
+ 	struct crypto_aead		*aead_fallback;
  	enum eip93_alg_type		type;
 +	struct crypto_skcipher		*fallback;
  };
  
  struct eip93_cipher_reqctx {
-@@ -42,6 +43,7 @@ struct eip93_cipher_reqctx {
+@@ -55,6 +56,7 @@ struct eip93_cipher_reqctx {
  	int				dst_nents;
  	struct sa_state			*sa_state_ctr;
  	dma_addr_t			sa_state_ctr_base;
 +	struct skcipher_request		fallback_req;
  };
  
- int check_valid_request(struct eip93_cipher_reqctx *rctx);
+ /*
