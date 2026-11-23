@@ -1,0 +1,599 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: QDMA 拥塞、WRR 与 CDMA VLAN 寄存器按整字位掩码访问，大小端都对
+
+现象：EN7528（小端）上两个 QDMA 的 TXQ_CNGST_CFG（+0xa0）读回 0x0000c000：驱动在 probe 时打开的尾丢弃与 DEI 丢弃落在 bit15/14（tick 字段），原厂定义的 bit31/30 从未置位，debugfs 却照样显示 +tail_drop +dei_drop；TXQ_DYN_TOTALTHR（+0xa4）读回 0xffff02c0，debugfs 显示 min=65535 max=704，上下限颠倒；TXWRR_WEIGHT_CFG（+0x88）空闲时读回 0x40000000，完成位在 bit30，驱动的访问函数读的是 bit14（恒 0），WRR 权重读写一旦启用就永远等不到完成，通道与队列号也会写进权重字段。反方向：包补丁 001 把 CDMA_VLAN_CTRL（gdm_vlan）的两个半字对调成小端排布，大端 EN751221 上 set_gdm_vlan_stag_parse 置的是 bit16（TPID 0x8100 变成 0x8101），bit0 的标签解析不开。
+
+根因：这几个寄存器用 {u16, u16}（或 u16 + u8 + u8）结构体描述，经 en75_rreg/en75_wreg 的 union 当作 u32 读写，第一个成员落在 u32 的哪一半取决于 CPU 字节序（大端是高半字，小端是低半字）。上游 90b6d9b（en7528 little endian support）把其余寄存器改成了 { u32 word; } 加位掩码访问函数，这几个漏掉了。
+
+改法：qregs_wrr_weight、qregs_tx_congest_cfg、qregs_tx_congest_thr、gdm_vlan、gdm_pppoe 改成 { u32 word; }，字段用 BIT/GENMASK 写出在整字里的位置，访问函数用 FIELD_GET/FIELD_SET（与上游其余寄存器同一写法）。readl/writel 交出的就是 CPU 序的寄存器值，掩码作用在这个值上，不再依赖结构体在内存里的排布，大小端结果相同。位置依据：TXQ_CNGST_CFG 尾丢弃 bit31、DEI 丢弃 bit30、动态门限 bit29、[27:24] 超门限阻塞 TX 环、[21:20] DEI 刻度、[18:16] 动态更新源、[15:0] tick（原厂 qdma_lan.ko 的 qdma_set_txq_cngst_cfg、qdma_set_txq_dei_drop_mode），[23:22] margin（qdma_set_tx_cngst_mode）；airoha REG_TXQ_CNGST_CFG 的丢弃位相同。TXQ_DYN_TOTALTHR 上限在高半字、下限在低半字（qdma_set_txq_cngst_total_threshold，要求上限不小于下限；原厂把 API 数值左移 2 位后写入，访问函数注释写明了这一换算）。TXWRR_WEIGHT_CFG 写命令 bit31、完成 bit30、通道 [23:19]、队列 [18:16]、权重 [7:0]（qdmaSetTxQosScheduler；airoha REG_TXWRR_WEIGHT_CFG 的命令、完成、通道、队列位相同，权重字段是 [15:0]）。CDMA_VLAN_CTRL 的 TPID 在 [31:16]、bit1、bit0（fe_api_set_ins_vlan_tpid、fe_api_set_vlan_enable、macEN7512STagEnable）；CDMA_PPP_GEN 沿用本驱动原先大端排布给出的位置（标志 bit16、会话号 [15:0]），未与原厂核对，驱动也不用它。新增 tick、上下限、权重值、TPID、会话号的访问函数；debugfs 改用访问函数解码，wrr_weight 另显示权重值与 +done。三个 QDMA 字段的寄存器偏移由 static_assert 固定。
+
+影响面：EN7528 上 QDMA 初始化写进 +0xa0 的值由 0x0000c000 变为 0xc0000000，尾丢弃与 DEI 丢弃第一次真正打开（动态门限仍关，静态队列门限 +0xb0..+0xcc 保持复位值 0x00300060）。只在 probe 的配置路径写一次，收发包路径不变。小端上 gdm_vlan 仍是整字读改写 bit0；大端 EN751221 上标签解析位回到 bit0、TPID 不再被改。WRR 权重驱动尚未使用，这里只修访问函数。
+
+GS2107 上热换实测（2026-11-23，模块只放 /tmp）：修前两个 QDMA 的 +0xa0 读回 0x0000c000、+0x88 读回 0x40000000；修后 +0xa0 读回 0xc0000000，debugfs 解码 tx_congest_thr min=704 max=65535、wrr_weight +done；经 debugfs fe_regs 向 +0x88 写 WRR 读命令（通道 0 队列 1、通道 1 队列 0）读回 0x40010000、0x40080000，完成位在 bit30、通道与队列在 [23:19]/[18:16]。回归：PPE 发卡套件（IPv4/IPv6 的 TCP、UDP、TOS 用例）的吞吐、绑定、conntrack 冻结与抓包核对与同日基线模块一致；软件转发路径与本机发包路径做了基线/修复交替 A/B，两种模块的结果分布重合；本机发包在千兆与 LAN 口协商成 100M（交换机出口拥塞、CPU 口 pause 反压回 QDMA）两种情形下都无重传，100M 时两种模块都是 94 Mb/s 线速；QDMA 每通道丢包计数（+0x280..、+0x2c0..）全程为 0（这组计数没有做过正对照）。
+
+diff --git a/econet_eth_debug.c b/econet_eth_debug.c
+index dd663b4..b90a328 100644
+--- a/econet_eth_debug.c
++++ b/econet_eth_debug.c
+@@ -298,7 +298,15 @@ static int en75_qdma_regs(struct seq_file *m, void *v)
+ 	}
+ 
+ 	/* wrr_weight needs writing to read as anything meaningful */
+-	seq_printf(m, "wrr_weight=%.08x\n",      en75_word(en75_rreg(&regs->wrr_weight)));
++	{
++		struct qregs_wrr_weight cfg = en75_rreg(&regs->wrr_weight);
++
++		seq_printf(m, "wrr_weight=%.08x value=%u%s\n",
++			en75_word(cfg),
++			get_qregs_wrr_weight_value(&cfg),
++			is_qregs_wrr_weight_done(&cfg) ? " +done" : ""
++		);
++	}
+ 	seq_printf(m, "buf_usage_cfg=%.08x\n",   en75_rreg(&regs->buf_usage_cfg));
+ 	seq_printf(m, "tx_meter_cfg=%.08x\n",    en75_rreg(&regs->tx_meter_cfg));
+ 	seq_printf(m, "tx_limit_cfg=%.08x\n",    en75_rreg(&regs->tx_limit_cfg));
+@@ -311,7 +319,7 @@ static int en75_qdma_regs(struct seq_file *m, void *v)
+ 			"tx_congest_cfg=%.08x dyncong_tick=%u margin=%u dei_scale=%u\n"
+ 			"%s%s%s%s%s%s%s%s%s%s\n",
+ 			en75_word(cfg),
+-			cfg.dyncong_tick,
++			get_qregs_tx_congest_cfg_dyncong_tick(&cfg),
+ 			get_qregs_tx_congest_cfg_dyncong_margin(&cfg),
+ 			get_qregs_tx_congest_cfg_dyncong_dei_scale(&cfg),
+ 
+@@ -339,8 +347,8 @@ static int en75_qdma_regs(struct seq_file *m, void *v)
+ 		seq_printf(m,
+ 			"tx_congest_thr=%.08x min=%u max=%u\n",
+ 			en75_word(cfg),
+-			cfg.min,
+-			cfg.max
++			get_qregs_tx_congest_thr_min(&cfg),
++			get_qregs_tx_congest_thr_max(&cfg)
+ 		);
+ 	}
+ 
+diff --git a/gdm_regs.h b/gdm_regs.h
+index e0d15ce..ad3c9f5 100644
+--- a/gdm_regs.h
++++ b/gdm_regs.h
+@@ -13,35 +13,27 @@
+ 
+ /** gdm: GDM Registers */
+ struct gdm {
+-	/** gdm_vlan: VLAN tag control */
+-	struct gdm_vlan {
+-		/**
+-		 * See accessors:
+-		 * is_gdm_vlan_urx()
+-		 * set_gdm_vlan_urx()
+-		 * is_gdm_vlan_stag_parse()
+-		 * set_gdm_vlan_stag_parse()
+-		 */
+-		u16 bitfield_0;
+-
+-		/** gdm_vlan_tpid: bits 31:16 (0x8100 after reset; the vendor fe_api_set_ins_vlan_tpid writes it) */
+-		u16 tpid;
+-
+-	} vlan;
+-
+-	/** gdm_pppoe: PPPoE header control */
+-	struct gdm_pppoe {
+-		/**
+-		 * See accessors:
+-		 * is_gdm_pppoe_ttx()
+-		 * set_gdm_pppoe_ttx()
+-		 */
+-		u16 bitfield_0;
+-
+-		/** gdm_pppoe_pppid: PPPoE Session ID to insert on transmitted packets */
+-		u16 pppoe_id;
++	/**
++	 * gdm_vlan: VLAN tag control（原厂 CDMA_VLAN_CTRL / CDMA2_VLAN_CTRL）
++	 * See accessors:
++	 * get_gdm_vlan_tpid()
++	 * set_gdm_vlan_tpid()
++	 * is_gdm_vlan_urx()
++	 * set_gdm_vlan_urx()
++	 * is_gdm_vlan_stag_parse()
++	 * set_gdm_vlan_stag_parse()
++	 */
++	struct gdm_vlan { u32 word; } vlan;
+ 
+-	} pppoe;
++	/**
++	 * gdm_pppoe: PPPoE header control（原厂 CDMA_PPP_GEN）
++	 * See accessors:
++	 * is_gdm_pppoe_ttx()
++	 * set_gdm_pppoe_ttx()
++	 * get_gdm_pppoe_id()
++	 * set_gdm_pppoe_id()
++	 */
++	struct gdm_pppoe { u32 word; } pppoe;
+ 
+ 	/**
+ 	 * See accessors:
+@@ -656,42 +648,60 @@ struct gdm {
+ };
+ 
+ /**
+- * Bitfield accessors for: gdm_vlan bitfield_0
++ * Bitfield accessors for: struct gdm_vlan
++ * TPID 在高半字、标志在低半字（原厂 fe_api_set_ins_vlan_tpid、fe_api_set_vlan_enable、macEN7512STagEnable；复位值 0x81000000）；字段是整字上的掩码，与 CPU 字节序无关。
+  */
+ 
++#define GDM_VLAN_TPID_MASK				GENMASK(31, 16)
+ #define GDM_VLAN_URX					BIT(1)
+ #define GDM_VLAN_STAG_PARSE				BIT(0)
+ 
++/** DMA 插入的 VLAN 标签的 TPID（复位值 0x8100） */
++static inline u16 get_gdm_vlan_tpid(struct gdm_vlan *x) {
++	return FIELD_GET(GDM_VLAN_TPID_MASK, x->word);
++}
++static inline void set_gdm_vlan_tpid(struct gdm_vlan *x, u16 v) {
++	x->word = FIELD_SET(x->word, GDM_VLAN_TPID_MASK, v);
++}
+ 
+ /** Vendor fe_api_set_vlan_enable writes this bit; its effect is not verified */
+ static inline bool is_gdm_vlan_urx(struct gdm_vlan *x) {
+-	return FIELD_GET(GDM_VLAN_URX, x->bitfield_0);
++	return FIELD_GET(GDM_VLAN_URX, x->word);
+ }
+ static inline void set_gdm_vlan_urx(struct gdm_vlan *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, GDM_VLAN_URX, v);
++	x->word = FIELD_SET(x->word, GDM_VLAN_URX, v);
+ }
+ 
+ /** The DMA parses the MediaTek special tag that the CPU writes into the frame (vendor CDMA_VLAN_CTRL bit0, set by macEN7512STagEnable). TX checksum offload and TSO of tagged frames need it: on GS2107 the checksums came out wrong without it. */
+ static inline bool is_gdm_vlan_stag_parse(struct gdm_vlan *x) {
+-	return FIELD_GET(GDM_VLAN_STAG_PARSE, x->bitfield_0);
++	return FIELD_GET(GDM_VLAN_STAG_PARSE, x->word);
+ }
+ static inline void set_gdm_vlan_stag_parse(struct gdm_vlan *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, GDM_VLAN_STAG_PARSE, v);
++	x->word = FIELD_SET(x->word, GDM_VLAN_STAG_PARSE, v);
+ }
+ 
+ /**
+- * Bitfield accessors for: gdm_pppoe bitfield_0
++ * Bitfield accessors for: struct gdm_pppoe
++ * 位置沿用本驱动原先按大端 EN751221 排布的结构体（标志在高半字、会话号在低半字），未与原厂代码核对、未实测；驱动不用这个寄存器。
+  */
+ 
+-#define GDM_PPPOE_TTX					BIT(0)
+-
++#define GDM_PPPOE_TTX					BIT(16)
++#define GDM_PPPOE_ID_MASK				GENMASK(15, 0)
+ 
+ /** Insert PPPoE header on transmitted packets */
+ static inline bool is_gdm_pppoe_ttx(struct gdm_pppoe *x) {
+-	return FIELD_GET(GDM_PPPOE_TTX, x->bitfield_0);
++	return FIELD_GET(GDM_PPPOE_TTX, x->word);
+ }
+ static inline void set_gdm_pppoe_ttx(struct gdm_pppoe *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, GDM_PPPOE_TTX, v);
++	x->word = FIELD_SET(x->word, GDM_PPPOE_TTX, v);
++}
++
++/** PPPoE Session ID to insert on transmitted packets */
++static inline u16 get_gdm_pppoe_id(struct gdm_pppoe *x) {
++	return FIELD_GET(GDM_PPPOE_ID_MASK, x->word);
++}
++static inline void set_gdm_pppoe_id(struct gdm_pppoe *x, u16 v) {
++	x->word = FIELD_SET(x->word, GDM_PPPOE_ID_MASK, v);
+ }
+ 
+ /**
+diff --git a/qdma_regs.h b/qdma_regs.h
+index 3da268d..a9de3ee 100644
+--- a/qdma_regs.h
++++ b/qdma_regs.h
+@@ -4,6 +4,8 @@
+ 
+ #include <linux/bits.h>
+ #include <linux/bitfield.h>
++#include <linux/build_bug.h>
++#include <linux/stddef.h>
+ #include <linux/types.h>
+ 
+ #ifndef FIELD_SET
+@@ -202,26 +204,15 @@ struct qregs {
+ 	/**
+ 	 * qregs_wrr_weight: Read and write a WRR weight for a channel+queue pair.
+ 	 * Called QDMA_CSR_TXWRR_WEIGHT_CFG.
++	 * See accessors:
++	 * set_qregs_wrr_weight_write()
++	 * is_qregs_wrr_weight_done()
++	 * set_qregs_wrr_weight_channel()
++	 * set_qregs_wrr_weight_queue()
++	 * get_qregs_wrr_weight_value()
++	 * set_qregs_wrr_weight_value()
+ 	 */
+-	struct qregs_wrr_weight {
+-		/**
+-		 * See accessors:
+-		 * set_qregs_wrr_weight_write()
+-		 * is_qregs_wrr_weight_done()
+-		 * set_qregs_wrr_weight_channel()
+-		 * set_qregs_wrr_weight_queue()
+-		 */
+-		u16 bitfield_0;
+-
+-		u8 unused_0;
+-
+-		/**
+-		 * qregs_wrr_weight_value: The WRR weight to read or write for the configured
+-		 * channel+queue.
+-		 */
+-		u8 value;
+-
+-	} wrr_weight;
++	struct qregs_wrr_weight { u32 word; } wrr_weight;
+ 
+ 	u32 unused_5;
+ 
+@@ -249,60 +240,47 @@ struct qregs {
+ 	 */
+ 	u32 tx_limit_param;
+ 
+-	/** qregs_tx_congest_cfg:  */
+-	struct qregs_tx_congest_cfg {
+-		/**
+-		 * See accessors:
+-		 * is_qregs_tx_congest_cfg_tail_drop_en()
+-		 * set_qregs_tx_congest_cfg_tail_drop_en()
+-		 * is_qregs_tx_congest_cfg_dei_drop_en()
+-		 * set_qregs_tx_congest_cfg_dei_drop_en()
+-		 * is_qregs_tx_congest_cfg_dyncong_en()
+-		 * set_qregs_tx_congest_cfg_dyncong_en()
+-		 * is_qregs_tx_congest_cfg_max_thr_blk_tx1()
+-		 * set_qregs_tx_congest_cfg_max_thr_blk_tx1()
+-		 * is_qregs_tx_congest_cfg_min_thr_blk_tx1()
+-		 * set_qregs_tx_congest_cfg_min_thr_blk_tx1()
+-		 * is_qregs_tx_congest_cfg_max_thr_blk_tx0()
+-		 * set_qregs_tx_congest_cfg_max_thr_blk_tx0()
+-		 * is_qregs_tx_congest_cfg_min_thr_blk_tx0()
+-		 * set_qregs_tx_congest_cfg_min_thr_blk_tx0()
+-		 * get_qregs_tx_congest_cfg_dyncong_margin()
+-		 * set_qregs_tx_congest_cfg_dyncong_margin()
+-		 * get_qregs_tx_congest_cfg_dyncong_dei_scale()
+-		 * set_qregs_tx_congest_cfg_dyncong_dei_scale()
+-		 * is_qregs_tx_congest_cfg_dyncong_upd_wrr()
+-		 * set_qregs_tx_congest_cfg_dyncong_upd_wrr()
+-		 * is_qregs_tx_congest_cfg_dyncong_upd_txrx()
+-		 * set_qregs_tx_congest_cfg_dyncong_upd_txrx()
+-		 * is_qregs_tx_congest_cfg_dyncong_upd_tick()
+-		 * set_qregs_tx_congest_cfg_dyncong_upd_tick()
+-		 */
+-		u16 bitfield_0;
+-
+-		/**
+-		 * qregs_tx_congest_cfg_dyncong_tick: Dynamic congestion ticker rate in
+-		 * microseconds
+-		 */
+-		u16 dyncong_tick;
+-
+-	} tx_congest_cfg;
+-
+-	/** qregs_tx_congest_thr:  */
+-	struct qregs_tx_congest_thr {
+-		/**
+-		 * qregs_tx_congest_thr_max: When total buffer usage exceeds this, drop all
+-		 * packets except VIP
+-		 */
+-		u16 max;
+-
+-		/**
+-		 * qregs_tx_congest_thr_min: When total buffer usage exceeds this, dynamic
+-		 * congestion control will start
+-		 */
+-		u16 min;
++	/**
++	 * qregs_tx_congest_cfg: Called QDMA_CSR_TXQ_CNGST_CFG.
++	 * See accessors:
++	 * is_qregs_tx_congest_cfg_tail_drop_en()
++	 * set_qregs_tx_congest_cfg_tail_drop_en()
++	 * is_qregs_tx_congest_cfg_dei_drop_en()
++	 * set_qregs_tx_congest_cfg_dei_drop_en()
++	 * is_qregs_tx_congest_cfg_dyncong_en()
++	 * set_qregs_tx_congest_cfg_dyncong_en()
++	 * is_qregs_tx_congest_cfg_max_thr_blk_tx1()
++	 * set_qregs_tx_congest_cfg_max_thr_blk_tx1()
++	 * is_qregs_tx_congest_cfg_min_thr_blk_tx1()
++	 * set_qregs_tx_congest_cfg_min_thr_blk_tx1()
++	 * is_qregs_tx_congest_cfg_max_thr_blk_tx0()
++	 * set_qregs_tx_congest_cfg_max_thr_blk_tx0()
++	 * is_qregs_tx_congest_cfg_min_thr_blk_tx0()
++	 * set_qregs_tx_congest_cfg_min_thr_blk_tx0()
++	 * get_qregs_tx_congest_cfg_dyncong_margin()
++	 * set_qregs_tx_congest_cfg_dyncong_margin()
++	 * get_qregs_tx_congest_cfg_dyncong_dei_scale()
++	 * set_qregs_tx_congest_cfg_dyncong_dei_scale()
++	 * is_qregs_tx_congest_cfg_dyncong_upd_wrr()
++	 * set_qregs_tx_congest_cfg_dyncong_upd_wrr()
++	 * is_qregs_tx_congest_cfg_dyncong_upd_txrx()
++	 * set_qregs_tx_congest_cfg_dyncong_upd_txrx()
++	 * is_qregs_tx_congest_cfg_dyncong_upd_tick()
++	 * set_qregs_tx_congest_cfg_dyncong_upd_tick()
++	 * get_qregs_tx_congest_cfg_dyncong_tick()
++	 * set_qregs_tx_congest_cfg_dyncong_tick()
++	 */
++	struct qregs_tx_congest_cfg { u32 word; } tx_congest_cfg;
+ 
+-	} tx_congest_thr;
++	/**
++	 * qregs_tx_congest_thr: Called QDMA_CSR_TXQ_DYN_TOTALTHR.
++	 * See accessors:
++	 * get_qregs_tx_congest_thr_max()
++	 * set_qregs_tx_congest_thr_max()
++	 * get_qregs_tx_congest_thr_min()
++	 * set_qregs_tx_congest_thr_min()
++	 */
++	struct qregs_tx_congest_thr { u32 word; } tx_congest_thr;
+ 
+ 	/**
+ 	 * qregs_tx_per_ch_dthr: Called QDMA_CSR_TXQ_DYN_CHNLTHR_CFG, tx per-channel
+@@ -466,6 +444,11 @@ struct qregs {
+ 
+ };
+ 
++/* 上面按整字掩码描述的字段的寄存器偏移（原厂 qdma_lan.ko）。 */
++static_assert(offsetof(struct qregs, wrr_weight) == 0x88);
++static_assert(offsetof(struct qregs, tx_congest_cfg) == 0xa0);
++static_assert(offsetof(struct qregs, tx_congest_thr) == 0xa4);
++
+ /**
+  * Bitfield accessors for: qregs_qcfg bitfield_0
+  */
+@@ -794,16 +777,19 @@ static inline void set_qregs_wrr_mode_by_byte(struct wrr_mode *x, bool v) {
+ }
+ 
+ /**
+- * Bitfield accessors for: qregs_wrr_weight bitfield_0
++ * Bitfield accessors for: struct qregs_wrr_weight
++ * 位置取自原厂 qdma_lan.ko 的 qdmaSetTxQosScheduler（轮询 bit30 等完成，权重只用 [7:0]）与 airoha 的 REG_TXWRR_WEIGHT_CFG（airoha 的权重字段是 [15:0]）；字段是整字上的掩码，与 CPU 字节序无关。
+  */
+ 
+-#define QREGS_WRR_WEIGHT_WRITE				BIT(15)
+-#define QREGS_WRR_WEIGHT_DONE				BIT(14)
+-#define QREGS_WRR_WEIGHT_CHANNEL_MASK			GENMASK(7, 3)
+-#define QREGS_WRR_WEIGHT_QUEUE_MASK			GENMASK(2, 0)
++#define QREGS_WRR_WEIGHT_WRITE				BIT(31)
++#define QREGS_WRR_WEIGHT_DONE				BIT(30)
++#define QREGS_WRR_WEIGHT_CHANNEL_MASK			GENMASK(23, 19)
++#define QREGS_WRR_WEIGHT_QUEUE_MASK			GENMASK(18, 16)
++#define QREGS_WRR_WEIGHT_VALUE_MASK			GENMASK(7, 0)
+ 
++/** 1：把权重字段写进所选通道与队列；0：把它的权重读进权重字段。 */
+ static inline void set_qregs_wrr_weight_write(struct qregs_wrr_weight *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_WRR_WEIGHT_WRITE, v);
++	x->word = FIELD_SET(x->word, QREGS_WRR_WEIGHT_WRITE, v);
+ }
+ 
+ /**
+@@ -811,18 +797,30 @@ static inline void set_qregs_wrr_weight_write(struct qregs_wrr_weight *x, bool v
+  * the operation is done.
+  */
+ static inline bool is_qregs_wrr_weight_done(struct qregs_wrr_weight *x) {
+-	return FIELD_GET(QREGS_WRR_WEIGHT_DONE, x->bitfield_0);
++	return FIELD_GET(QREGS_WRR_WEIGHT_DONE, x->word);
+ }
+ static inline void set_qregs_wrr_weight_channel(struct qregs_wrr_weight *x, u8 v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_WRR_WEIGHT_CHANNEL_MASK, v);
++	x->word = FIELD_SET(x->word, QREGS_WRR_WEIGHT_CHANNEL_MASK, v);
+ }
+ static inline void set_qregs_wrr_weight_queue(struct qregs_wrr_weight *x, u8 v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_WRR_WEIGHT_QUEUE_MASK, v);
++	x->word = FIELD_SET(x->word, QREGS_WRR_WEIGHT_QUEUE_MASK, v);
++}
++
++/**
++ * The WRR weight to read or write for the configured channel+queue.
++ * 原厂 API 以权重 0xff 表示不配置该队列，此时不写寄存器（qdmaSetTxQosScheduler 0x124ac）。
++ */
++static inline u8 get_qregs_wrr_weight_value(struct qregs_wrr_weight *x) {
++	return FIELD_GET(QREGS_WRR_WEIGHT_VALUE_MASK, x->word);
++}
++static inline void set_qregs_wrr_weight_value(struct qregs_wrr_weight *x, u8 v) {
++	x->word = FIELD_SET(x->word, QREGS_WRR_WEIGHT_VALUE_MASK, v);
+ }
+ 
+ /**
+- * Bitfield accessors for: qregs_tx_congest_cfg bitfield_0
+- * Configuration for TX congestion dropping
++ * Bitfield accessors for: struct qregs_tx_congest_cfg
++ * Configuration for TX congestion dropping.
++ * 位置取自原厂 qdma_lan.ko 的 qdma_set_txq_cngst_cfg 与 qdma_set_txq_dei_drop_mode（尾丢弃 bit31、DEI 丢弃 bit30、动态门限 bit29、tick [15:0]）、qdma_set_tx_cngst_mode（margin [23:22]）及 airoha 的 REG_TXQ_CNGST_CFG；字段是整字上的掩码，与 CPU 字节序无关。
+  */
+ 
+ enum qregs_tx_congest_cfg_dyncong_margin {
+@@ -838,40 +836,41 @@ enum qregs_tx_congest_cfg_dyncong_dei_scale {
+ 	QREGS_TX_CONGEST_CFG_DYNCONG_DEI_SCALE_SIXTEENTH = 3,
+ };
+ 
+-#define QREGS_TX_CONGEST_CFG_TAIL_DROP_EN		BIT(15)
+-#define QREGS_TX_CONGEST_CFG_DEI_DROP_EN		BIT(14)
+-#define QREGS_TX_CONGEST_CFG_DYNCONG_EN			BIT(13)
+-#define QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX1		BIT(11)
+-#define QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX1		BIT(10)
+-#define QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX0		BIT(9)
+-#define QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX0		BIT(8)
+-#define QREGS_TX_CONGEST_CFG_DYNCONG_MARGIN_MASK	GENMASK(7, 6)
+-#define QREGS_TX_CONGEST_CFG_DYNCONG_DEI_SCALE_MASK	GENMASK(5, 4)
+-#define QREGS_TX_CONGEST_CFG_DYNCONG_UPD_WRR		BIT(2)
+-#define QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TXRX		BIT(1)
+-#define QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TICK		BIT(0)
++#define QREGS_TX_CONGEST_CFG_TAIL_DROP_EN		BIT(31)
++#define QREGS_TX_CONGEST_CFG_DEI_DROP_EN		BIT(30)
++#define QREGS_TX_CONGEST_CFG_DYNCONG_EN			BIT(29)
++#define QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX1		BIT(27)
++#define QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX1		BIT(26)
++#define QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX0		BIT(25)
++#define QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX0		BIT(24)
++#define QREGS_TX_CONGEST_CFG_DYNCONG_MARGIN_MASK	GENMASK(23, 22)
++#define QREGS_TX_CONGEST_CFG_DYNCONG_DEI_SCALE_MASK	GENMASK(21, 20)
++#define QREGS_TX_CONGEST_CFG_DYNCONG_UPD_WRR		BIT(18)
++#define QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TXRX		BIT(17)
++#define QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TICK		BIT(16)
++#define QREGS_TX_CONGEST_CFG_DYNCONG_TICK_MASK		GENMASK(15, 0)
+ 
+ static inline bool is_qregs_tx_congest_cfg_tail_drop_en(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_TAIL_DROP_EN, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_TAIL_DROP_EN, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_tail_drop_en(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_TAIL_DROP_EN, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_TAIL_DROP_EN, v);
+ }
+ 
+ /** Support 802.1ad DEI packet dropping */
+ static inline bool is_qregs_tx_congest_cfg_dei_drop_en(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_DEI_DROP_EN, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_DEI_DROP_EN, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_dei_drop_en(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_DEI_DROP_EN, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_DEI_DROP_EN, v);
+ }
+ 
+ /** Enable dynamic congestion algorithm */
+ static inline bool is_qregs_tx_congest_cfg_dyncong_en(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_EN, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_EN, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_dyncong_en(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_DYNCONG_EN, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_DYNCONG_EN, v);
+ }
+ 
+ /**
+@@ -879,10 +878,10 @@ static inline void set_qregs_tx_congest_cfg_dyncong_en(struct qregs_tx_congest_c
+  * tx_congest_thr)
+  */
+ static inline bool is_qregs_tx_congest_cfg_max_thr_blk_tx1(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX1, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX1, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_max_thr_blk_tx1(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX1, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX1, v);
+ }
+ 
+ /**
+@@ -890,10 +889,10 @@ static inline void set_qregs_tx_congest_cfg_max_thr_blk_tx1(struct qregs_tx_cong
+  * tx_congest_thr)
+  */
+ static inline bool is_qregs_tx_congest_cfg_min_thr_blk_tx1(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX1, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX1, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_min_thr_blk_tx1(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX1, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX1, v);
+ }
+ 
+ /**
+@@ -901,10 +900,10 @@ static inline void set_qregs_tx_congest_cfg_min_thr_blk_tx1(struct qregs_tx_cong
+  * tx_congest_thr)
+  */
+ static inline bool is_qregs_tx_congest_cfg_max_thr_blk_tx0(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX0, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX0, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_max_thr_blk_tx0(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX0, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_MAX_THR_BLK_TX0, v);
+ }
+ 
+ /**
+@@ -912,46 +911,79 @@ static inline void set_qregs_tx_congest_cfg_max_thr_blk_tx0(struct qregs_tx_cong
+  * tx_congest_thr)
+  */
+ static inline bool is_qregs_tx_congest_cfg_min_thr_blk_tx0(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX0, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX0, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_min_thr_blk_tx0(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX0, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_MIN_THR_BLK_TX0, v);
+ }
+ static inline enum qregs_tx_congest_cfg_dyncong_margin get_qregs_tx_congest_cfg_dyncong_margin(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_MARGIN_MASK, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_MARGIN_MASK, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_dyncong_margin(struct qregs_tx_congest_cfg *x, enum qregs_tx_congest_cfg_dyncong_margin v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_DYNCONG_MARGIN_MASK, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_DYNCONG_MARGIN_MASK, v);
+ }
+ static inline enum qregs_tx_congest_cfg_dyncong_dei_scale get_qregs_tx_congest_cfg_dyncong_dei_scale(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_DEI_SCALE_MASK, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_DEI_SCALE_MASK, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_dyncong_dei_scale(struct qregs_tx_congest_cfg *x, enum qregs_tx_congest_cfg_dyncong_dei_scale v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_DYNCONG_DEI_SCALE_MASK, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_DYNCONG_DEI_SCALE_MASK, v);
+ }
+ 
+ /** Update dyanmic congestion after each update to WRR weights. */
+ static inline bool is_qregs_tx_congest_cfg_dyncong_upd_wrr(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_UPD_WRR, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_UPD_WRR, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_dyncong_upd_wrr(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_DYNCONG_UPD_WRR, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_DYNCONG_UPD_WRR, v);
+ }
+ 
+ /** Update dyanmic congestion after each TX or RX */
+ static inline bool is_qregs_tx_congest_cfg_dyncong_upd_txrx(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TXRX, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TXRX, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_dyncong_upd_txrx(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TXRX, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TXRX, v);
+ }
+ 
+ /** Update dyanmic congestion after each tick */
+ static inline bool is_qregs_tx_congest_cfg_dyncong_upd_tick(struct qregs_tx_congest_cfg *x) {
+-	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TICK, x->bitfield_0);
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TICK, x->word);
+ }
+ static inline void set_qregs_tx_congest_cfg_dyncong_upd_tick(struct qregs_tx_congest_cfg *x, bool v) {
+-	x->bitfield_0 = FIELD_SET(x->bitfield_0, QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TICK, v);
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_DYNCONG_UPD_TICK, v);
++}
++
++/** Dynamic congestion ticker rate in microseconds */
++static inline u16 get_qregs_tx_congest_cfg_dyncong_tick(struct qregs_tx_congest_cfg *x) {
++	return FIELD_GET(QREGS_TX_CONGEST_CFG_DYNCONG_TICK_MASK, x->word);
++}
++static inline void set_qregs_tx_congest_cfg_dyncong_tick(struct qregs_tx_congest_cfg *x, u16 v) {
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_CFG_DYNCONG_TICK_MASK, v);
++}
++
++/**
++ * Bitfield accessors for: struct qregs_tx_congest_thr
++ * 上限在高半字、下限在低半字（原厂 qdma_set_txq_cngst_total_threshold，要求上限不小于下限）；EN7528 复位值上限 0xffff、下限 0x02c0。
++ * 原厂把 API 的数值左移 2 位后写进字段（上限写 max << 18，下限写 (min << 2) & 0xffff），按原厂 API 的单位填数时要乘 4。
++ */
++
++#define QREGS_TX_CONGEST_THR_MAX_MASK			GENMASK(31, 16)
++#define QREGS_TX_CONGEST_THR_MIN_MASK			GENMASK(15, 0)
++
++/** When total buffer usage exceeds this, drop all packets except VIP */
++static inline u16 get_qregs_tx_congest_thr_max(struct qregs_tx_congest_thr *x) {
++	return FIELD_GET(QREGS_TX_CONGEST_THR_MAX_MASK, x->word);
++}
++static inline void set_qregs_tx_congest_thr_max(struct qregs_tx_congest_thr *x, u16 v) {
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_THR_MAX_MASK, v);
++}
++
++/** When total buffer usage exceeds this, dynamic congestion control will start */
++static inline u16 get_qregs_tx_congest_thr_min(struct qregs_tx_congest_thr *x) {
++	return FIELD_GET(QREGS_TX_CONGEST_THR_MIN_MASK, x->word);
++}
++static inline void set_qregs_tx_congest_thr_min(struct qregs_tx_congest_thr *x, u16 v) {
++	x->word = FIELD_SET(x->word, QREGS_TX_CONGEST_THR_MIN_MASK, v);
+ }
+ 
+ /**
