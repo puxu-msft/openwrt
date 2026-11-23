@@ -1,0 +1,10 @@
+#!/bin/sh
+# 建 EIP-93 加密引擎的开关（缺省不启用），已有的不动；启用：uci set system.eip93.enabled=1; uci commit system（procd 触发 /etc/init.d/eip93 reload），或重启。
+
+uci -q get system.eip93 >/dev/null && exit 0
+uci -q batch <<'UCI'
+set system.eip93=eip93
+set system.eip93.enabled='0'
+commit system
+UCI
+exit 0

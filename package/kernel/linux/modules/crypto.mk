@@ -536,7 +536,8 @@ define KernelPackage/crypto-hw-eip93
 	CONFIG_CRYPTO_DEV_EIP93_GENERIC_SW_MAX_LEN=256 \
 	CONFIG_CRYPTO_DEV_EIP93_AES_128_SW_MAX_LEN=512
   FILES:=$(LINUX_DIR)/drivers/crypto/inside-secure/eip93/crypto-hw-eip93.ko
-  AUTOLOAD:=$(call AutoLoad,09,crypto-hw-eip93)
+  # econet 上不随开机自动加载：加载即以优先级 1500 接管内核里全部 cbc/ecb/ctr(aes)、des、authenc 用户，由 /etc/init.d/eip93 按 system.eip93.enabled 开关加载
+  AUTOLOAD:=$(if $(CONFIG_TARGET_econet),,$(call AutoLoad,09,crypto-hw-eip93))
   $(call AddDepends/crypto)
 endef
 

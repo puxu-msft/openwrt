@@ -1,0 +1,42 @@
+#!/bin/sh /etc/rc.common
+# EIP-93 加密引擎按需启用：读 /etc/config/system 的 eip93 段（enabled，缺省 0），开机与 system 配置变化时加载或卸载 crypto-hw-eip93。
+# econet 上这个模块不随开机自动加载（kmod-crypto-hw-eip93 不装 /etc/modules.d 文件）：加载后它以优先级 1500 接管内核里全部 cbc/ecb/ctr(aes)、des、authenc 的用户（IPsec 等），所以由这个开关决定。
+# 排在 boot（START=10，kmodloader 装好依赖）之后、network 与 strongSwan 之前。卸载时若 IPsec SA 等还持有它的 tfm，rmmod 会失败，停掉这些用户或重启后生效。
+
+START=11
+USE_PROCD=1
+
+eip93_apply() {
+	local enabled
+	config_load system
+	config_get_bool enabled eip93 enabled 0
+	if [ "$enabled" = 1 ]; then
+		[ -d /sys/module/crypto_hw_eip93 ] && return 0
+		[ -e "/lib/modules/$(uname -r)/crypto-hw-eip93.ko" ] ||
+			{ logger -t eip93 "镜像里没有 kmod-crypto-hw-eip93，不启用"; return 0; }
+		if modprobe crypto-hw-eip93; then
+			logger -t eip93 "已加载 crypto-hw-eip93"
+		else
+			logger -t eip93 "crypto-hw-eip93 加载失败，原因见 dmesg"
+		fi
+	else
+		[ -d /sys/module/crypto_hw_eip93 ] || return 0
+		if rmmod crypto_hw_eip93; then
+			logger -t eip93 "已卸载 crypto-hw-eip93"
+		else
+			logger -t eip93 "crypto-hw-eip93 仍被占用（IPsec SA 等），卸不掉；停掉这些用户或重启后生效"
+		fi
+	fi
+}
+
+start_service() {
+	eip93_apply
+}
+
+reload_service() {
+	eip93_apply
+}
+
+service_triggers() {
+	procd_add_reload_trigger system
+}
