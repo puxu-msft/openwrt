@@ -1,0 +1,130 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: 按发包设备结算 BQL；发送侧环锁不关下半部，netpoll 下只尝试
+
+现象：GS2107 上 netconsole 以 br-lan 为目标（netpoll 经网桥 → DSA 用户口 lan1 → conduit eth0）时，第一行日志发出后 TX 完成 NAPI（napi/qdma0_eth-）在 dql_completed() 里 "Kernel bug detected"（epc dql_completed+0x18，ra 在 econet_eth 的 TX 完成处理），CONFIG_PANIC_ON_OOPS 下 panic 重启。
+
+根因：en75_dev_xmit() 按参数 dev（eth0）的 0 号发送队列记 BQL（en75_qdma_xmit() 里的 netdev_tx_sent_queue()），TX 完成路径却按 skb->dev 取队列做 netdev_tx_completed_queue()。常规路径上 dsa_enqueue_skb() 在 dev_queue_xmit() 之前把 skb->dev 改成 conduit，两边一致；netpoll 分支（netpoll_tx_running()，即关着中断）直接 netpoll_send_skb() 交给 conduit，不改 skb->dev，skb->dev 仍是网桥 __br_forward() 设成的 lan1。于是字节记在 eth0 的 dql 上，却在从未记过账的 lan1 的 dql 上完成，dql_completed() 的 BUG_ON(count > num_queued - num_completed) 触发；eth0 的 dql 也永远得不到这份完成。上游完成路径同样按 skb->dev 取队列（包补丁 001 之前即如此）。
+
+同一路径上的发送侧环锁原先用 spin_lock_bh。netpoll 从进程上下文进来（例如写 /dev/kmsg）时只关了中断、没关下半部，spin_unlock_bh() 若遇到积压的软中断会在 __local_bh_enable_ip() 里 do_softirq()，在 netpoll 持有 eth0 发送队列锁与 netconsole 目标表锁的情况下开中断跑软中断，软中断里的转发再经 eth0 发包要拿同一把发送队列锁，本 CPU 死锁（据 6.18 kernel/softirq.c 推断，未复现）。环锁若正被本 CPU 被打断的 TX 完成 NAPI 持有（或锁内 WARN 引起打印），netpoll 自旋拿锁同样永远等不到。
+
+改法：
+1. en75_dev_xmit() 开头把 skb->dev 设为 dev，完成路径据此结算的就是记账的那个队列。进过驱动又被交回 NETDEV_TX_BUSY 的帧，netpoll 排队后按 skb->dev 重发时也直接回到 conduit，不再经用户口第二次打 MTK 标签；没进过驱动就排进 eth0 netpoll 队列的帧（队列里已有帧，或 eth0 发送队列整整一个 tick 都停着）仍带着 skb->dev = lan1，queue_process() 会经 lan1 再打一层标签，队里有两帧以上时还会在 kworker 里无限循环——这是 netpoll 核心的问题，主线 c367b9082194（"netpoll: normalize skb->dev to the netpoll device"，v7.1）在 __netpoll_send_skb() 入口把 skb->dev 设成 np->dev 修掉，6.18.y 尚未收录，需随内核另行回移；回移后这一行仍让驱动不依赖调用方的 skb->dev。
+2. 发送侧（en75_qdma_xmit()、en75_qdma_tx_flush()、en75_qdma_tx_has_room()，都只从 ndo_start_xmit 调用）改用 en75_tx_lock()：中断开着就是常规路径，下半部已由 dev_queue_xmit() 关掉，直接 spin_lock；中断关着就是 netpoll，只 spin_trylock。拿不到时 en75_qdma_xmit() 返回 -EAGAIN、不碰硬件，en75_dev_xmit() 交回 NETDEV_TX_BUSY（不停队列），netpoll 重试一个 tick 后把帧排队稍后再发；tx_flush 拿不到就不敲门铃（netpoll 每次只发一帧、xmit_more 为假，没有被它扣下门铃的帧）；tx_has_room 拿不到答"没有"（队列已先停下，持锁的完成路径随后看到停着的队列会唤醒）。TX 完成路径与进程上下文的取锁方式不变。
+3. en75_features_check() 首次见到 DSA 帧时打开标签解析（_bh 版取 reg_lock 并打印），关着中断（netpoll）时不做，留给下一帧常规流量；这一帧照不带校验和/TSO 卸载发。常规路径只在标签解析尚未打开时多判一次。
+
+影响面：常规发包路径每包少一对 local_bh_disable/enable（_raw_spin_lock_bh/_raw_spin_unlock_bh 换成 _raw_spin_lock 与内联解锁），多一次读 CP0 Status（irqs_disabled()）与 ACQUIRE_ERR 的两次比较跳转；skb->dev 的赋值落在 xmit 本就访问的 sk_buff 首行。PPE 硬件转发的帧不经这里。顺带：补丁前 netpoll 若在硬中断里被调用（硬中断里的打印经 netconsole），发送侧的 spin_unlock_bh() 还会触发 __local_bh_enable_ip() 的 WARN_ON_ONCE(in_hardirq())，改后不再经过它。
+
+GS2107 实测（2026-11-23，内核 6.18.60，模块热换只放 /tmp）：修前（镜像自带模块）netconsole 经 br-lan 发出第一行后即 panic，panic 全文经 netconsole 到了主机，ramoops 存档 captures/netconsole-panic-20261123-dmesg-ramoops-0.txt。修后：经 br-lan 连发 500 行，主机收齐 500 行；经 WAN 口 lan4（不在网桥里的 DSA 用户口，发往主机 Wi-Fi 所在网段）收齐 20 行；测试模块的 WARN（dmesg -n 8 下）全文 29 帧送达；软件转发 448 Mbit/s 期间每秒连写 200 行、共 2400 行，主机收到 2399 行且全部按序（缺的一行丢在哪里未定：eth0 与 lan1 的硬件 TX 丢弃计数为 0，驱动自己的 tx_dropped 不经 ndo_get_stats64 报出；一种可能是上面第 1 条所说没进驱动就排队、经 lan1 二次打标签的帧，未证实），无 oops、boot_id 不变。回归：PPE lan→hair 928.9/929.9 Mbit/s（自带模块 927.7/927.5），lan→vwan 916.8/926.3（自带 917.3/928.6），均 bound=2；软件转发 lan→vwan 495.5/685.4（自带模块三次 152.1/550.6、645.2/532.6、606.6/641.5，随 CPU 落点方差很大，单次样本只说明没有塌陷）。以上用的是加第 3 条之前的版本；终版（多第 3 条与注释）再热换复验：常规流量照常打开标签解析（dmesg "DSA conduit: TX checksum offload and TSO in use"），经 br-lan 200 行、经 lan4 5 行全部送达，PPE lan→hair 929.6 Mbit/s、bound=2。trylock 失败分支未插桩，实机上是否走到过未知（突发全部按序，没有排队重发的直接迹象）。
+
+diff --git a/econet_port.c b/econet_port.c
+index d52301e..fb43a37 100644
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -242,7 +242,8 @@ static netdev_features_t en75_features_check(struct sk_buff *skb,
+ 
+ 	bool dsa = netdev_uses_dsa(dev);
+ 
+-	if (unlikely(!READ_ONCE(port->stag_parse)) && dsa) {
++	/* netpoll（关着中断）里不开：这里用 _bh 版取 reg_lock 还要打印，留给下一帧常规流量；这一帧照不带卸载发 */
++	if (unlikely(!READ_ONCE(port->stag_parse)) && dsa && !irqs_disabled()) {
+ 		en75_set_dsa_tag_parse(port, true);
+ 		netdev_info(dev, "DSA conduit: TX checksum offload and TSO in use\n");
+ 	}
+@@ -260,6 +261,9 @@ static netdev_tx_t en75_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 	union desc_msg msg = {0};
+ 	int ret;
+ 
++	/* TX 完成路径按 skb->dev 找要结算 BQL 的队列（en75_tx_done_process()），这里让它就是记账的这个设备。netpoll 经 DSA 用户口发帧时 skb->dev 仍是用户口（dsa_enqueue_skb() 只在 dev_queue_xmit 分支改成 conduit；网桥上的 netconsole 经 lan1 下来就是这样）：字节记在 eth0 的队列上，却在 lan1 的队列上完成，dql_completed() 的 BUG_ON 触发 panic，eth0 的队列也永远等不到完成。进过这里又被交回 NETDEV_TX_BUSY 的帧，netpoll 排队后按 skb->dev 重发时也直接回到本设备，不再经用户口第二次打标签（没进过驱动就排队的帧要靠主线 c367b9082194 "netpoll: normalize skb->dev to the netpoll device"）。 */
++	skb->dev = dev;
++
+ 	set_etx_channel(&msg.etx, 0);
+ 	set_etx_queue(&msg.etx, 0);
+ 	set_etx_fport(&msg.etx, port->fport);
+@@ -299,6 +303,9 @@ static netdev_tx_t en75_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		goto drop;
+ 
+ 	ret = en75_qdma_xmit(port->qdma, skb, &msg, 0, txq);
++	if (ret == -EAGAIN)
++		/* 只有 netpoll 会遇到：没拿到环锁，交回这个 skb 由 netpoll 重试或排队，不停队列 */
++		return NETDEV_TX_BUSY;
+ 	if (ret == -EBUSY) {
+ 		/* Ring full, nothing queued: the stack requeues this skb, so it must not be freed. Not expected, since the queue is stopped as soon as the ring has no room left. */
+ 		en75_stop_queue_if_full(port, txq);
+diff --git a/econet_qdma.c b/econet_qdma.c
+index 3da4a5d..72c2de0 100644
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -53,7 +53,7 @@ struct en75_q_tx_ent {
+ 
+ struct en75_q_tx {
+ 	/* protect concurrent queue accesses
+-	 * use _bh unless in napi poll */
++	 * 持锁时下半部或中断必须关着：NAPI 与常规 ndo_start_xmit 关着下半部、netpoll 关着中断，都直接 spin_lock（发送侧经 en75_tx_lock()）；进程上下文用 _bh 版 */
+ 	spinlock_t			lock_bh;
+ 	struct en75_q_tx_ent		*entry;
+ 	struct desc			*desc;
+@@ -614,6 +614,7 @@ static u32 en75_tx_done_process(struct en75_tx_doneq *done_q, u32 limit,
+ 			continue;
+ 
+ 		/* every packet was queued on TX queue 0 (en75_dev_xmit()) */
++		/* skb->dev 由 en75_dev_xmit() 设成记账的那个设备 */
+ 		txq = netdev_get_tx_queue(skb->dev, 0);
+ 		if (txq != done_txq) {
+ 			if (done_txq)
+@@ -692,7 +693,18 @@ static int en75_poll_tx_complete(struct napi_struct *napi, int budget)
+ 	return done;
+ }
+ 
+-/* Queue one skb as a chain of descriptors (NLS set on all but the last) and ring the doorbell unless more packets follow (netdev_xmit_more()). Returns -EBUSY with nothing queued when the ring is full, EBUSY when it was queued but the ring cannot take another full-size skb (the caller stops the queue), or a negative error with nothing queued. */
++/* 发送侧（只从 ndo_start_xmit 调用）取环锁。常规路径进来时下半部已关（dev_queue_xmit 持 rcu_read_lock_bh），netpoll（netconsole）进来时中断已关，所以不再关下半部：_bh 版解锁时若有积压的软中断会就地执行并临时开中断，在 netpoll 里就是带着 netpoll 持有的 eth0 发送队列锁跑软中断，软中断再经 eth0 发包便在本 CPU 上死锁。netpoll 只尝试一次：此刻持锁的可能正是本 CPU 被打断的 TX 完成 NAPI，或在锁内打印告警的代码，自旋永远等不到；拿不到时调用方交回 NETDEV_TX_BUSY，netpoll 会重试，仍不成就把帧排进它自己的队列稍后再发。中断开着的就是常规路径（netpoll_tx_running() 即按 irqs_disabled() 判 netpoll）。 */
++static bool en75_tx_lock(spinlock_t *lock)
++{
++	if (likely(!irqs_disabled())) {
++		spin_lock(lock);
++		return true;
++	}
++	return spin_trylock(lock);
++}
++DEFINE_LOCK_GUARD_1_COND(spinlock, _en75_tx, en75_tx_lock(_T->lock));
++
++/* Queue one skb as a chain of descriptors (NLS set on all but the last) and ring the doorbell unless more packets follow (netdev_xmit_more()). Returns -EBUSY with nothing queued when the ring is full, EBUSY when it was queued but the ring cannot take another full-size skb (the caller stops the queue), or a negative error with nothing queued. netpoll 没拿到环锁时返回 -EAGAIN，什么都没排、也没碰硬件（en75_tx_lock()）。 */
+ int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
+ 		   union desc_msg *msg, int qid, struct netdev_queue *txq)
+ {
+@@ -701,7 +713,9 @@ int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
+ 	u16 first, index;
+ 	int i, j, ret = 0;
+ 
+-	guard(spinlock_bh)(&q->lock_bh);
++	ACQUIRE(spinlock_en75_tx, lock)(&q->lock_bh);
++	if (ACQUIRE_ERR(spinlock_en75_tx, &lock))
++		return -EAGAIN;
+ 
+ 	if (q->nfree < nr + 1) {
+ 		en75_wreg((u32)q->freelist_head, &q->qchain_regs->tx_cpui);
+@@ -794,17 +808,22 @@ void en75_qdma_tx_flush(struct en75_qdma *qdma, int qid)
+ {
+ 	struct en75_q_tx *q = &qdma->q_tx[qid];
+ 
+-	guard(spinlock_bh)(&q->lock_bh);
++	/* netpoll 拿不到锁就不敲：它每次只发一帧（xmit_more 为假），没有被它扣下门铃的帧 */
++	ACQUIRE(spinlock_en75_tx, lock)(&q->lock_bh);
++	if (ACQUIRE_ERR(spinlock_en75_tx, &lock))
++		return;
+ 	en75_wreg((u32)q->freelist_head, &q->qchain_regs->tx_cpui);
+ 	en75_tx_done_kick_arm(&qdma->q_tx_done[0]);
+ }
+ 
+-/* True when en75_qdma_xmit() on this ring would accept any skb. */
++/* True when en75_qdma_xmit() on this ring would accept any skb. netpoll 拿不到锁时答"没有"：队列已先停下，持锁的完成路径随后看到停着的队列会负责唤醒。 */
+ bool en75_qdma_tx_has_room(struct en75_qdma *qdma, int qid)
+ {
+ 	struct en75_q_tx *q = &qdma->q_tx[qid];
+ 
+-	guard(spinlock_bh)(&q->lock_bh);
++	ACQUIRE(spinlock_en75_tx, lock)(&q->lock_bh);
++	if (ACQUIRE_ERR(spinlock_en75_tx, &lock))
++		return false;
+ 
+ 	return q->nfree >= EN75_TX_ROOM;
+ }
