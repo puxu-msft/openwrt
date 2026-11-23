@@ -1,0 +1,113 @@
+From c367b9082194d01cb38bdefac6e887ebf1ab017d Mon Sep 17 00:00:00 2001
+From: Zhang Cen <rollkingzzc@gmail.com>
+Date: Tue, 19 May 2026 18:46:47 +0800
+Subject: [PATCH] netpoll: normalize skb->dev to the netpoll device
+
+__netpoll_send_skb() always transmits through np->dev and queues busy
+packets on np->dev->npinfo->txq, but it leaves skb->dev unchanged.
+Stacked callers such as DSA and macvlan can reach netpoll with skb->dev
+still naming the upper device while np->dev is the lower device that
+owns the netpoll state.
+
+If the skb has to be deferred, queue_process() later dequeues it from
+the lower device's txq but retries it through skb->dev. That can
+re-enter the upper ndo_start_xmit path on an already transformed skb,
+and if the upper device disappears before the lower txq drains the
+workqueue can dereference a stale skb->dev pointer.
+
+The buggy scenario involves two paths, with each column showing the
+order within that path:
+
+path A label: netpoll enqueue path   path B label: upper-device teardown
+1. Stacked xmit calls netpoll        1. Teardown unregisters the upper
+   with lower np->dev and upper         net_device while lower npinfo
+   skb->dev.                            stays alive.
+2. __netpoll_send_skb() uses         2. netdev_release() runs for the
+   np->dev->npinfo as the txq           upper net_device.
+   owner.
+3. Busy transmit queues the skb      3. The lower txq still owns the
+   on that lower txq with upper         deferred skb.
+   skb->dev.
+4. queue_process() drains the        4. queue_process() dereferences
+   lower txq and reads skb->dev.        that stale upper skb->dev.
+
+Normalize skb->dev to np->dev after loading np->dev from the netpoll
+instance, before either the direct transmit path or the fallback enqueue.
+This keeps the queued skb in the same device and txq domain as the
+netpoll state that owns it.
+
+KASAN report as below:
+
+KASAN slab-use-after-free in queue_process+0x7c/0x480
+Workqueue: events queue_process
+The buggy address belongs to the object at ffff88810906c000 which belongs
+to the cache kmalloc-4k of size 4096
+The buggy address is located 168 bytes inside of freed 4096-byte region
+[ffff88810906c000, ffff88810906d000)
+Read of size 8
+Call trace:
+  dump_stack_lvl+0x73/0xb0 (?:?)
+  print_report+0xd1/0x620 (?:?)
+  srso_alias_return_thunk+0x5/0xfbef5 (?:?)
+  __virt_addr_valid+0x215/0x420 (?:?)
+  kasan_complete_mode_report_info+0x64/0x200 (?:?)
+  kasan_report+0xf7/0x130 (?:?)
+  queue_process+0x7c/0x480 (net/core/netpoll.c:88)
+  kasan_check_range+0x10c/0x1c0 (?:?)
+  __kasan_check_read+0x15/0x20 (?:?)
+  process_one_work+0x8b7/0x1af0 (kernel/workqueue.c:3200)
+  assign_work+0x170/0x3f0 (?:?)
+  worker_thread+0x574/0xf10 (?:?)
+  _raw_spin_unlock_irqrestore+0x4b/0x60 (?:?)
+  trace_hardirqs_on+0x2a/0x180 (?:?)
+  kthread+0x2fc/0x3f0 (?:?)
+  ret_from_fork+0x58b/0x830 (?:?)
+  __switch_to+0x58e/0xe90 (?:?)
+  __switch_to_asm+0x39/0x70 (?:?)
+  ret_from_fork_asm+0x1a/0x30 (?:?)
+Freed by task stack:
+  kasan_save_stack+0x3d/0x60 (?:?)
+  kasan_save_track+0x18/0x40 (?:?)
+  kasan_save_free_info+0x3f/0x60 (?:?)
+  __kasan_slab_free+0x48/0x70 (?:?)
+  kfree+0x20e/0x4e0 (?:?)
+  kvfree+0x31/0x40 (?:?)
+  netdev_release+0x71/0x90 (net/core/net-sysfs.c:2227)
+  device_release+0xd2/0x250 (?:?)
+  kobject_put+0x181/0x4c0 (lib/kobject.c:730)
+  netdev_run_todo+0x700/0x1000 (net/core/dev.c:11666)
+  rtnl_dellink+0x396/0xc00 (net/core/rtnetlink.c:3558)
+  rtnetlink_rcv_msg+0x740/0xc20 (net/core/rtnetlink.c:6897)
+  netlink_rcv_skb+0x147/0x3a0 (?:?)
+  rtnetlink_rcv+0x19/0x20 (net/core/rtnetlink.c:7021)
+  netlink_unicast+0x4d1/0x830 (net/netlink/af_netlink.c:1327)
+  netlink_sendmsg+0x840/0xe10 (net/netlink/af_netlink.c:1812)
+  ____sys_sendmsg+0x8a7/0xb50 (?:?)
+  ___sys_sendmsg+0x104/0x190 (?:?)
+  __sys_sendmsg+0x135/0x1d0 (?:?)
+  __x64_sys_sendmsg+0x7b/0xc0 (?:?)
+  x64_sys_call+0x205c/0x2130 (?:?)
+  do_syscall_64+0x115/0x6a0 (arch/x86/entry/syscall_64.c:87)
+  entry_SYSCALL_64_after_hwframe+0x77/0x7f (?:?)
+
+Fixes: 5de4a473bda4 ("netpoll queue cleanup")
+Signed-off-by: Zhang Cen <rollkingzzc@gmail.com>
+Link: https://patch.msgid.link/20260519104647.3517990-1-rollkingzzc@gmail.com
+Signed-off-by: Jakub Kicinski <kuba@kernel.org>
+---
+ net/core/netpoll.c | 2 ++
+ 1 file changed, 2 insertions(+)
+
+diff --git a/net/core/netpoll.c b/net/core/netpoll.c
+index 84faace50ac281..3f4a17fa5713a8 100644
+--- a/net/core/netpoll.c
++++ b/net/core/netpoll.c
+@@ -319,6 +319,8 @@ static netdev_tx_t __netpoll_send_skb(struct netpoll *np, struct sk_buff *skb)
+ 	lockdep_assert_irqs_disabled();
+ 
+ 	dev = np->dev;
++	/* npinfo->txq belongs to np->dev, so retries must stay bound to it. */
++	skb->dev = dev;
+ 	rcu_read_lock();
+ 	npinfo = rcu_dereference_bh(dev->npinfo);
+ 
