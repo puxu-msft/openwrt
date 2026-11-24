@@ -33,6 +33,7 @@ AM_TOOL_PATHS_FAKE:=$(subst = ,=,$(patsubst "%,"$(TRUE)",$(subst =,= ",$(AM_TOOL
 # 3: automake paths
 # 4: libtool paths
 # 5: extra m4 dirs
+# config.rpath 链接用相对路径（relpath，见 rules.mk），整棵树换位置后再 autoreconf 时照样指对；早先留下的悬空链接由 -f 换掉
 define autoreconf
 	(cd $(1); \
 		$(patsubst %,rm -f %;,$(2)) \
@@ -40,7 +41,7 @@ define autoreconf
 			if [ -f $(p)/configure.ac ] || [ -f $(p)/configure.in ]; then \
 				[ -d $(p)/autom4te.cache ] && rm -rf $(p)/autom4te.cache; \
 				[ -e $(p)/config.rpath ] || \
-						ln -s $(SCRIPT_DIR)/config.rpath $(p)/config.rpath; \
+						ln -sf $(call relpath,$(SCRIPT_DIR)/config.rpath,$(abspath $(1)/$(p))) $(p)/config.rpath; \
 				touch NEWS AUTHORS COPYING ABOUT-NLS ChangeLog; \
 				$(AM_TOOL_PATHS) \
 					LIBTOOLIZE='$(STAGING_DIR_HOST)/bin/libtoolize --install' \

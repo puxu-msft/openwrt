@@ -29,16 +29,14 @@ include $(INCLUDE_DIR)/cmake.mk
 CMAKE_OPTIONS += \
 	-DSOVERSION=$(PKG_ABI_VERSION)
 
+# 主机版的 ucode、udbg 与 lib/ucode/ 下的模块都要找 hostpkg/lib 里的 libucode：rpath 相对各自位置（host_rpath，见 rules.mk），整棵树换位置后 LuCI 包照样能用它编模板；ucode 的 CMakeLists 已不读 USE_RPATH，不再传
 CMAKE_HOST_OPTIONS += \
 	-DCMAKE_SKIP_RPATH=FALSE \
-	-DCMAKE_INSTALL_RPATH="${STAGING_DIR_HOSTPKG}/lib"
+	-DCMAKE_INSTALL_RPATH=$(call host_rpath,$(STAGING_DIR_HOSTPKG),.. ../..)
 
 ifeq ($(HOST_OS),Darwin)
   CMAKE_HOST_OPTIONS += \
 	-DCMAKE_MACOSX_RPATH=1
-else
-  CMAKE_HOST_OPTIONS += \
-	-DUSE_RPATH="${STAGING_DIR_HOSTPKG}/lib"
 endif
 
 CMAKE_HOST_OPTIONS += \

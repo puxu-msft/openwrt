@@ -241,11 +241,14 @@ $(STAGING_DIR_HOST)/bin/mkhash: $(SCRIPT_DIR)/mkhash.c
 	mkdir -p $(dir $@)
 	$(STAGING_DIR_HOST)/bin/gcc -O2 -I$(TOPDIR)/tools/include -o $@ $<
 
+# 指向树里脚本的两个链接用相对路径：prereq 只在本文件改了时重跑，绝对路径的链接在整棵树换位置后悬空，PATH 就落到主机上的同名命令
+SCRIPT_DIR_FROM_HOST_BIN:=$(call relpath,$(SCRIPT_DIR),$(STAGING_DIR_HOST)/bin)
+
 $(STAGING_DIR_HOST)/bin/xxd: $(SCRIPT_DIR)/xxdi.pl
-	$(LN) $< $@
+	$(LN) $(SCRIPT_DIR_FROM_HOST_BIN)/xxdi.pl $@
 
 prereq: $(STAGING_DIR_HOST)/bin/mkhash $(STAGING_DIR_HOST)/bin/xxd
 
 # Install ldconfig stub
 $(eval $(call TestHostCommand,ldconfig-stub,Failed to install stub, \
-	$(LN) $(SCRIPT_DIR)/noop.sh $(STAGING_DIR_HOST)/bin/ldconfig))
+	$(LN) $(SCRIPT_DIR_FROM_HOST_BIN)/noop.sh $(STAGING_DIR_HOST)/bin/ldconfig))

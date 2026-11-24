@@ -373,6 +373,12 @@ MKHASH:=$(STAGING_DIR_HOST)/bin/mkhash
 export MKHASH
 CP:=cp -fpR
 LN:=ln -sf
+# $(call relpath,<目标>,<起点目录>)：从起点目录到目标的相对路径（两个都给绝对路径）。树里互相指的符号链接用它，整棵树换位置后照样指对
+relpath=$(shell perl -MFile::Spec -e 'print File::Spec->abs2rel(@ARGV)' '$(1)' '$(2)')
+# 主机程序与库找 staging 前缀下 lib/ 的 rpath（给 CMake 的 CMAKE_INSTALL_RPATH 一类）：Linux 写相对自身位置的 $ORIGIN，整棵树换位置后照样找得到；macOS 的 install_name 另成一套，仍给绝对路径
+# $(1)：staging 前缀（$(STAGING_DIR_HOST) 或 $(STAGING_DIR_HOSTPKG)）；$(2)：从程序或库所在目录回到前缀的相对路径，缺省 ..（bin/、lib/ 下），可给多个（如 lib/ucode/ 下的模块再加 ../..）
+# 只用在 HostBuild 的配方参数里（如 CMAKE_HOST_OPTIONS）：那里在 call HostBuild/Core 求值时与配方执行时各展开一次，所以写四个 $；结果是单引号括起来的 CMake 列表
+host_rpath=$(if $(filter Darwin,$(HOST_OS)),"$(1)/lib",'$(subst $(space),;,$(foreach up,$(or $(2),..),$$$$ORIGIN/$(up)/lib))')
 XARGS:=xargs -r
 
 BASH:=bash
