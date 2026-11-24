@@ -31,7 +31,7 @@
 #  环境变量：
 #      TARGET_DIR   OpenWrt 已构建的 rootfs（默认 build_dir/target-*/root.orig-econet）
 #      STAGE        中间 staging 目录
-#      OUT          输出 cpio 路径（= CONFIG_EXTERNAL_CPIO 要填的值）
+#      OUT          输出 cpio 路径（按当前目录解析）；写进 CONFIG_EXTERNAL_CPIO 时，在主树里的用相对 TOPDIR 的写法
 #      INIT_SRC     /init 脚本源（默认 target/linux/econet/other-files/gs2107-usbboot-init）
 #      RESCUE_PW    救援 shell 的 root 口令（必填，tools/openwrt/build.sh 从凭据真源 var/credentials/gs2107/rescue.json 传入）
 #      RESCUE_SALT  口令哈希的固定盐（必填，来源同上；固定是为了同一提交重复构建逐字节相同）
@@ -207,6 +207,10 @@ chmod 1777 "$STAGE"/tmp
 chmod 0700 "$STAGE"/root
 
 # ---- 打 cpio（newc，与内核 initramfs 解包器兼容）-------------------------
+# newc 头记着每个条目的修改时间，--reproducible 只归一 inode 与设备号：打包前把修改时间统一成 SOURCE_DATE_EPOCH（tools/openwrt/build.sh 按同一个脚本算好传进来，单独运行时这里现算；与 OpenWrt 顶层一样取主树的提交时间），同一提交、同样的输入重新生成时逐字节相同
+: "${SOURCE_DATE_EPOCH:=$("$TOPDIR/scripts/get_source_date_epoch.sh" "$TOPDIR")}"
+[ -n "$SOURCE_DATE_EPOCH" ] || { echo "取不到 SOURCE_DATE_EPOCH（$TOPDIR/scripts/get_source_date_epoch.sh）" >&2; exit 1; }
+find "$STAGE" -exec touch -h -d "@$SOURCE_DATE_EPOCH" {} +
 rm -f "$OUT"
 ( cd "$STAGE" && find . | LC_ALL=C sort | \
 	"$CPIO" --reproducible -o -H newc -R 0:0 >"$OUT" )
@@ -266,5 +270,5 @@ else
 	echo "   (跳过体积估算：无 xz 或未拿到内核本体尺寸；上限 $MAX_KERNEL B)"
 fi
 
-echo "   把这一行写进 .config："
-echo "   CONFIG_EXTERNAL_CPIO=\"$OUT\""
+echo "   把这一行写进 .config（在主树里的写相对 TOPDIR 的路径）："
+echo "   CONFIG_EXTERNAL_CPIO=\"${OUT#"$TOPDIR"/}\""
