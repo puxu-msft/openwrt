@@ -8,6 +8,9 @@ initscript=$1
 action=${2:-help}
 shift 2
 
+# 开机时间线：procd 开机时按 /etc/rc.d/S* 的次序逐个以 boot 动作运行脚本，这里在开始与结束各往内核日志写一行，时刻由内核时间戳给出。直接写 /dev/kmsg：procd 在“- init -”之后把自己的日志改走 syslog，logd（S12log）起来之前的都会丢。级别 debug（<15>），不上串口控制台，只进内存里的内核日志环。
+[ "$action" = boot ] && echo "<15>rc: $initscript boot" 2>/dev/null >/dev/kmsg
+
 start() {
 	return 0
 }
@@ -188,3 +191,6 @@ ALL_COMMANDS="${ALL_COMMANDS} ${EXTRA_COMMANDS}"
 ALL_HELP="${ALL_HELP}${EXTRA_HELP}"
 list_contains ALL_COMMANDS "$action" || action=help
 $action "$@"
+rc_common_status=$?
+[ "$action" = boot ] && echo "<15>rc: $initscript boot done" 2>/dev/null >/dev/kmsg
+exit $rc_common_status

@@ -50,17 +50,27 @@ boot_hook_shift() {
 	return 1
 }
 
+# 开机时间线：往内核日志写一行标记，时刻由内核时间戳给出。级别 debug（<15>，user 设施）：不上串口控制台，只进内存里的内核日志环，不落闪存。
+boot_timeline_mark() {
+	echo "<15>preinit: $*" 2>/dev/null >/dev/kmsg
+}
+
+# 每个钩子函数开跑前记一行“<钩子> <函数>”，钩子里有函数跑过时结束再记一行“<钩子> done”：函数依次执行，相邻两行的时间差就是前一个函数的耗时。
 boot_run_hook() {
 	local hook="$1"
 	local func
+	local pi_hook_ran=
 
 	while boot_hook_shift "$hook" func; do
 		local ran; eval "ran=\$PI_RAN_$func"
 		[ -n "$ran" ] || {
 			export -n "PI_RAN_$func=1"
+			boot_timeline_mark "$hook $func"
+			pi_hook_ran=1
 			$func "$1" "$2"
 		}
 	done
+	[ -z "$pi_hook_ran" ] || boot_timeline_mark "$hook done"
 }
 
 pivot() { # <new_root> <old_root>
