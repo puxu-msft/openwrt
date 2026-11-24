@@ -4,6 +4,7 @@
 
 include $(TOPDIR)/rules.mk
 include $(INCLUDE_DIR)/prereq.mk
+include $(INCLUDE_DIR)/host-ncurses.mk
 
 SHELL:=sh
 PKG_NAME:=Build dependency
@@ -58,9 +59,10 @@ $(eval $(call TestHostCommand,working-g++, \
 		$(STAGING_DIR_HOST)/bin/g++ -x c++ -o $(TMP_DIR)/a.out - -lstdc++ && \
 		$(TMP_DIR)/a.out))
 
+# HOST_NCURSES_FLAGS 是 include/host-ncurses.mk 选中的那份 ncurses 的 -I/-L，为空时按编译器的默认路径找
 $(eval $(call RequireCHeader,ncurses.h, \
 	Please install ncurses. (Missing libncurses.so or ncurses.h), \
-	initscr(), -lncurses))
+	initscr(), $(HOST_NCURSES_FLAGS) -lncurses))
 
 $(eval $(call SetupHostCommand,git,Please install Git (git-core) >= 1.7.12.2, \
 	git --exec-path | xargs -I % -- grep -q -- --recursive %/git-submodule, \

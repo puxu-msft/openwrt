@@ -7,6 +7,7 @@ PREP_MK= OPENWRT_BUILD= QUIET=0
 export IS_TTY=$(if $(MAKE_TERMOUT),1,0)
 
 include $(TOPDIR)/include/verbose.mk
+include $(TOPDIR)/include/host-ncurses.mk
 
 ifeq ($(SDK),1)
   include $(TOPDIR)/include/version.mk
@@ -136,6 +137,11 @@ endif
 ifneq ($(DISTRO_PKG_CONFIG),)
 scripts/config/%onf: export PATH:=$(dir $(DISTRO_PKG_CONFIG)):$(PATH)
 endif
+# mconf、nconf 用 include/host-ncurses.mk 选中的 ncurses：mconf-cfg.sh、nconf-cfg.sh 的 pkg-config 先查它的 .pc，链接加它的 RUNPATH；private 不让前提（如 mconf 的 .prereq-build）继承这两个变量；已编好的 mconf、nconf 与缓存的 *conf-cflags/libs 不随前缀更新（见 host-ncurses.mk）
+ifneq ($(HOST_NCURSES_PKG_CONFIG_PATH),)
+scripts/config/mconf scripts/config/nconf: private export PKG_CONFIG_PATH:=$(HOST_NCURSES_PKG_CONFIG_PATH)$(if $(PKG_CONFIG_PATH),:$(PKG_CONFIG_PATH))
+scripts/config/mconf scripts/config/nconf: private LDFLAGS+=$(HOST_NCURSES_RPATH)
+endif
 scripts/config/%onf: CFLAGS+= -O2
 scripts/config/%onf: FORCE
 	@$(_SINGLE)$(SUBMAKE) $(if $(findstring s,$(OPENWRT_VERBOSE)),,-s) \
@@ -211,7 +217,7 @@ kernel_nconfig: prepare_kernel_conf
 kernel_xconfig: prepare_kernel_conf
 	$(_SINGLE)$(NO_TRACE_MAKE) -C target/linux xconfig
 
-$(STAGING_DIR_HOST)/.prereq-build: include/prereq-build.mk
+$(STAGING_DIR_HOST)/.prereq-build: include/prereq-build.mk include/host-ncurses.mk
 	mkdir -p tmp
 	@$(_SINGLE)$(NO_TRACE_MAKE) -j1 -r -s -f $(TOPDIR)/include/prereq-build.mk prereq 2>/dev/null || { \
 		echo "Prerequisite check failed. Use FORCE=1 to override."; \
