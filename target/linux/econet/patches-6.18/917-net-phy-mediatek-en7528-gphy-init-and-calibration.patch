@@ -1,0 +1,519 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] net: phy: mediatek: EN7528 内置 GPHY 加载原厂配置表并做片上模拟校准
+
+现象：EN7528 内置交换的 4 个 GPHY（MDIO 地址 9–12）在 Linux 下以复位缺省工作。原厂内核的 eth_ephy.ko 在初始化时对每个 PHY 做 BMCR 软复位、写配置表（40 项 MMD、3 项 C22、5 项 Token Ring），并做 Rext、R45 终端电阻、TX offset、TX amp 四步片上校准与 RX offset 硬件校准，原厂日志逐 PHY 打印结果；Linux 实读四口的校准寄存器全是复位值、彼此相同。
+
+改法：照原厂 tcPhyInit（eth_ephy.ko 0x12380）的顺序，由第一个进 config_init 的 EN7528 PHY 在持 MDIO 总线锁的情况下对 9..12 逐个做：BMCR 软复位 → 配置表写给全部 GPHY → 开自协商 → 校准（第一个 PHY 先做一次 Rext）。比较器、握手寄存器（MMD 0x1e 0x17a/0x17b/0x17c）与 R45 的 DAC 码（0x1e 0xe0）都在第一个 GPHY 上，所以四个 PHY 串行做。地址 9–12 的四个 PHY 组成一个 phy_package，用 phy_package_init_once 保证只做一次；交换机驱动重新探测、PHY 重新注册时共享数据重建，会再做一次（推断那时交换机复位已把模拟寄存器清回缺省：Linux 下实读如此，具体哪次复位清的没有证实）。每个 PHY 的结果打一行日志，饱和标 S、出错标 E、没做标 -，最后打出总耗时，便于和原厂日志比对。
+
+与原厂的差异与限制：配置表里的 LED 寄存器（MMD 0x1f 0x21、0x24–0x27）不写，LED 归 LED 框架管；地址 8 上没有设备，不写。原厂在 chip SCU 0x174[19:18] 为 1 或 3（40 MHz 共时钟）时先写一段 PLL 序列再校准，这一支没有移植也没有验证，遇到时跳过校准并告警；找不到 chip SCU 时同样跳过。MDIO 出一次错就停止后续事务（mt7530 每次 PHY_IAC 访问超时 100 ms）。照原厂留下的残留（不恢复的 0x185、0x0fb、0x05c、0x096、0x037、0x039、全局 1f.0x107 与公共 PHY 的 0x0db/0x0dc）在代码里注明。0x03e、0x05c 的终值与原厂相同的前提是原厂开机后段没有执行 tce setPowerSaving off（未证实）。MMD 0x1f 是整组 GPHY 共用的寄存器，写给任一地址对全部生效（GS2107 实测）。
+
+范围：SoC EN7528（内置 GPHY；chip SCU 0x174[19:18] 为 1 或 3 的 40 MHz 共时钟配置跳过校准，见上）。
+
+依据：原厂 eth_ephy.ko 逆向（tcPhyInit 0x12380、ePhyInit 0x5520、配置表 mt75xxGe_cfg_cl45，亲验字节）与原厂同一驱动的源码 tcetherphy_7528.c（打印串、R45 表、偏置常数与本机 .ko 逐字节一致，配置表以本机 .ko 为准）；原厂开机日志的逐口校准结果；规格与对照见 devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N3。
+
+已验证设备：GS2107，测试模块层面（2026-11-25，同一算法以测试模块 gphycal 在运行中的系统上做，initone 模式：配置表只写本口、不重放；devices/openwrt/gs2107/captures/layout-audit-20261125/gphycal-stage-c.log、-d.log，亲手实测）：Rext 0x18 与原厂相同；R45 16 对里 14 对与原厂日志相同、2 对差一档；TX offset 16 对里 14 对相同、2 对差 1（同条件重做有 ±1 的抖动）；TX amp 系统性比原厂高 1–4 码（中位 2，原因未定：原厂在冷开机、各口未连接时做，试验时 WAN 与 lan1 在线）。Rext 必须在第一个 PHY 的校准准备之后做，单独做会饱和。未上硬件：本补丁的内核构建，以及“每轮把配置表写给全部 GPHY”的完整重放顺序，待网络启动测试内核核对开机日志与寄存器终值。
+---
+--- a/drivers/net/phy/mediatek/mtk-ge-soc.c
++++ b/drivers/net/phy/mediatek/mtk-ge-soc.c
+@@ -1479,8 +1479,492 @@
+ 	return phy_clear_bits(phydev, MII_BMCR, BMCR_PDOWN);
+ }
+ 
++/* EN7528 内置 GPHY（MDIO 地址 9–12）的配置表与片上模拟校准，照原厂 eth_ephy.ko 的 tcPhyInit（0x12380）：对每个 PHY 依次做 BMCR 软复位、配置表写进全部 GPHY、开自协商、校准；第一个 PHY 先做一次 Rext。比较器、握手寄存器与 R45 扫描用的 DAC 码都在第一个 GPHY（公共 PHY）上，所以四个 PHY 必须串行，由第一个进 config_init 的 PHY 在持 MDIO 总线锁的情况下一次做完。规格与上机比对见 devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N3。 */
++#define EN7528_GPHY_BASE		9	/* 交换机口 1–4 的 GPHY 在 MDIO 地址 9–12（口号 + 8） */
++#define EN7528_GPHY_NUM			4
++#define EN7528_SCU_REXT			0x16c	/* chip SCU；原厂把 Rext 码 [5:3] 写进 [15:13]，按 16 位写回（GS2107 上写后读回仍为 0，含义未知） */
++#define EN7528_SCU_XTAL			0x174	/* [19:18]：原厂在 1、3（40 MHz 共时钟）时先经第一个 GPHY 写一段 PLL 序列再校准 */
++
++#define EN7528_CAL_ERROR		0xfd
++#define EN7528_CAL_SATURATION		0xfe
++#define EN7528_CAL_FINISH		0xff
++
++/* 每个 PHY 的结果：r45[4]、txoff[4]、txamp[4]，状态是 EN7528_CAL_*，0 表示没做 */
++struct en7528_cal_res {
++	u8 code[12];
++	u8 st[12];
++};
++
++struct en7528_gphy_ctx {
++	struct mii_bus *bus;
++	int common;		/* 公共 PHY 地址（第一个 GPHY） */
++	int err;		/* 第一次 MDIO 错误 */
++};
++
++/* 出过一次错就不再发事务：mt7530 的每次 PHY_IAC 访问超时 100 ms，总线不通时照发会持锁卡几分钟 */
++static u16 en7528_rd(struct en7528_gphy_ctx *c, int addr, u32 reg)
++{
++	int v;
++
++	if (c->err)
++		return 0;
++	v = __mdiobus_read(c->bus, addr, reg);
++
++	if (v < 0) {
++		if (!c->err)
++			c->err = v;
++		return 0;
++	}
++	return v;
++}
++
++static void en7528_wr(struct en7528_gphy_ctx *c, int addr, u32 reg, u16 val)
++{
++	int r;
++
++	if (c->err)
++		return;
++	r = __mdiobus_write(c->bus, addr, reg, val);
++
++	if (r < 0 && !c->err)
++		c->err = r;
++}
++
++/* MMD 经 C22 寄存器 13/14 间接访问，先回到页 0（与原厂 tcMiiExtStationWrite_CL22 相同） */
++static void en7528_mmd_sel(struct en7528_gphy_ctx *c, int addr, int dev, u32 reg)
++{
++	en7528_wr(c, addr, MTK_EXT_PAGE_ACCESS, MTK_PHY_PAGE_STANDARD);
++	en7528_wr(c, addr, MII_MMD_CTRL, dev);
++	en7528_wr(c, addr, MII_MMD_DATA, reg);
++	en7528_wr(c, addr, MII_MMD_CTRL, MII_MMD_CTRL_NOINCR | dev);
++}
++
++static u16 en7528_mrd(struct en7528_gphy_ctx *c, int addr, int dev, u32 reg)
++{
++	en7528_mmd_sel(c, addr, dev, reg);
++	return en7528_rd(c, addr, MII_MMD_DATA);
++}
++
++static void en7528_mwr(struct en7528_gphy_ctx *c, int addr, int dev, u32 reg, u16 val)
++{
++	en7528_mmd_sel(c, addr, dev, reg);
++	en7528_wr(c, addr, MII_MMD_DATA, val);
++}
++
++static void en7528_tr_wr(struct en7528_gphy_ctx *c, int addr, u8 data_addr, u32 val)
++{
++	en7528_wr(c, addr, MTK_EXT_PAGE_ACCESS, MTK_PHY_PAGE_EXTENDED_52B5);
++	en7528_wr(c, addr, 0x11, val & 0xffff);
++	en7528_wr(c, addr, 0x12, val >> 16);
++	/* PMA 节点：ch 1、node 0xf */
++	en7528_wr(c, addr, 0x10, BIT(15) | (0x1 << 11) | (0xf << 7) | ((data_addr & 0x3f) << 1));
++	en7528_wr(c, addr, MTK_EXT_PAGE_ACCESS, MTK_PHY_PAGE_STANDARD);
++}
++
++/* 原厂 mt75xxGe_cfg_cl45（eth_ephy.ko .data+0x64）。原厂表里的 LED 寄存器（MMD 0x1f 0x21、0x24–0x27）不在这里：LED 归 LED 框架管。MMD 0x1f 是整组 GPHY 共用的寄存器，写给任一地址都对全部生效。 */
++static const struct {
++	u8 dev;
++	u16 reg;
++	u16 val;
++} en7528_gphy_cfg[] = {
++	{ 0x1f, 0x273, 0x1000 }, { 0x1f, 0x272, 0x7cff }, { 0x1f, 0x268, 0x0728 }, { 0x1f, 0x269, 0x444f },
++	{ 0x1f, 0x271, 0x7e14 }, { 0x1f, 0x272, 0x7cff }, { 0x1f, 0x044, 0x0030 }, { 0x1f, 0x27c, 0x0808 },
++	{ 0x1f, 0x27b, 0x0177 }, { 0x1f, 0x417, 0x7775 },
++	{ 0x1e, 0x000, 0x0187 }, { 0x1e, 0x001, 0x01c0 }, { 0x1e, 0x002, 0x01c2 }, { 0x1e, 0x003, 0x0109 },
++	{ 0x1e, 0x004, 0x0200 }, { 0x1e, 0x005, 0x0202 }, { 0x1e, 0x006, 0x0387 }, { 0x1e, 0x007, 0x03c0 },
++	{ 0x1e, 0x008, 0x03c2 }, { 0x1e, 0x009, 0x0309 }, { 0x1e, 0x00a, 0x0000 }, { 0x1e, 0x00b, 0x0002 },
++	{ 0x1e, 0x013, 0x0000 }, { 0x1e, 0x014, 0x0000 }, { 0x1e, 0x03e, 0x0000 }, { 0x1e, 0x044, 0x0060 },
++	{ 0x1e, 0x176, 0x5500 }, { 0x1e, 0x177, 0x0000 }, { 0x1e, 0x041, 0x3333 }, { 0x1e, 0x040, 0x0000 },
++	{ 0x1e, 0x201, 0x4000 }, { 0x1e, 0x190, 0x0110 }, { 0x1e, 0x0a6, 0x0350 }, { 0x1e, 0x0b6, 0x7777 },
++	{ 0x07, 0x03c, 0x0000 },
++};
++
++/* 原厂 mt75xxGe_cfg_tr，PMA 节点 */
++static const struct {
++	u8 addr;
++	u32 val;
++} en7528_gphy_cfg_tr[] = {
++	{ 0x00, 0x00002b }, { 0x17, 0x060671 }, { 0x18, 0x0e2e00 }, { 0x12, 0x3c4d2a }, { 0x03, 0x082422 },
++};
++
++/* 原厂 ZCAL_TO_R45ohm_TBL（eth_ephy.ko .rodata+0xdc） */
++static const u8 en7528_zcal_to_r45[64] = {
++	0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7f, 0x7e, 0x7b, 0x78, 0x75, 0x72, 0x70, 0x6e, 0x6b, 0x69, 0x67,
++	0x65, 0x63, 0x61, 0x4f, 0x4d, 0x4b, 0x4a, 0x48, 0x46, 0x45, 0x43, 0x42, 0x41, 0x2f, 0x2e, 0x2d,
++	0x2b, 0x2a, 0x29, 0x28, 0x27, 0x26, 0x25, 0x24, 0x22, 0x22, 0x21, 0x20, 0x0f, 0x0e, 0x0d, 0x0c,
++	0x0b, 0x0a, 0x0a, 0x09, 0x08, 0x07, 0x07, 0x06, 0x05, 0x04, 0x04, 0x03, 0x02, 0x02, 0x01, 0x01,
++};
++
++static void en7528_gphy_cfg_load(struct en7528_gphy_ctx *c, int addr)
++{
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(en7528_gphy_cfg); i++)
++		en7528_mwr(c, addr, en7528_gphy_cfg[i].dev, en7528_gphy_cfg[i].reg, en7528_gphy_cfg[i].val);
++	en7528_wr(c, addr, MII_CTRL1000, 0x0600);
++	en7528_wr(c, addr, MTK_EXT_PAGE_ACCESS, MTK_PHY_PAGE_EXTENDED_1);
++	en7528_wr(c, addr, 0x14, 0x3a14);
++	en7528_wr(c, addr, MTK_EXT_PAGE_ACCESS, MTK_PHY_PAGE_STANDARD);
++	for (i = 0; i < ARRAY_SIZE(en7528_gphy_cfg_tr); i++)
++		en7528_tr_wr(c, addr, en7528_gphy_cfg_tr[i].addr, en7528_gphy_cfg_tr[i].val);
++}
++
++/* 一次比较：公共 PHY 的 0x17c 置 1，固定等 delay µs，0x17b[0] 为完成位（原厂不轮询） */
++static bool en7528_cal_wait(struct en7528_gphy_ctx *c, unsigned int delay)
++{
++	bool done;
++
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x17c, 0x0001);
++	fsleep(delay);
++	done = en7528_mrd(c, c->common, MDIO_MMD_VEND1, 0x17b) & 0x1;
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x17c, 0x0000);
++	return done;
++}
++
++static u8 en7528_cal_comp(struct en7528_gphy_ctx *c)
++{
++	return (en7528_mrd(c, c->common, MDIO_MMD_VEND1, 0x17a) >> 8) & 0x1;
++}
++
++/* 逐码步进直到比较器翻转：返回 FINISH/SATURATION/ERROR，*code 是翻转（或饱和、出错）时的码。write() 把码写进被扫描的字段。 */
++static u8 en7528_cal_sweep(struct en7528_gphy_ctx *c, int *code, int lo, int hi, unsigned int delay,
++			   void (*write)(struct en7528_gphy_ctx *c, void *arg, int code), void *arg)
++{
++	u8 c0;
++	int step;
++
++	write(c, arg, *code);
++	if (!en7528_cal_wait(c, delay) || c->err)
++		return EN7528_CAL_ERROR;
++	c0 = en7528_cal_comp(c);
++	step = c0 ? -1 : 1;
++	for (;;) {
++		*code += step;
++		write(c, arg, *code);
++		if (!en7528_cal_wait(c, delay) || c->err)
++			return EN7528_CAL_ERROR;
++		if (en7528_cal_comp(c) != c0)
++			return EN7528_CAL_FINISH;
++		if (*code == lo || *code == hi)
++			return EN7528_CAL_SATURATION;
++	}
++}
++
++static void en7528_write_e0(struct en7528_gphy_ctx *c, void *arg, int code)
++{
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0e0, *(u16 *)arg | code);
++}
++
++static u8 en7528_gphy_rext(struct en7528_gphy_ctx *c, struct regmap *scu, int *rext)
++{
++	u16 e0_saved, zero = 0;
++	int code = 0x20;
++	u8 st;
++
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0db, 0x1110);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0dc, 0x0000);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0e1, 0x0000);
++	e0_saved = en7528_mrd(c, c->common, MDIO_MMD_VEND1, 0x0e0);
++	st = en7528_cal_sweep(c, &code, 0x00, 0x3f, 100, en7528_write_e0, &zero);
++	if (st == EN7528_CAL_SATURATION)
++		code = 0x20;
++	if (st == EN7528_CAL_ERROR) {
++		en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0e0, e0_saved | 0x20);
++		code = 0x20;
++	} else {
++		unsigned int r;
++
++		en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0e0, code | e0_saved);
++		en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0e0, (code << 8) | code);
++		/* BG_RASEL 是整组共用的寄存器 */
++		en7528_mwr(c, c->common, MDIO_MMD_VEND2, 0x115, (code >> 3) & 0x7);
++		if (scu && !regmap_read(scu, EN7528_SCU_REXT, &r))
++			regmap_write(scu, EN7528_SCU_REXT, ((((code >> 3) & 0x7) << 13) | (r & 0x1fff)) & 0xffff);
++	}
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0db, 0x0000);
++	*rext = code;
++	return st;
++}
++
++struct en7528_field {
++	int addr;
++	u16 reg;
++	u16 base;	/* 字段之外的位 */
++	u8 shift;
++};
++
++static void en7528_write_field(struct en7528_gphy_ctx *c, void *arg, int code)
++{
++	struct en7528_field *f = arg;
++
++	en7528_mwr(c, f->addr, MDIO_MMD_VEND1, f->reg, f->base | (code << f->shift));
++}
++
++static void en7528_write_offset(struct en7528_gphy_ctx *c, void *arg, int v)
++{
++	/* 符号-幅值编码，bit5 为负号 */
++	en7528_write_field(c, arg, v >= 0 ? v : (0x20 | -v));
++}
++
++/* 一个 PHY 的校准，照原厂 doGePhyALLAnalogCal_R45（0x10fc4）。res 收结果供日志：r45[4]、txoff[4]、txamp[4]。 */
++static void en7528_gphy_cal(struct en7528_gphy_ctx *c, int pa, bool rext, struct regmap *scu,
++			    struct en7528_cal_res *res, int *rext_code, u8 *rext_st)
++{
++	static const u16 dc_zcal[4] = { 0x0000, 0x1000, 0x0100, 0x0010 };
++	static const u16 dd_sel[4] = { 0x1000, 0x0100, 0x0010, 0x0001 };
++	static const u16 off_reg[4] = { 0x172, 0x172, 0x173, 0x173 };
++	static const u8 off_shift[4] = { 8, 0, 8, 0 };
++	static const u16 amp_reg[4] = { 0x012, 0x017, 0x019, 0x021 };
++	static const u16 amp_reg100[4] = { 0x016, 0x018, 0x020, 0x022 };
++	static const u8 amp_shift[4] = { 10, 8, 8, 8 };
++	struct en7528_field f;
++	u16 bmcr, r145, rt, hi;
++	int p, code;
++	u8 st;
++
++	en7528_wr(c, pa, MTK_EXT_PAGE_ACCESS, MTK_PHY_PAGE_STANDARD);
++	bmcr = en7528_rd(c, pa, MII_BMCR);
++	en7528_wr(c, pa, MII_BMCR, BMCR_SPEED1000 | BMCR_FULLDPLX);
++	en7528_mwr(c, pa, MDIO_MMD_VEND2, 0x100, 0xc000);
++	r145 = en7528_mrd(c, pa, MDIO_MMD_VEND1, 0x145);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x145, 0x1010);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x185, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0fb, 0x0100);
++
++	if (rext)
++		*rext_st = en7528_gphy_rext(c, scu, rext_code);
++
++	/* R45：DAC 码扫在公共 PHY 的 0xe0[5:0]，结果按表换算后写进本 PHY 的 0x174/0x175 */
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0db, 0x1100);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dc, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0e1, 0x0000);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0db, 0x1100);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0dc, 0x0000);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0e1, 0x0000);
++	for (p = 0; p < 4; p++) {
++		hi = en7528_mrd(c, c->common, MDIO_MMD_VEND1, 0x0e0) & 0xffc0;
++		en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0e0, hi | 0x20);	/* 原厂先写初值、再选对 */
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0db, p == 0 ? 0x1101 : 0x1100);
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dc, dc_zcal[p]);
++		code = 0x20;
++		st = en7528_cal_sweep(c, &code, 0x00, 0x3f, 20, en7528_write_e0, &hi);
++		if (st == EN7528_CAL_SATURATION)
++			code = 0x20;
++		code = st == EN7528_CAL_ERROR ? 0x20 : en7528_zcal_to_r45[code & 0x3f];
++		res->code[p] = code;
++		res->st[p] = st;
++		rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, p < 2 ? 0x174 : 0x175);
++		if (p % 2 == 0)
++			rt = (rt & 0x80ff) | (code << 8) | 0x8000;
++		else
++			rt = (rt & 0xff80) | code | 0x0080;
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, p < 2 ? 0x174 : 0x175, rt);
++	}
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0db, 0x0000);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0db, 0x0000);
++
++	/* TX offset */
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0db, 0x0100);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dc, 0x0001);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0db, 0x0100);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0dc, 0x0001);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x096, 0x8000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x03e, 0xf808);
++	for (p = 0; p < 4; p++) {
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dd, dd_sel[p]);
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x17d + p, 0x8000);
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x181 + p, 0x8000);
++		f.addr = pa;
++		f.reg = off_reg[p];
++		f.shift = off_shift[p];
++		f.base = en7528_mrd(c, pa, MDIO_MMD_VEND1, f.reg) & ~(0x3f << f.shift);
++		code = 0;
++		st = en7528_cal_sweep(c, &code, -31, 31, 20, en7528_write_offset, &f);
++		if (st == EN7528_CAL_ERROR) {
++			en7528_mwr(c, pa, MDIO_MMD_VEND1, f.reg, f.base);
++			code = 0;
++		}
++		res->code[4 + p] = code >= 0 ? code : (0x20 | -code);
++		res->st[4 + p] = st;
++	}
++	for (p = 0; p < 8; p++)
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x17d + p, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0db, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dc, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x03e, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dd, 0x0000);
++
++	/* TX amp：翻转码 amp 之后，GBE = amp + 14、TST = amp + 14、HBT = amp + 3（第一、二个 GPHY 的 A/B 对）或 + 2、TBT = amp + 3（第四个 GPHY 的 A 对为 − 5） */
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x05c, 0x6666);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0db, 0x1100);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dc, 0x0001);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0e1, 0x0000);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0db, 0x1100);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0dc, 0x0001);
++	en7528_mwr(c, c->common, MDIO_MMD_VEND1, 0x0e1, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x03e, 0xf808);
++	for (p = 0; p < 4; p++) {
++		int idx = pa - c->common;
++		u8 sh = amp_shift[p];
++		int v;
++
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dd, dd_sel[p]);
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x17d + p, 0x80f0);
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x181 + p, 0x80f0);
++		f.addr = pa;
++		f.reg = amp_reg[p];
++		f.shift = sh;
++		f.base = en7528_mrd(c, pa, MDIO_MMD_VEND1, f.reg) & ~(0x3f << sh);
++		code = 0x20;
++		st = en7528_cal_sweep(c, &code, 0x00, 0x3f, 100, en7528_write_field, &f);
++		if (st == EN7528_CAL_ERROR) {
++			en7528_mwr(c, pa, MDIO_MMD_VEND1, f.reg, f.base | (0x20 << sh));
++			res->code[8 + p] = 0x20;
++			res->st[8 + p] = st;
++			break;		/* 原厂出错后不再做后面的线对 */
++		}
++		if (st == EN7528_CAL_FINISH) {
++			rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, f.reg) & 0x00ff;
++			en7528_mwr(c, pa, MDIO_MMD_VEND1, f.reg, rt | ((code + 14) << sh));
++		} else {
++			code = 0x20;	/* 饱和：主寄存器高字段留在上下限 */
++		}
++		res->code[8 + p] = code;
++		res->st[8 + p] = st;
++		rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, amp_reg100[p]) & 0xffc0;
++		v = code + 14;
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, amp_reg100[p],
++			   rt | ((st == EN7528_CAL_SATURATION || !v) ? 0x10 : v));
++		rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, amp_reg100[p]) & 0x00ff;
++		v = code + ((p < 2 && idx < 2) ? 3 : 2);
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, amp_reg100[p],
++			   rt | (((st == EN7528_CAL_SATURATION || !v) ? 0x4 : v) << sh));
++		rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, f.reg) & 0xffc0;
++		v = (idx == 3 && p == 0) ? code - 5 : code + 3;
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, f.reg,
++			   rt | ((st == EN7528_CAL_SATURATION || !v) ? 0x10 : v));
++	}
++	for (p = 0; p < 8; p++)
++		en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x17d + p, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0db, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dc, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x03e, 0xc000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x0dd, 0x0000);
++
++	/* RX offset：硬件校准，0x39 bit13 打一个脉冲 */
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x096, 0x8000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x037, 0x0033);
++	rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, 0x039);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x039, rt & 0xb7ff);
++	rt = en7528_mrd(c, pa, MDIO_MMD_VEND2, 0x107);
++	en7528_mwr(c, pa, MDIO_MMD_VEND2, 0x107, rt & 0xefff);
++	rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, 0x171);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x171, rt | 0x0180);
++	rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, 0x039);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x039, rt | 0x2000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x039, rt & 0xdfff);
++	fsleep(10000);
++	rt = en7528_mrd(c, pa, MDIO_MMD_VEND1, 0x171);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x171, rt & 0xfe7f);
++
++	/* 原厂只恢复 BMCR、1f.0x100 与 0x145；0x185、0x0fb、0x05c、0x096、0x037、0x039、全局 1f.0x107 以及公共 PHY 的 0x0db = 0x1100、0x0dc = 0x0001 都照原厂留着（build/research/gphy-cal/vendor-re.md §4.6，公共 PHY 上这两位的影响未知） */
++	en7528_wr(c, pa, MII_BMCR, bmcr);
++	en7528_mwr(c, pa, MDIO_MMD_VEND2, 0x100, 0x0000);
++	en7528_mwr(c, pa, MDIO_MMD_VEND1, 0x145, r145);
++	en7528_wr(c, pa, MII_BMCR, BMCR_ANENABLE | BMCR_ANRESTART);
++}
++
++/* 日志里每个结果后面的标记：正常翻转不标，S 饱和，E 出错，- 没做 */
++static const char *en7528_cal_flag(u8 st)
++{
++	switch (st) {
++	case EN7528_CAL_FINISH:
++		return "";
++	case EN7528_CAL_SATURATION:
++		return "S";
++	case EN7528_CAL_ERROR:
++		return "E";
++	default:
++		return "-";
++	}
++}
++
++static void en7528_gphy_init_all(struct phy_device *phydev)
++{
++	struct en7528_gphy_ctx c = {
++		.bus = phydev->mdio.bus,
++		.common = EN7528_GPHY_BASE,
++	};
++	struct en7528_cal_res res;
++	struct regmap *scu;
++	unsigned int xtal;
++	int i, a, k, rext = 0;
++	u8 rext_st = 0;
++	ktime_t t0 = ktime_get();
++	char line[96];
++
++	scu = syscon_regmap_lookup_by_compatible("econet,en7528-chip-scu");
++	if (IS_ERR(scu) || regmap_read(scu, EN7528_SCU_XTAL, &xtal)) {
++		phydev_warn(phydev, "GPHY calibration skipped: chip SCU not available\n");
++		return;
++	}
++	/* 原厂在 40 MHz 共时钟（[19:18] = 1 或 3）时先写一段 PLL 序列，这一支没有移植也没有验证过 */
++	if (((xtal >> 18) & 0x3) == 1 || ((xtal >> 18) & 0x3) == 3) {
++		phydev_warn(phydev, "GPHY calibration skipped: co-clock mode (SCU 0x174 = %#x) not supported\n", xtal);
++		return;
++	}
++
++	for (i = 0; i < EN7528_GPHY_NUM && !c.err; i++) {
++		int pa = c.common + i;
++		u16 v;
++
++		memset(&res, 0, sizeof(res));
++		phy_lock_mdio_bus(phydev);
++		en7528_wr(&c, pa, MTK_EXT_PAGE_ACCESS, MTK_PHY_PAGE_STANDARD);
++		en7528_wr(&c, pa, MII_BMCR, BMCR_RESET);
++		fsleep(100);
++		/* 原厂每次都把表写给全部 GPHY；表与校准重叠的只有 0x03e，所以重放之后各口 0x03e 的终值也与原厂相同（原厂开机后段若执行了 tce setPowerSaving off，0x03e、0x05c 会再被改写，未证实） */
++		for (a = c.common; a < c.common + EN7528_GPHY_NUM; a++)
++			en7528_gphy_cfg_load(&c, a);
++		v = en7528_rd(&c, pa, MII_BMCR);
++		en7528_wr(&c, pa, MII_BMCR, v | BMCR_ANENABLE | BMCR_ANRESTART);
++		en7528_gphy_cal(&c, pa, i == 0, scu, &res, &rext, &rext_st);
++		phy_unlock_mdio_bus(phydev);
++
++		if (c.err)
++			break;
++		if (i == 0)
++			phydev_info(phydev, "GPHY rext %02x%s\n", rext, en7528_cal_flag(rext_st));
++		for (k = 0, a = 0; k < 12; k++)
++			a += scnprintf(line + a, sizeof(line) - a, "%s%02x%s ",
++				       k == 0 ? "r45 " : k == 4 ? "txoff " : k == 8 ? "txamp " : "",
++				       res.code[k], en7528_cal_flag(res.st[k]));
++		phydev_info(phydev, "GPHY %d calibrated: %s\n", pa, line);
++	}
++	if (c.err)
++		phydev_err(phydev, "GPHY calibration stopped on MDIO error %d\n", c.err);
++	else
++		phydev_info(phydev, "GPHY calibration took %lld ms\n", ktime_ms_delta(ktime_get(), t0));
++}
++
++static int en7528_phy_probe(struct phy_device *phydev)
++{
++	int err;
++
++	/* 四个 GPHY（地址 9–12）组成一个 package，校准由第一个进 config_init 的 PHY 一次做完；别的地址上的同型 PHY 不入包、不校准 */
++	if (phydev->mdio.addr >= EN7528_GPHY_BASE && phydev->mdio.addr < EN7528_GPHY_BASE + EN7528_GPHY_NUM) {
++		err = devm_phy_package_join(&phydev->mdio.dev, phydev, EN7528_GPHY_BASE, 0);
++		if (err)
++			return err;
++	}
++	return an7581_phy_probe(phydev);
++}
++
+ static int en7528_phy_config_init(struct phy_device *phydev)
+ {
++	if (phydev->shared && phy_package_init_once(phydev))
++		en7528_gphy_init_all(phydev);
++
+ 	/* The LED controller of the EN7528 powers up with its external
+ 	 * control disabled, leaving the LED pins dark regardless of what is
+ 	 * programmed into the LED control registers. Hand the pins over to
+@@ -1531,7 +2015,7 @@
+ 		PHY_ID_MATCH_EXACT(MTK_GPHY_ID_EN7528),
+ 		.name		= "EcoNet EN7528 PHY",
+ 		.config_init	= en7528_phy_config_init,
+-		.probe		= an7581_phy_probe,
++		.probe		= en7528_phy_probe,
+ 		.led_blink_set	= mt798x_phy_led_blink_set,
+ 		.led_brightness_set = mt798x_phy_led_brightness_set,
+ 		.led_hw_is_supported = mt798x_phy_led_hw_is_supported,
