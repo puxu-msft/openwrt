@@ -11,7 +11,8 @@
 
 DEP_FINDPARAMS := -x "*/.svn*" -x ".*" -x "*:*" -x "*\!*" -x "* *" -x "*\\\#*" -x "*/.*_check" -x "*/.*.swp" -x "*/.pkgdir*"
 
-find_md5=find $(wildcard $(1)) -type f $(patsubst -x,-and -not -path,$(DEP_FINDPARAMS) $(2)) -printf "%p%T@\n" | LC_ALL=C sort | $(MKHASH) md5
+# 路径按相对 TOPDIR 的形式进哈希：戳记名与 .dep_files 只随文件与修改时间变，整棵树换位置（mv、cp -a、rsync -a 保留修改时间）后照旧认得。TOPDIR 在这里当 sed 的正则用，路径里带 [ \ | 一类字符不支持
+find_md5=find $(wildcard $(1)) -type f $(patsubst -x,-and -not -path,$(DEP_FINDPARAMS) $(2)) -printf "%p%T@\n" | sed -e 's|^$(TOPDIR)/||' | LC_ALL=C sort | $(MKHASH) md5
 find_md5_reproducible=find $(wildcard $(1)) -type f $(patsubst -x,-and -not -path,$(DEP_FINDPARAMS) $(2)) -print0 | xargs -0 $(MKHASH) md5 | LC_ALL=C sort | $(MKHASH) md5
 
 # Make expands the names of the prepared stamps several times, so hash the
