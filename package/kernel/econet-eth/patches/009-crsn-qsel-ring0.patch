@@ -1,0 +1,112 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: 两个 CDMA 的全部 CPU 原因码都指到收包环 0
+
+现象：CDMA 按原因码选收包环的寄存器（原厂 CDMA_CRSN_QSEL，FE+0x410..0x41c 与 CDMA2 的 FE+0x1410..0x141c，每个原因码 4 位、值是环号）驱动从不写，留在复位值：GS2107 实读 0x418 = 0x02300000、0x41c = 0x00000022，即原因码 21 指环 3、22/24/25 指环 2；驱动只建环 0 与环 1，环 2–15 的基址、尺寸与下标实读都是 0。带这几个原因码的帧（保活复制、绑定表项强制上 CPU、组播上 CPU）去向不确定，现在没有触发只是因为 PPE 只学单播、保活关、没做组播卸载。gdm_regs.h 还把 0x410/0x414 写成“每原因码 2 位的 CPU 原因优先级”，位宽与语义都不对（驱动不用它们）。
+
+改法：probe 时把两个 CDMA 的四个字都写 0，所有原因码进环 0；gdm_regs.h 的这一段改成 crsn_qsel[4] 加每原因码 4 位的访问函数，偏移用 _Static_assert 钉住。原厂 fe_core（init_module .init 0x1ac..0x280）把 8、21、22、24、25 指到环 1，那要求环 1 与环 0 同规格；全部指环 0 不需要别的环。环 0 的规格与收包路径不变。
+
+依据：devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N4；实读 devices/openwrt/gs2107/captures/layout-audit-20261125/readonly.log。
+
+上机（GS2107，2026-11-25，与包补丁 010、011 同一个模块 76c90b75 热换，只放 /tmp）：两组 CRSN_QSEL 读回全 0；PPE 成套用例 plain 16 步 0 失败（IPv4/IPv6 的 TCP、UDP 1400/64 B、TOS，绑定后 conntrack 冻结、抓包 200/200 核对；软件转发对照；当时 lan1 协商在 100M）；本机发包 TX 卸载回归 verdict=ok（DNS 10/10、TCP 100 MiB 内容一致、无重传）；内核日志无告警，UBI 擦除计数不变。已验证设备：GS2107（EN7528）。
+
+diff --git a/econet_eth.c b/econet_eth.c
+index 03fb055..4163d20 100644
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -153,6 +153,8 @@ struct en751221_regs {
+ 	u32		switch_regs[0x8000 / sizeof(u32)];
+ };
+ _Static_assert(sizeof(struct en751221_regs) == 0x10000, "en751221_regs size incorrect");
++_Static_assert(offsetof(struct en751221_regs, port0) == 0x400 && offsetof(struct en751221_regs, port1) == 0x1400, "CDMA1/CDMA2 offsets");
++_Static_assert(offsetof(struct gdm, crsn_qsel) == 0x10, "CDMA_CRSN_QSEL at CDMA+0x10");
+ 
+ static struct net_device *en75_get_sport_dev(struct en75_eth_pvt *eth,
+ 					     enum etx_fport sport)
+@@ -350,7 +352,7 @@ static void en75_prepare_qdma_cfg(struct en75_qdma_cfg *cfg,
+ 				  bool has_port)
+ {
+ 	memset(cfg, 0, sizeof(*cfg));
+-	/* 512 RX descriptors on ring 0 of a QDMA with a port: with 128 the ring ran out (RX NO_DSCP) tens of thousands of times per minute while forwarding at 1 Gb/s, and each drop costs a TCP retransmit. A QDMA without a port never enables its RX DMA (en75_qdma_use() runs from ndo_open only). Ring 1 gets the frames whose CPU reason CDMA1_CRSN_QSEL (FE+0x410..0x41c, 4 bits per reason) steers to it; the driver leaves those registers at their reset value, and on GS2107 no frame reached ring 1 or QDMA1 under bulk TCP both ways, a 38,700-packet multicast and broadcast flood and PPE flow learning (2026-11-14). The vendor fe_core maps CPU reasons 8 (IPv4 fragment), 21, 22, 24 and 25 to ring 1 (fe_core init 0x1b0..0x228); programming it that way needs ring 1 sized like ring 0. The idle rings would otherwise hold 512 buffers of 2 KiB each. */
++	/* 有端口的 QDMA 在环 0 上放 512 个收包描述符：放 128 个时，千兆转发下每分钟有数万次环耗尽（RX NO_DSCP），每次丢包都换来一次 TCP 重传。没有端口的 QDMA 从不开收包 DMA（en75_qdma_use() 只在 ndo_open 里调）。en75_probe() 把所有 CPU 原因码都指到环 0（en75_crsn_qsel_ring0()），环 1 收不到帧，只放空闲规格的描述符；空闲环若也放 512 个，每个环要占 512 个 2 KiB 缓冲。 */
+ 	cfg->num_rx_descs[0] = has_port ? 512 : EN75_RX_IDLE_DESCS;
+ 	for (int i = 1; i < QDMA_NUM_CHAINS; i++)
+ 		cfg->num_rx_descs[i] = EN75_RX_IDLE_DESCS;
+@@ -395,6 +397,13 @@ static void en75_remove(struct platform_device *pdev)
+ 	platform_set_drvdata(pdev, NULL);
+ }
+ 
++/* 两个 CDMA 的全部 CPU 原因码都指到收包环 0。复位值把原因码 21 指到环 3、22/24/25 指到环 2，而本驱动只建环 0 和环 1（QDMA_NUM_CHAINS），环 2–15 的基址与尺寸一直是 0（GS2107 实读 QDMA +0x800..+0x9bf），这几类帧（保活复制、绑定表项强制上 CPU、组播上 CPU）的去向因此不确定。原厂 fe_core 把 8、21、22、24、25 指到环 1（init_module .init 0x1ac..0x280），那要求环 1 与环 0 同规格；全部指环 0 不需要别的环。 */
++static void en75_crsn_qsel_ring0(struct gdm __iomem *regs)
++{
++	for (int i = 0; i < ARRAY_SIZE(regs->crsn_qsel); i++)
++		en75_wreg((struct gdm_crsn_qsel){ .word = 0 }, &regs->crsn_qsel[i]);
++}
++
+ static int en75_probe(struct platform_device *pdev)
+ {
+ 	struct en75_debug_conf debug_conf = {0};
+@@ -485,6 +494,10 @@ static int en75_probe(struct platform_device *pdev)
+ 		}
+ 	}
+ 
++	/* 端口打开、帧开始上送之前 */
++	en75_crsn_qsel_ring0(&regs->port0.regs);
++	en75_crsn_qsel_ring0(&regs->port1.regs);
++
+ 	/* Before the ports: their GDM forwards to the engine from ndo_init on. */
+ 	if (ppe && eth->soc->has_ppe) {
+ 		eth->ppe = en75_ppe_init(&pdev->dev, regs);
+diff --git a/gdm_regs.h b/gdm_regs.h
+index ad3c9f5..a1a7fb4 100644
+--- a/gdm_regs.h
++++ b/gdm_regs.h
+@@ -55,20 +55,14 @@ struct gdm {
+ 	u32 channels_enabled;
+ 
+ 	/**
+-	 * gdm_crsn_prio_lo: Priority of a packet based on the CPU_REASON for packet
+-	 * being sent to CPU. Each CPU_REASON corrisponds to 2 bits, 00 = crit_prio, 01
+-	 * = low_prio, 10 = high_prio. This word covers CPU_REASONS 0..15
+-	 */
+-	u32 cpu_reason_priority_lo;
+-
+-	/**
+-	 * gdm_crsn_prio_hi: Priority of a packet based on the CPU_REASON for packet
+-	 * being sent to CPU. Each CPU_REASON corrisponds to 2 bits, 00 = crit_prio, 01
+-	 * = low_prio, 10 = high_prio. This word covers CPU_REASONS 16..31
++	 * gdm_crsn_qsel: 按 CPU 原因码选 QDMA 收包环（原厂 CDMA_CRSN_QSEL，FE+0x410..0x41c / CDMA2 FE+0x1410..0x141c）：每个原因码 4 位、值是环号，第 n 个字管原因码 8n..8n+7。
++	 * See accessors:
++	 * get_gdm_crsn_qsel()
++	 * set_gdm_crsn_qsel()
+ 	 */
+-	u32 cpu_reason_priority_hi;
++	struct gdm_crsn_qsel { u32 word; } crsn_qsel[4];
+ 
+-	u8 unused_0[232];
++	u8 unused_0[224];
+ 
+ 	/**
+ 	 * See accessors:
+@@ -680,6 +674,22 @@ static inline void set_gdm_vlan_stag_parse(struct gdm_vlan *x, bool v) {
+ 	x->word = FIELD_SET(x->word, GDM_VLAN_STAG_PARSE, v);
+ }
+ 
++/**
++ * Accessors for: struct gdm_crsn_qsel
++ * 复位值把原因码 21 指到环 3、22/24/25 指到环 2，其余为 0（FE+0x418 = 0x02300000、0x41c = 0x00000022，GS2107 实读）；原厂 fe_core 初始化把 8、21、22、24、25 改指环 1（init_module .init 0x1ac..0x280）。字段是整字上的掩码，与 CPU 字节序无关。
++ */
++
++#define GDM_CRSN_QSEL_SHIFT(reason)			(((reason) % 8) * 4)
++#define GDM_CRSN_QSEL_MASK(reason)			(0xfU << GDM_CRSN_QSEL_SHIFT(reason))
++
++/** 原因码 reason（0..31）在 crsn_qsel[reason / 8] 里的收包环号 */
++static inline u8 get_gdm_crsn_qsel(struct gdm_crsn_qsel *x, unsigned int reason) {
++	return (x->word & GDM_CRSN_QSEL_MASK(reason)) >> GDM_CRSN_QSEL_SHIFT(reason);
++}
++static inline void set_gdm_crsn_qsel(struct gdm_crsn_qsel *x, unsigned int reason, u8 ring) {
++	x->word = (x->word & ~GDM_CRSN_QSEL_MASK(reason)) | ((u32)(ring & 0xf) << GDM_CRSN_QSEL_SHIFT(reason));
++}
++
+ /**
+  * Bitfield accessors for: struct gdm_pppoe
+  * 位置沿用本驱动原先按大端 EN751221 排布的结构体（标志在高半字、会话号在低半字），未与原厂代码核对、未实测；驱动不用这个寄存器。

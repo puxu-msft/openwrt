@@ -1,0 +1,22 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: GDM2 端口用 GDM2 自己的寄存器块
+
+现象：en75_init_port() 给 GDM2（id 2）传的是 port0，即 GDM1 的 CDMA/GDM/MIB 寄存器块（FE+0x400 起）；GDM2 的块在 FE+0x1400（CDMA2）、0x1500（GDM2）、0x1600（MIB），en751221_regs 里的 port1 位置本身是对的。上游 9644850 原样如此。启用 gmac1 的板子上，GDM2 的 ndo_init/open/change_mtu/统计会改写 GDM1 的转发配置、超长门限与标签解析位，并读走 GDM1 的计数（读后清零）。
+
+改法：GDM2 传 port1。
+
+依据：原厂 fe_core.ko 各 fe_api_* 的端口 1 分支访问 0x14xx/0x15xx/0x16xx（devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N5）。GS2107 的 gmac1 是 disabled，这一改动在 GS2107 上不改变行为。
+
+diff --git a/econet_eth.c b/econet_eth.c
+index 4163d20..9635d8a 100644
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -314,7 +314,7 @@ static int en75_init_port(struct en75_eth_pvt *eth, struct device_node *np)
+ 					  false, eth->ppe);
+ 	else if (id == 2)
+ 		dev = en75_alloc_gdm_port(&eth->pub, np,
+-					  &eth->regs->port0.regs,
++					  &eth->regs->port1.regs,
+ 					  eth->qdma[1],
+ 					  ETX_FPORT_GDM2,
+ 					  true, NULL);

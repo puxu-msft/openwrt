@@ -1,0 +1,32 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: PPE 不把收包描述符里的无效索引 0x3fff 当表项
+
+现象：绑定请求（原因码 15）的处理只拒绝索引 ≥ 16384，收包描述符带 0x3fff 时照常去读写表项 16383。原厂 hw_nat.ko 的 PpeRxinfoHandler（0x1df08..0x1df88）把索引 0x3fff 与原因码 27/30 一样当作“没有表项”（改写成 gPpeFoeNum − 1 作无效标记），mainline mtk_eth_soc 也跳过 0x3fff。
+
+改法：0x3fff 定义为 PPE_INDEX_INVALID，绑定请求带它时直接返回。GS2107 上至今没有观察到这个索引，这一改动不改变现有绑定的行为。
+
+依据：devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N13。
+
+diff --git a/econet_ppe.c b/econet_ppe.c
+index 16866ba..709d889 100644
+--- a/econet_ppe.c
++++ b/econet_ppe.c
+@@ -89,6 +89,8 @@
+ 
+ #define PPE_ENTRIES_SHIFT	4
+ #define PPE_ENTRIES		(1024 << PPE_ENTRIES_SHIFT)
++/* 收包描述符里的表项索引 0x3fff 是“无效”标记：原厂 hw_nat.ko PpeRxinfoHandler（0x1df08..0x1df88）把它与原因码 27/30 一样当作没有表项，mainline mtk_eth_soc 也跳过 0x3fff。 */
++#define PPE_INDEX_INVALID	0x3fff
+ 
+ #define FOE_IB1_UNBIND_TS	GENMASK(7, 0)
+ #define FOE_IB1_BIND_TS		GENMASK(14, 0)
+@@ -586,7 +588,8 @@ void en75_ppe_check_skb(struct en75_ppe *ppe, struct sk_buff *skb,
+ 	u8 dsfield;
+ 	int fam;
+ 
+-	if (crsn != PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED || index >= PPE_ENTRIES)
++	if (crsn != PPE_CPU_REASON_HIT_UNBIND_RATE_REACHED || index >= PPE_ENTRIES ||
++	    index == PPE_INDEX_INVALID)
+ 		return;
+ 	if (!en75_rx_parse_encap(skb, proto_off, &enc))
+ 		goto unparsed;
