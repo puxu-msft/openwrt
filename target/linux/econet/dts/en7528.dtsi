@@ -288,10 +288,10 @@
 			phy-mode = "internal";
 			status = "disabled";
 
+			/* 与交换机 CPU 口一致，不开 802.3x 流控（见 port@6） */
 			fixed-link {
 				speed = <1000>;
 				full-duplex;
-				pause;
 			};
 		};
 
@@ -350,7 +350,7 @@
 				ethernet = <&gmac0>;
 				phy-mode = "internal";
 
-				/* CPU 口不开 802.3x 流控，与原厂内核一致（eth.ko macSetGSW 写 PMCR_P6 = 0x5e30a/0x5e30b，流控位清零）：开着时一个用户口出口拥塞会经 CPU 口反压住所有发往交换机的流量（GS2107 实测：lan1 限 100M 拥塞时，经 WAN 口 ping 网关的 p50 从 1.3 ms 升到 10 ms；关掉后交换机在 CPU 口入口丢掉发往拥塞口的帧，别的口不受影响）。 */
+				/* CPU 口不开 802.3x 流控，与原厂内核一致（eth.ko macSetGSW 写 PMCR_P6 = 0x5e30a/0x5e30b，流控位清零）：开着时一个用户口出口拥塞会把经 CPU 发往别的口的流量一起拖慢（GS2107 寄存器级实测：lan1 限 100M 拥塞时，经 WAN 口 ping 网关的 p50 从 1.3 ms 升到 10 ms；关掉后交换机在 CPU 口入口丢掉发往拥塞口的帧，别的口基本不受影响；反压的具体路径是推断）。 */
 				fixed-link {
 					speed = <1000>;
 					full-duplex;
