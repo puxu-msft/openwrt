@@ -3,9 +3,9 @@ Subject: [PATCH] econet-eth: PPE 不把收包描述符里的无效索引 0x3fff 
 
 现象：绑定请求（原因码 15）的处理只拒绝索引 ≥ 16384，收包描述符带 0x3fff 时照常去读写表项 16383。原厂 hw_nat.ko 的 PpeRxinfoHandler（0x1df08..0x1df88）把索引 0x3fff 与原因码 27/30 一样当作“没有表项”（改写成 gPpeFoeNum − 1 作无效标记），mainline mtk_eth_soc 也跳过 0x3fff。
 
-改法：0x3fff 定义为 PPE_INDEX_INVALID，绑定请求带它时直接返回。GS2107 上至今没有观察到这个索引，这一改动不改变现有绑定的行为。
+改法：0x3fff 定义为 PPE_INDEX_INVALID，绑定请求带它时直接返回。收包表项索引只在这一处入口用到，缓存清除与流记录用的是已绑定流自己的索引。
 
-依据：devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N13。
+范围：芯片层（PPE 只在 EN7528 上启用）。依据：devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N13。已验证设备：GS2107（随包补丁 009 的模块热换回归通过；至今没有观察到 0x3fff，这一改动不改变现有绑定的行为）。
 
 diff --git a/econet_ppe.c b/econet_ppe.c
 index 16866ba..709d889 100644

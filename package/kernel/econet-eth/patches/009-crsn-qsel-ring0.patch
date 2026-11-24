@@ -1,28 +1,31 @@
 From: GS2107 <gs2107@local>
-Subject: [PATCH] econet-eth: 两个 CDMA 的全部 CPU 原因码都指到收包环 0
+Subject: [PATCH] econet-eth: EN7528 上两个 CDMA 的全部 CPU 原因码都指到收包环 0
 
 现象：CDMA 按原因码选收包环的寄存器（原厂 CDMA_CRSN_QSEL，FE+0x410..0x41c 与 CDMA2 的 FE+0x1410..0x141c，每个原因码 4 位、值是环号）驱动从不写，留在复位值：GS2107 实读 0x418 = 0x02300000、0x41c = 0x00000022，即原因码 21 指环 3、22/24/25 指环 2；驱动只建环 0 与环 1，环 2–15 的基址、尺寸与下标实读都是 0。带这几个原因码的帧（保活复制、绑定表项强制上 CPU、组播上 CPU）去向不确定，现在没有触发只是因为 PPE 只学单播、保活关、没做组播卸载。gdm_regs.h 还把 0x410/0x414 写成“每原因码 2 位的 CPU 原因优先级”，位宽与语义都不对（驱动不用它们）。
 
-改法：probe 时把两个 CDMA 的四个字都写 0，所有原因码进环 0；gdm_regs.h 的这一段改成 crsn_qsel[4] 加每原因码 4 位的访问函数，偏移用 _Static_assert 钉住。原厂 fe_core（init_module .init 0x1ac..0x280）把 8、21、22、24、25 指到环 1，那要求环 1 与环 0 同规格；全部指环 0 不需要别的环。环 0 的规格与收包路径不变。
+改法：EN7528（soc 数据 has_crsn_qsel）在 probe 的 FE 复位之后、端口打开之前把两个 CDMA 的四个字都写 0，所有原因码进环 0；gdm_regs.h 的这一段改成 crsn_qsel[4] 加每原因码 4 位的访问函数，crsn_qsel 与 fwd_cfg 的偏移用 _Static_assert 钉住。原厂 fe_core（init_module .init 0x1ac..0x280）把 8、21、22、24、25 指到环 1，那要求环 1 与环 0 同规格；全部指环 0 不需要别的环。环 0 的规格与收包路径不变。这只是打开那几项功能的必要条件：收包路径不按原因码分流，例如保活副本到了环 0 会照常交给协议栈。
+
+范围：芯片层（EN7528）。EN751221 不写：它的这组寄存器没与原厂核对过（同族的 airoha EN7581 同一偏移是每原因码 8 位）。
 
 依据：devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N4；实读 devices/openwrt/gs2107/captures/layout-audit-20261125/readonly.log。
 
-上机（GS2107，2026-11-25，与包补丁 010、011 同一个模块 76c90b75 热换，只放 /tmp）：两组 CRSN_QSEL 读回全 0；PPE 成套用例 plain 16 步 0 失败（IPv4/IPv6 的 TCP、UDP 1400/64 B、TOS，绑定后 conntrack 冻结、抓包 200/200 核对；软件转发对照；当时 lan1 协商在 100M）；本机发包 TX 卸载回归 verdict=ok（DNS 10/10、TCP 100 MiB 内容一致、无重传）；内核日志无告警，UBI 擦除计数不变。已验证设备：GS2107（EN7528）。
+上机（GS2107，2026-11-25，不带 has_crsn_qsel 判断、在 EN7528 上行为相同的上一版，与包补丁 010、011 同一个模块 76c90b75 热换，只放 /tmp；captures/layout-audit-20261125/hotswap.log、suite-plain-76c90b75.log、tx-offload-76c90b75.log）：两组 CRSN_QSEL 读回全 0；PPE 成套用例 plain 16 步 0 失败（当时 lan1 协商在 100M）；本机发包 TX 卸载回归 verdict=ok；内核日志无告警，UBI 擦除计数不变；换回开机模块后两组回到复位值。开机顺序里交换机复位在 probe 之后，部署后要再读一次核对。已验证设备：GS2107（EN7528）。
 
 diff --git a/econet_eth.c b/econet_eth.c
-index 03fb055..4163d20 100644
+index 03fb055..3efcb9f 100644
 --- a/econet_eth.c
 +++ b/econet_eth.c
-@@ -153,6 +153,8 @@ struct en751221_regs {
+@@ -153,6 +153,9 @@ struct en751221_regs {
  	u32		switch_regs[0x8000 / sizeof(u32)];
  };
  _Static_assert(sizeof(struct en751221_regs) == 0x10000, "en751221_regs size incorrect");
 +_Static_assert(offsetof(struct en751221_regs, port0) == 0x400 && offsetof(struct en751221_regs, port1) == 0x1400, "CDMA1/CDMA2 offsets");
 +_Static_assert(offsetof(struct gdm, crsn_qsel) == 0x10, "CDMA_CRSN_QSEL at CDMA+0x10");
++_Static_assert(offsetof(struct gdm, fwd_cfg) == 0x100, "GDM_FWD_CFG at CDMA+0x100 (vendor fe_api_get_fw_cfg reads FE+0x500/0x1500)");
  
  static struct net_device *en75_get_sport_dev(struct en75_eth_pvt *eth,
  					     enum etx_fport sport)
-@@ -350,7 +352,7 @@ static void en75_prepare_qdma_cfg(struct en75_qdma_cfg *cfg,
+@@ -350,7 +353,7 @@ static void en75_prepare_qdma_cfg(struct en75_qdma_cfg *cfg,
  				  bool has_port)
  {
  	memset(cfg, 0, sizeof(*cfg));
@@ -31,7 +34,7 @@ index 03fb055..4163d20 100644
  	cfg->num_rx_descs[0] = has_port ? 512 : EN75_RX_IDLE_DESCS;
  	for (int i = 1; i < QDMA_NUM_CHAINS; i++)
  		cfg->num_rx_descs[i] = EN75_RX_IDLE_DESCS;
-@@ -395,6 +397,13 @@ static void en75_remove(struct platform_device *pdev)
+@@ -395,6 +398,13 @@ static void en75_remove(struct platform_device *pdev)
  	platform_set_drvdata(pdev, NULL);
  }
  
@@ -45,19 +48,42 @@ index 03fb055..4163d20 100644
  static int en75_probe(struct platform_device *pdev)
  {
  	struct en75_debug_conf debug_conf = {0};
-@@ -485,6 +494,10 @@ static int en75_probe(struct platform_device *pdev)
+@@ -485,6 +495,12 @@ static int en75_probe(struct platform_device *pdev)
  		}
  	}
  
-+	/* 端口打开、帧开始上送之前 */
-+	en75_crsn_qsel_ring0(&regs->port0.regs);
-+	en75_crsn_qsel_ring0(&regs->port1.regs);
++	/* 端口打开、帧开始上送之前，且在上面的 FE 复位之后（复位会把它们清回复位值） */
++	if (eth->soc->has_crsn_qsel) {
++		en75_crsn_qsel_ring0(&regs->port0.regs);
++		en75_crsn_qsel_ring0(&regs->port1.regs);
++	}
 +
  	/* Before the ports: their GDM forwards to the engine from ndo_init on. */
  	if (ppe && eth->soc->has_ppe) {
  		eth->ppe = en75_ppe_init(&pdev->dev, regs);
+@@ -534,6 +550,7 @@ static const struct en75_soc_data en751221_soc_data = {
+ static const struct en75_soc_data en7528_soc_data = {
+ 	.dscp_byte_swap = false,
+ 	.has_ppe = true,
++	.has_crsn_qsel = true,
+ };
+ 
+ static const struct of_device_id of_en75_match[] = {
+diff --git a/econet_eth.h b/econet_eth.h
+index e23d0a9..443666f 100644
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -20,6 +20,8 @@ struct en75_soc_data {
+ 	bool dscp_byte_swap;
+ 	/* PPE at FE+0xe00 with the register layout econet_ppe.c drives (EN7528; verified on GS2107) */
+ 	bool has_ppe;
++	/* CDMA_CRSN_QSEL（CDMA+0x10..0x1c）是每原因码 4 位的收包环号（EN7528，与原厂 fe_core 核对过）；EN751221 的这组寄存器没核对过，不写 */
++	bool has_crsn_qsel;
+ };
+ 
+ /* Number of QDMA engines in this ethernet device. */
 diff --git a/gdm_regs.h b/gdm_regs.h
-index ad3c9f5..a1a7fb4 100644
+index ad3c9f5..94e1fd5 100644
 --- a/gdm_regs.h
 +++ b/gdm_regs.h
 @@ -55,20 +55,14 @@ struct gdm {
@@ -74,7 +100,7 @@ index ad3c9f5..a1a7fb4 100644
 -	 * gdm_crsn_prio_hi: Priority of a packet based on the CPU_REASON for packet
 -	 * being sent to CPU. Each CPU_REASON corrisponds to 2 bits, 00 = crit_prio, 01
 -	 * = low_prio, 10 = high_prio. This word covers CPU_REASONS 16..31
-+	 * gdm_crsn_qsel: 按 CPU 原因码选 QDMA 收包环（原厂 CDMA_CRSN_QSEL，FE+0x410..0x41c / CDMA2 FE+0x1410..0x141c）：每个原因码 4 位、值是环号，第 n 个字管原因码 8n..8n+7。
++	 * gdm_crsn_qsel: 按 CPU 原因码选 QDMA 收包环（原厂 CDMA_CRSN_QSEL，FE+0x410..0x41c / CDMA2 FE+0x1410..0x141c）：EN7528 上每个原因码 4 位、值是环号，第 n 个字管原因码 8n..8n+7。EN751221 的布局没与原厂核对过（同族的 airoha EN7581 同一偏移是每原因码 8 位），驱动只在 has_crsn_qsel 的芯片上写它。
 +	 * See accessors:
 +	 * get_gdm_crsn_qsel()
 +	 * set_gdm_crsn_qsel()
