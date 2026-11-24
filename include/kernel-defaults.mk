@@ -46,6 +46,9 @@ else
   endef
 endif
 
+# CONFIG_EXTERNAL_CPIO 写相对路径时以 TOPDIR 为基准：.config 与发布的 config.buildinfo 里不留本机绝对路径，整棵树换位置后照样指对；没配时为空
+EXTERNAL_CPIO=$(if $(call qstrip,$(CONFIG_EXTERNAL_CPIO)),$(if $(filter /%,$(call qstrip,$(CONFIG_EXTERNAL_CPIO))),,$(TOPDIR)/)$(call qstrip,$(CONFIG_EXTERNAL_CPIO)))
+
 ifeq ($(CONFIG_TARGET_ROOTFS_INITRAMFS),y)
   ifeq ($(strip $(CONFIG_EXTERNAL_CPIO)),"")
     define Kernel/SetInitramfs/PreConfigure
@@ -60,7 +63,7 @@ ifeq ($(CONFIG_TARGET_ROOTFS_INITRAMFS),y)
     define Kernel/SetInitramfs/PreConfigure
 	{ \
 		grep -v INITRAMFS $(2)/.config.old > $(2)/.config; \
-		echo 'CONFIG_INITRAMFS_SOURCE="$(call qstrip,$(CONFIG_EXTERNAL_CPIO))"' >> $(2)/.config; \
+		echo 'CONFIG_INITRAMFS_SOURCE="$(EXTERNAL_CPIO)"' >> $(2)/.config; \
 	}
     endef
   endif
@@ -238,7 +241,7 @@ define Kernel/CompileImage/Initramfs
 		$(if $(CONFIG_TARGET_ROOTFS_INITRAMFS_SEPARATE), \
 			$(call locked,{ \
 				$(if $(call qstrip,$(CONFIG_EXTERNAL_CPIO)), \
-					$(CP) $(CONFIG_EXTERNAL_CPIO) $(KERNEL_BUILD_DIR)/initrd$(2).cpio;,\
+					$(CP) $(EXTERNAL_CPIO) $(KERNEL_BUILD_DIR)/initrd$(2).cpio;,\
 					( cd $(if $(1),$(1),$(TARGET_DIR)); find . | LC_ALL=C sort | $(STAGING_DIR_HOST)/bin/cpio --reproducible -o -H newc -R 0:0 > $(KERNEL_BUILD_DIR)/initrd$(2).cpio ); \
 					$(call Kernel/AppendInitrdInit,$(2));) \
 				$(if $(SOURCE_DATE_EPOCH), \
