@@ -1,0 +1,10 @@
+# preinit（failsafe）网口按板指定。GS2107 的 LAN 口是交换机的 DSA 用户口：eth0 注册后 DSA 还要约 1.6 s 才建好用户口（11-23 开机日志 40.80 → 42.42 s），preinit_ip 运行时 lan1 可能还不在，preinit_config_board 找不到口就不再管；指定了 ifname，lan1 稍后出现时热插拔路径（/sbin/preinit-netdev → preinit_ip_event，它只认 set_preinit_iface 给的 ifname）会补配 failsafe 地址。只取 lan1：preinit 只在一个口上配地址，与 board.d 里 lan 口列表的第一个相同。没列出的板保持原来的 preinit_config_board 路径。
+set_preinit_iface() {
+	case "$(board_name)" in
+	chinamobile,gs2107)
+		ifname=lan1
+		;;
+	esac
+}
+
+boot_hook_add preinit_main set_preinit_iface
