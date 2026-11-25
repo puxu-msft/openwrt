@@ -103,13 +103,6 @@
 		 * 详见 en7528/config-6.18 同值注释。
 		 */
 		bootargs = "console=ttyS0,115200 root=/dev/mtdblock4 rootfstype=squashfs rootwait";
-		/*
-		 * free-bootbase：镜像解压占物理 0x2000-0x20000，vmlinuz 落在
-		 * 0x80020000。usable 从 0x20000 起（与 JioFiber 一致），尾部留 128KB。
-		 * VMLINUX-RE：未定位到显式 "bootram" 命名保留区，最大保留块即内核
-		 * 巨型 BSS（约 17.9MB，位于解压区之后）。
-		 */
-		linux,usable-memory-range = <0x00020000 0x1bfe0000>;
 	};
 
 	/*

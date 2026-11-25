@@ -121,8 +121,9 @@
 
 	spi_ctrl: spi@1fa10000 {
 		compatible = "airoha,en7581-snand";
+		/* NFI 块按 4 KiB 声明：驱动经 regmap 访问到 NFI+0x55c（SNF_NFI_CNFG），原来的 0x160 只靠 ioremap 按页取整才没出错；U-Boot 的同一节点也是 0x1000 */
 		reg = <0x1fa10000 0x140>,
-		      <0x1fa11000 0x160>;
+		      <0x1fa11000 0x1000>;
 
 		clocks = <&spi_clock>;
 		clock-names = "spi";
