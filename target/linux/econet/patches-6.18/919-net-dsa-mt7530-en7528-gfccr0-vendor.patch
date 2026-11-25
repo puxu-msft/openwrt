@@ -1,0 +1,37 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] net: dsa: mt7530: EN7528 照原厂开机写全局流控配置 0x1fe0
+
+现象：EN7528 内置交换机的 GSW 0x1fe0 在 Linux 下停在硬件复位值 0xa0087864（6.18.60 的 mt7530 与 OpenWrt econet 补丁都不写它，mt7988_setup 开头的 GSW 复位之后没有写者）。原厂 eth.ko mt7530_switch_init（0xc948-0xc950，亲验字节）在 GSW 复位之后、收包重新打开之前，于内置交换机路径无条件整字写 0x80083020；原厂运行期 API（macMT7530SetBackPressure、macMT7530SetDsP5Qos）只改 bit31，从不改其余位。复位值与原厂值差在 bit29（复位 1、原厂 0）与三个门限字节（复位 0x08/0x78/0x64、原厂 0x08/0x30/0x20）。按 MT7530 手册（C）这是全局流控配置（GFCCR0），bit31 为全局流控使能、三个字节为空闲缓冲块门限；EN7528 上字段语义未核实。
+
+改法：EN7528 分支在 en7528_reset() 之后、mt7531_setup_common() 之前整字写 0x80083020，时机与原厂相同（GSW 复位之后、各口打开之前）；交换机重绑时 setup 重跑、复位后再写一次。其它型号不变。
+
+范围：SoC EN7528（原厂内置交换机路径无条件写；EN751221 的 GSW 没核对过，放窄）。
+
+依据：原厂 eth.ko 字节（devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N43，build/research/gphy-cal/vendor-re.md §9.1）；hw-qos 会话的上机判别（devices/openwrt/gs2107/captures/hwqos-SW-20261125-2350/）：旧模块 8764 上运行期把 0x1fe0 写成原厂值，htb-cycle 原触发 25 周期 0 次停死（srep-s10.txt，B，基线约 0.14/周期、偶然全 0 的概率约 2.4%）；同期阳性对照只改 QDMA +0x2c bit19、0x1fe0 留复位值，第 9–10 周期停死（srep-qx2c.txt、eth-swap-stall-20261125-235912.log）；交换机重绑会把 0x1fe0 复位回 0xa0087864（s10-rebind-check.txt，A），所以要在每次 setup 的 GSW 复位之后写；原厂值与我们的读值逐项对照见 swreg-audit.txt。
+
+已验证设备：GS2107 上只验证了运行期写原厂值（旧模块 8764，htb-cycle 25 周期 0 停死）；本补丁本身没上过硬件，在下一次批量构建后的网络启动测试内核上验收：只读确认 0x1fe0 = 0x80083020、交换机重绑后仍是，htb-cycle 25 周期回归。
+---
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -3411,6 +3411,8 @@
+ 
+ 	if (priv->id == ID_EN7528) {
+ 		en7528_reset(priv);
++		/* 原厂 eth.ko mt7530_switch_init（0xc948-0xc950）在 GSW 复位之后、收包打开之前无条件整字写这一值；复位值 0xa0087864 下 hw_qos 的发送停死可复现，运行期写成原厂值后 htb-cycle 25 周期未再出现（B，gs2107 docs/35 N43）。不受 hw_qos 控制：原厂开机就写 */
++		mt7530_write(priv, MT753X_GFCCR0, EN7528_GFCCR0_VENDOR);
+ 		return mt7531_setup_common(ds);
+ 	}
+ 
+--- a/drivers/net/dsa/mt7530.h
++++ b/drivers/net/dsa/mt7530.h
+@@ -41,6 +41,10 @@
+ /* EN7528：交换机复位释放后原厂 eth.ko macReset（0x1c48-0x1c80）轮询这一位，置位就提前结束、5 次等不到也照常继续；数据手册含义未查到，运行期读数 0x00071899，置位 */
+ #define  EN7528_AGC_READY		BIT(17)
+ 
++/* 全局流控配置（MT7530 手册称 GFCCR0；按手册 bit31 为全局流控使能、[23:0] 三个字节为空闲缓冲块门限，EN7528 上字段语义未核实）。EN7528 照原厂 eth.ko 开机写的整字，见 mt7988_setup() */
++#define MT753X_GFCCR0			0x1fe0
++#define  EN7528_GFCCR0_VENDOR		0x80083020
++
+ /* Register for MAC forward control */
+ #define MT753X_MFC			0x10
+ #define  BC_FFP_MASK			GENMASK(31, 24)
