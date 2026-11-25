@@ -1,71 +1,31 @@
 Subject: [PATCH] spi: airoha-snfi: EN7528 SPI NAND bring-up fixes (consolidated)
 
-Consolidated low-level fixes for the GS2107 (EcoNet EN7528) SPI NAND, all
-verified on hardware: the device now boots OpenWrt from the onboard
-BWET08U NAND with this driver (kernel log: "spi-nand spi0.0: BWET SPI
-NAND was found", "8 fixed-partitions partitions found", root mounted from
-/dev/mtdblock4). Background and the bootbase-level replication evidence are
-in devices/gs2107/docs/11-NAND-ROOTCAUSE.md §10/§11.
+层：芯片家族层（EcoNet SNFI 控制器的 manual FIFO 与 DMA 读写）。本树 en7528 与 en751627 子目标的 DT 都以 airoha,en7581-snand 用本驱动（en751221 子目标用 spi-en7523，不受影响）；只在 EN7528（GS2107，BWET08U）上验证过，EN751627 未验证。
 
-1. SFC clock environment: SCU 0x1fa2011c (divider+enable, matching the
-   vendor spi_nor_set_clock_speed(40) net effect) + SI_CK_SEL=9 +
-   MACMUX_SEL=1, gated on the EN7528 chip_scu syscon. This is what makes
-   the flash answer at all: without it the SFC FSM runs but MISO reads
-   back zero (unknown raw ID 0000000000, probe -122).
-2. Bus-turnaround op codes: the ID-read shape (command directly followed by
-   data-in) uses the vendor NOR read_id sequence (double cs_low, op=16 for
-   the command byte, op=2/len=5 terminator after cs_high); the last
-   address/dummy byte before an RX is sent with op=17 (vendor send_byte2).
-   Verified: with op=8 the flash does not answer at all; with these ops the
-   ID reads back correctly.
-3. DUMMY register = 0 in manual mode. Do not set it to 1: the hardware
-   turnaround already provides the dummy cycle and the spi-mem op carries an
-   explicit dummy segment, so DUMMY=1 shifts every page read left by one
-   byte (first byte of each page lost; proven by byte-for-byte comparison
-   against a firmware dump on 2026-11-08).
-4. DFIFO drain at the start of exec_op + the RX poll condition changed from
-   "bit0 cleared" to "the whole status register back to 0" (vendor
-   read_byte@0x802d7678). Without this the poll passes immediately over
-   residual FIFO bytes and reads zeros.
-5. Accept the en7581-snand compatible on the same DMA-probe path.
+按本机原厂 3.18 内核的 spi_nand 体系对齐 exec_op 的 manual 序列。依据是原厂 GPL 源码（devices/openwrt/gs2107/reference/xc220-gpl 下的 spi_controller.c、spi_nand_flash.c、newspiflash.h）与本机原厂内核 firmware/derived/vmlinux-3.18.21.bin 的反汇编，两者在这些原语上一致；对照与证据见 devices/openwrt/gs2107/docs/14-NAND-READ-PATH-FIX.md。
 
-No debug prints: the exec_op byte dump was a temporary aid while bringing
-the driver up and is removed now that the root cause is fixed.
+1. 每个 op 片选拉低、拉高各一次，命令字节用单线发送（原厂 SPI_CONTROLLER_Chip_Select_Low/High 各提交一个 op，vmlinux 0x802d7790、0x802d77b4）。拉低片选之后任何一步出错，都先拉高片选再返回。
+2. 后面紧跟读数据时，1 线地址或哑元段的最后一个字节用 op 0x11（原厂 OS2ID：单线发、随后转入双线收）。get_feature 的用法与原厂相同；读 ID（命令 + 地址）原厂用普通单线发送，这里用 0x11，读回 bcb2bcb2bc。
+3. 读字节前等 DFIFO 状态寄存器（0x3c）整体读回 0，与原厂 SPI_CONTROLLER_Read_NByte（vmlinux 0x802d7718）相同。每个 RX op 只取它要求的字节数，不另行排空 DFIFO，原厂也不排空；0x3c 在空闲时恒读 0，不能拿来判断 FIFO 里有没有字节。
+4. DUMMY（0x80）在两种模式下都写 0：改成 1 时页读数据整体左移 1 字节、每页首字节丢失（与固件备份逐字节比对）。原厂进 DMA 读 BWET08U 时写 0，进 manual 时写 1。
 
 --- a/drivers/spi/spi-airoha-snfi.c
 +++ b/drivers/spi/spi-airoha-snfi.c
-@@ -201,6 +201,18 @@
+@@ -201,6 +201,8 @@
  #define SNAND_FIFO_TX_BUSWIDTH_SINGLE		0x08
  #define SNAND_FIFO_TX_BUSWIDTH_DUAL		0x09
  #define SNAND_FIFO_TX_BUSWIDTH_QUAD		0x0a
-+/*
-+ * bus-turnaround 标记（原厂两套 manual 体系实证，docs/11 §11）：
-+ *  - 0x10 = 命令字节 + turnaround（原厂 NOR read_id 发 0x9F 用 op=16）
-+ *  - 0x11 = 地址/哑元字节 + turnaround（原厂 spi_nand send_byte2 用 op=17）
-+ * bit4 语义（B 级反推）= "本 TX 字节是命令/地址段最后一个，其后紧跟 RX"。
-+ * GS2107 实测：ID 读用 op=8 发 0x9F，flash 不回应、DFIFO 无数据；
-+ * 换 op=16 后正常读出 mfr 0xbc/dev 0xb2（bootbase 复刻，docs/11 §10.6）。
-+ */
-+#define SNAND_FIFO_TX_CMD_TA			0x10
++/* 0x11 是原厂的 OS2ID：单线发、随后转入双线收（原厂 newspiflash.h:146-148，OS2IS/OS2ID/OS2IQ = 0x10/0x11/0x12，单线发 → 单/双/四线收）。原厂 spi_nand 体系里，单线读缓存的列地址末字节或哑元用 OS2IS、双线读缓存的哑元用 OS2ID（spi_nand_flash.c:1467-1512），只有 get_feature 在单线读之前用 0x11（:746），读 ID 的地址字节用普通单线发送（:876）。本驱动在 1 线地址或哑元段之后紧跟读数据时，段内最后一个字节一律用 0x11：get_feature 与原厂相同；读 ID（命令 + 地址）与原厂不同，读回 bcb2bcb2bc；单线读缓存只在不走 DMA 时用到，本机没跑过 */
 +#define SNAND_FIFO_TX_ADDR_TA			0x11
-+/* 段收尾：原厂 NOR read_id 在 cs_high 后补一个 op=2/len=5 的空操作 */
-+#define SNAND_FIFO_OP_TERMINATOR			0x02
  #define SNAND_FIFO_RX_BUSWIDTH_SINGLE		0x0c
  #define SNAND_FIFO_RX_BUSWIDTH_DUAL		0x0e
  #define SNAND_FIFO_RX_BUSWIDTH_QUAD		0x0f
-@@ -306,10 +318,17 @@
+@@ -306,10 +308,10 @@
  		int err;
  		u32 val;
  
 -		/* 1. wait until dfifo is not empty */
-+		/*
-+		 * 1. 等 DFIFO 状态寄存器整体回 0。
-+		 * 原厂 read_byte（0x802d7678）同款条件：RX 传输中该寄存器
-+		 * 非 0（忙碌/计数字段），回 0 = 数据已就绪。旧条件只查
-+		 * bit0，传输中 bit0 常为 0 → 轮询立即通过 → 读到抢先的 0
-+		 * （ID 首字节恒 0 之因，11-08 debug 版 boot 日志实证：
-+		 * read 5B: 00bcb2bcb2）。
-+		 */
++		/* 1. 等 DFIFO 状态寄存器整体读回 0 再取字节，与原厂 SPI_CONTROLLER_Read_NByte 相同（vmlinux 0x802d7718 起的 lw 0x3c / bnez 循环）；11-08 debug 日志里它在空闲时也读 0，不能拿来判断 FIFO 里有没有残留字节 */
  		err = regmap_read_poll_timeout(as_ctrl->regmap_ctrl,
  					       REG_SPI_CTRL_DFIFO_EMPTY, val,
 -					       !(val & SPI_CTRL_DFIFO_EMPTY),
@@ -73,32 +33,19 @@ the driver up and is removed now that the root cause is fixed.
  					       0, 250 * USEC_PER_MSEC);
  		if (err)
  			return err;
-@@ -390,6 +409,15 @@
+@@ -390,6 +392,7 @@
  		break;
  	}
  
-+	/*
-+	 * [GS2107] DUMMY = 0（恢复原值）。
-+	 * 11-08 教训：曾按"原厂 system B 进 manual 写 1"改成 1，结果页读
-+	 * 数据整体左移 1 字节（每页首字节丢失，设备读出内容与固件备份
-+	 * 逐字节比对实证）——硬件 turnaround 自带的 dummy 与显式 dummy 段
-+	 * 叠加，DMA 捕获窗口整体后移。dummy 周期由 spi-mem op 的 dummy 段
-+	 * 显式提供（exec_op 经 write_data_ta 发 op=17+0xFF，与原厂
-+	 * read_page 序列一致），DUMMY 寄存器必须为 0。
-+	 */
++	/* DUMMY 写 0，这一写对 manual 与 DMA 两种模式都生效。曾把它改成 1，页读数据整体左移 1 字节、每页首字节丢失（devices/openwrt/gs2107/docs/14-NAND-READ-PATH-FIX.md §1.4，读出与固件备份逐字节比对），页读走的是 DMA。原厂进 DMA 读 BWET08U（哑元在地址之后）时写 0（spi_nand_flash.c:1675），进 manual 时写 1（spi_controller.c:530）；manual 下写 0 或 1，读 ID 读回的字节相同（11-08 debug 开机日志） */
  	return regmap_write(as_ctrl->regmap_ctrl, REG_SPI_CTRL_DUMMY, 0);
  }
  
-@@ -431,6 +459,33 @@
+@@ -431,6 +434,28 @@
  	return 0;
  }
  
-+/*
-+ * 逐字节发送 TX 段，最后一个字节打 bus-turnaround 标记（op=17）。
-+ * 对应原厂 spi_nand 体系 send_byte2@0x802d7540：地址/哑元段的最后一个
-+ * TX 字节用 op=17，其后紧跟 RX（get_feature/read_page 均如此，
-+ * docs/11 §11.2）。仅用于 1 线（buswidth==1）形状。
-+ */
++/* 逐字节发送 1 线的地址或哑元段，最后一个字节用 SNAND_FIFO_TX_ADDR_TA（0x11）发，其后紧跟读数据；原厂各场景的用法见该宏的注释 */
 +static int airoha_snand_write_data_ta(struct airoha_snand_ctrl *as_ctrl,
 +				      const u8 *data, int len)
 +{
@@ -123,106 +70,43 @@ the driver up and is removed now that the root cause is fixed.
  static int airoha_snand_read_data(struct airoha_snand_ctrl *as_ctrl,
  				  u8 *data, int len, int buswidth)
  {
-@@ -930,11 +985,39 @@
- 	return err;
- }
- 
-+/*
-+ * 排空 DFIFO。
-+ * 硬件事实（11-08 debug 版 boot 日志实证）：DFIFO_EMPTY 位在上电后/前一条
-+ * op 后常为 0（FIFO 里有残留字节，内容为 0）。此时 read_data_from_fifo 的
-+ * "等非空" 轮询立即通过，把残留 0 当成数据读走——flash 的真实数据后到，
-+ * 仍留在 FIFO 里（post-op 快照 DE=0 为证）。表现为 ID 读回全零。
-+ * bootbase 手工复刻因两条命令间隔几十 ms、真实数据先到而掩盖了该竞争。
-+ * 因此在 exec_op 起始（任何 TX/RX 之前）先把残留排掉。
-+ */
-+static void airoha_snand_drain_dfifo(struct airoha_snand_ctrl *as_ctrl)
-+{
-+	int i;
-+	u32 val;
-+
-+	for (i = 0; i < 256; i++) {
-+		regmap_read(as_ctrl->regmap_ctrl,
-+			    REG_SPI_CTRL_DFIFO_EMPTY, &val);
-+		if (val & SPI_CTRL_DFIFO_EMPTY)
-+			return;
-+
-+		regmap_read(as_ctrl->regmap_ctrl,
-+			    REG_SPI_CTRL_DFIFO_RDATA, &val);
-+		regmap_write(as_ctrl->regmap_ctrl, REG_SPI_CTRL_DFIFO_RD,
-+			     SPI_CTRL_DFIFO_RD);
-+	}
-+}
-+
- static int airoha_snand_exec_op(struct spi_mem *mem,
- 				const struct spi_mem_op *op)
+@@ -935,6 +960,7 @@
  {
  	struct airoha_snand_ctrl *as_ctrl;
  	int op_len, addr_len, dummy_len;
-+	bool rx_after, id_read;
++	bool rx_after;
  	u8 buf[20], *data;
  	int i, err;
  
-@@ -955,36 +1038,80 @@
+@@ -955,38 +981,51 @@
  	for (i = 0; i < dummy_len; i++)
  		*data++ = 0xff;
  
-+	/*
-+	 * [GS2107] data-in 前是否有 TX 段、以及是否 "ID 读形状"
-+	 * （命令后直接 data-in，无地址/哑元 —— spi-nand 核心的 RDID）。
-+	 * 原厂对 ID 读走 NOR read_id 序列（双 cs_low + op=16 发命令 +
-+	 * cs_high 后 op=2/len=5 收尾），bootbase 硬件复刻实证可读出
-+	 * mfr 0xbc/dev 0xb2（docs/11 §10.6 配方 A）；op=8 发命令实测
-+	 * flash 不回应（§10.6 A3）。其余操作走 spi_nand 体系：命令 op=8、
-+	 * 地址/哑元最后一个字节 op=17（turnaround）、单 cs_low、无收尾。
-+	 */
++	/* 按原厂 spi_nand 体系：每个 op 片选拉低、拉高各一次（原厂 SPI_CONTROLLER_Chip_Select_Low/High 各提交一个 op，vmlinux 0x802d7790、0x802d77b4），命令字节单线发送 */
 +	rx_after = op->data.nbytes > 0 && op->data.dir == SPI_MEM_DATA_IN;
-+	id_read = rx_after && !addr_len && !dummy_len;
 +
  	/* switch to manual mode */
  	err = airoha_snand_set_mode(as_ctrl, SPI_MODE_MANUAL);
  	if (err < 0)
  		return err;
  
-+	/* 排空 DFIFO 残留，避免 read 轮询读到残留 0（见 drain_dfifo 注释） */
-+	airoha_snand_drain_dfifo(as_ctrl);
-+
-+	/* ID 读形状：原厂双 cs_low */
-+	if (id_read) {
-+		err = airoha_snand_set_cs(as_ctrl, SPI_CHIP_SEL_LOW);
-+		if (err < 0)
-+			return err;
-+	}
-+
++	/* 片选拉低之后任何一步出错都经 out_cs_high 拉高片选再返回 */
  	err = airoha_snand_set_cs(as_ctrl, SPI_CHIP_SEL_LOW);
  	if (err < 0)
- 		return err;
+-		return err;
++		goto out_cs_high;
  
  	/* opcode */
  	data = buf;
 -	err = airoha_snand_write_data(as_ctrl, data, op_len,
 -				      op->cmd.buswidth);
--	if (err)
++	err = airoha_snand_write_data(as_ctrl, data, op_len, op->cmd.buswidth);
+ 	if (err)
 -		return err;
-+	if (id_read) {
-+		/* 命令字节用 turnaround 标记 op=16 */
-+		err = airoha_snand_set_fifo_op(as_ctrl, SNAND_FIFO_TX_CMD_TA,
-+					       op_len);
-+		if (err)
-+			return err;
++		goto out_cs_high;
  
 -	/* addr part */
-+		err = airoha_snand_write_data_to_fifo(as_ctrl, data, op_len);
-+		if (err < 0)
-+			return err;
-+	} else {
-+		err = airoha_snand_write_data(as_ctrl, data, op_len,
-+					      op->cmd.buswidth);
-+		if (err)
-+			return err;
-+	}
-+
-+	/* addr part：1 线且后面跟 RX 时，最后一个字节打 turnaround（op=17） */
++	/* addr part：1 线且后面跟读数据时，最后一个字节用 SNAND_FIFO_TX_ADDR_TA */
  	data += op_len;
  	if (addr_len) {
 -		err = airoha_snand_write_data(as_ctrl, data, addr_len,
@@ -235,11 +119,12 @@ the driver up and is removed now that the root cause is fixed.
 +						      op->addr.buswidth);
 +		}
  		if (err)
- 			return err;
+-			return err;
++			goto out_cs_high;
  	}
  
 -	/* dummy */
-+	/* dummy：同上（fast read 的哑元字节，原厂亦用 op=17） */
++	/* dummy：同上 */
  	data += addr_len;
  	if (dummy_len) {
 -		err = airoha_snand_write_data(as_ctrl, data, dummy_len,
@@ -252,21 +137,23 @@ the driver up and is removed now that the root cause is fixed.
 +						      op->dummy.buswidth);
 +		}
  		if (err)
- 			return err;
+-			return err;
++			goto out_cs_high;
  	}
-@@ -1003,7 +1130,16 @@
- 			return err;
+ 
+ 	/* data */
+@@ -1000,10 +1039,14 @@
+ 						      op->data.nbytes,
+ 						      op->data.buswidth);
+ 		if (err)
+-			return err;
++			goto out_cs_high;
  	}
  
 -	return airoha_snand_set_cs(as_ctrl, SPI_CHIP_SEL_HIGH);
-+	err = airoha_snand_set_cs(as_ctrl, SPI_CHIP_SEL_HIGH);
-+	if (err)
-+		return err;
-+
-+	/* ID 读形状：cs_high 后补 op=2/len=5 收尾（原厂 NOR read_id） */
-+	if (id_read)
-+		err = airoha_snand_set_fifo_op(as_ctrl,
-+					       SNAND_FIFO_OP_TERMINATOR, 5);
++out_cs_high:
++	if (airoha_snand_set_cs(as_ctrl, SPI_CHIP_SEL_HIGH) && !err)
++		err = -EIO;
 +
 +	return err;
  }

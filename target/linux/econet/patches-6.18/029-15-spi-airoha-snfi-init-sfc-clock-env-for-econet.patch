@@ -1,6 +1,6 @@
 Subject: [PATCH] spi: airoha-snfi: initialize SFC clock environment on EcoNet EN7528
 
-勘误（2026-11-09 硬件实验，devices/gs2107/docs/14 §1、§4）：下面“时钟环境缺失是读 ID 全零的根因”的推断已被证伪——内核期 chip_scu[0x11c] 本来就是 0x501，补写是空操作；根因在 airoha_snand_exec_op() 的 FIFO 序列细节（双 cs_low、op=16、收尾 op=2/len=5）、DFIFO 残留与 DUMMY=0，修复在后续补丁里。本补丁的三写与原厂一致、无害，保留；SI_CK_SEL 与 MACMUX_SEL 两写是否必要未单独实测。以下为当时的原说明。
+勘误：下面“时钟环境缺失是读 ID 全零的根因”的推断不成立——内核期 chip_scu[0x11c] 本来就是 0x501，补写是空操作（devices/openwrt/gs2107/docs/14-NAND-READ-PATH-FIX.md §4）。按 11-08 开机日志的时间线，探测失败的直接原因是 spi-nand 核心没有 0xBC 厂商表项，029-18 补上后即识别出 BWET08U（devices/openwrt/gs2107/captures/flash-direct-20261108-074329.log:194）。本补丁的三写与原厂一致、无害，保留；SI_CK_SEL 与 MACMUX_SEL 两写是否必要未单独实测。以下为当时的原说明。
 
 Reading the SPI NAND ID on GS2107 (EcoNet EN7528) returns all zeros
 (spi-nand spi0.0: unknown raw ID 0000000000, probe failed -122), while tcboot
@@ -45,20 +45,14 @@ boards sharing this driver are unaffected.
  	int err;
  
  	ctrl = devm_spi_alloc_host(dev, sizeof(*as_ctrl));
-@@ -1099,6 +1101,36 @@
+@@ -1099,6 +1101,30 @@
  		return dev_err_probe(dev, PTR_ERR(as_ctrl->spi_clk),
  				     "unable to get spi clk\n");
  
 +	/*
 +	 * [econet bring-up] SFC 时钟环境写入（GS2107）
 +	 *
-+	 * 勘误（2026-11-09 硬件实验，devices/gs2107/docs/14 §1、§4）：
-+	 * 当初按 docs/11 的反汇编推断“问题在 SFC 时钟环境而非协议”，
-+	 * 已证伪——内核期 chip_scu[0x11c] 本来就是 0x501，补写是空
-+	 * 操作。读 ID 全零的根因在 airoha_snand_exec_op() 的 FIFO
-+	 * 序列细节（双 cs_low、op=16、收尾 op=2/len=5）、DFIFO 残留
-+	 * 与 DUMMY=0，修复在后续补丁里。下面三写与原厂一致、无害，
-+	 * 保留；SI_CK_SEL/MACMUX_SEL 两写是否必要未单独实测：
++	 * 这三写与原厂一致、无害，保留；它们不是当年读 ID 失败的原因：内核期 chip_scu[0x11c] 本来就是 0x501，补写是空操作（devices/openwrt/gs2107/docs/14-NAND-READ-PATH-FIX.md §4）。按 11-08 开机日志的时间线，探测失败的直接原因是 spi-nand 核心没有 0xBC 厂商表项（029-18 补上）。SI_CK_SEL/MACMUX_SEL 两写是否必要未单独实测：
 +	 *   1) chip_scu[0x11c] = (old & 0xffff) | 0x0501
 +	 *      = 原厂 spi_nor_set_clock_speed(40) 的净效果
 +	 *      （bit0 使能 + bits[15:8]=5 → 400M/2/5 = 40MHz）
