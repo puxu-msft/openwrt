@@ -1407,7 +1407,7 @@ static bool pub_remap_block(
 	u16 mapped_block_idx,
 	int copy_len)
 {
-	u16 block;
+	int block;
 	struct block_info *maybe_mapped_block = NULL;
 	int ret;
 
