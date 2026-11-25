@@ -1,0 +1,52 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: debugfs hwf_descs 的空闲描述符数按原厂只取 LMGR_STATUS 的 [12:0]
+
+现象：debugfs qdma*/hwf_descs 第一行在 GS2107 上读出 used=-16777216。LMGR_STATUS（QDMA+0xf0）是两个字段，空闲时读 0x01000100，原来整字当成空闲数，用描述符总数去减就成了负数。
+
+原厂 qdma_get_lmgr_status（qdma_lan.ko 0xbc44 `lw a2,240(a1)`、0xbc48 `andi a2,a2,0x1fff`，亲验字节；GPL qdma_api.i:62840 同）只取 [12:0] 作空闲的 FWD 描述符数，已用数 = 总数 − 它。改成同样只取 [12:0]，偏移用 static_assert 钉在 0xf0。[28:16] 原厂代码不读，含义没核实：空闲时与 [12:0] 相同，有流量时更小（0x00b600d8），像是空闲数的低水位（推断），只在注释里记下。
+
+范围：芯片家族层（GPL SDK 的 qdma 各芯片共用；EN751221 未在实物上验证）。依据：devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N42。已验证设备：无（编译通过，W=1 无告警；整字读数 0x01000100 → 256 的换算按原厂掩码推出，待下一次上机读 hwf_descs 第一行核对）。
+
+diff --git a/econet_eth_debug.c b/econet_eth_debug.c
+index 38f6282..621b5a9 100644
+--- a/econet_eth_debug.c
++++ b/econet_eth_debug.c
+@@ -139,7 +139,7 @@ static int en75_qdma_hwf(struct seq_file *m, void *v)
+ 
+ 	cfg1 = en75_rreg(&regs->hwf_cfg1);
+ 	hwf_desc_addr = en75_rreg(&regs->hwf_desc_addr);
+-	free_desc_n = en75_rreg(&regs->debug.hwf_desc_free);
++	free_desc_n = FIELD_GET(QREGS_DEBUG_HWF_DESC_FREE, en75_rreg(&regs->debug.hwf_desc_free));
+ 
+ 	seq_printf(m, "QDMA FWD Descriptors used=%d total=%d base=%pad\n",
+ 		get_qregs_hwf_cfg1_fwd_desc_n(&cfg1) - free_desc_n,
+diff --git a/qdma_regs.h b/qdma_regs.h
+index a9de3ee..b096b0f 100644
+--- a/qdma_regs.h
++++ b/qdma_regs.h
+@@ -329,8 +329,8 @@ struct qregs {
+ 		u32 unused_0;
+ 
+ 		/**
+-		 * qregs_debug_hwf_desc_free: Called QDMA_CSR_DBG_LMGR_STATUS, number of free
+-		 * hardware forwarding descriptors
++		 * qregs_debug_hwf_desc_free: Called QDMA_CSR_DBG_LMGR_STATUS. [12:0] is the number of free
++		 * hardware forwarding descriptors (QREGS_DEBUG_HWF_DESC_FREE).
+ 		 */
+ 		u32 hwf_desc_free;
+ 
+@@ -444,10 +444,14 @@ struct qregs {
+ 
+ };
+ 
++/* LMGR_STATUS（+0xf0）：原厂 qdma_get_lmgr_status（qdma_lan.ko 0xbc44-0xbc48，GPL qdma_api.i:62840）只取 [12:0] 作空闲的 FWD 描述符数，已用数 = 描述符总数 − 它。[28:16] 原厂代码不读，含义没核实：空闲时与 [12:0] 相同（0x01000100），有流量时更小（0x00b600d8），像是空闲数的低水位（推断）。 */
++#define QREGS_DEBUG_HWF_DESC_FREE	GENMASK(12, 0)
++
+ /* 上面按整字掩码描述的字段的寄存器偏移（原厂 qdma_lan.ko）。 */
+ static_assert(offsetof(struct qregs, wrr_weight) == 0x88);
+ static_assert(offsetof(struct qregs, tx_congest_cfg) == 0xa0);
+ static_assert(offsetof(struct qregs, tx_congest_thr) == 0xa4);
++static_assert(offsetof(struct qregs, debug.hwf_desc_free) == 0xf0);
+ 
+ /**
+  * Bitfield accessors for: qregs_qcfg bitfield_0
