@@ -5,13 +5,13 @@ Subject: [PATCH] net: dsa: mt7530: EN7528 交换机复位照原厂保持并等�
 
 原厂做法（eth.ko macReset，0x1be4–0x1ca0，亲验字节）：SCU RST_CTRL1（0x1fb00834）bit23 置位，udelay(1000)，清掉；外接交换时先写 SYS_CTRL 0x7000 = 3（0x1ca4），内置交换不写；然后两种都走同一个循环（0x1c48–0x1c80）：最多 5 次“udelay(1000)，读交换机偏移 0x000c（AGC）”，bit17 置位就提前结束，5 次都没置位也照常返回。上游 mt7988_setup 只保持复位 20–50 µs、释放后 20–50 µs 就写 SYS_CTRL_PHY_RST 并继续，紧接着扫 MDIO。
 
-改法（只在 ID_EN7528 上，复位序列收进 en7528_reset，其它型号的 mt7988_setup 原样）：复位保持 1 ms，释放后照原厂最多 5 次“延时 1 ms、读 AGC”，bit17 置位就结束，等不到只告警。SYS_CTRL_PHY_RST 原厂没有，这里照上游保留：去掉它就要依赖“SCU 复位同时复位了 GPHY”这个没验证过的前提；而失败形态正是复位后第一笔读坏、第二笔就对，只在它之前等不能排除坏读来自这次 PHY 复位，所以它之后对 DT mdio 节点下的每个 PHY 轮询 PHYSID1，读到非 0、非 0xffff 才交给 phylib 扫描（每个最多 50 ms，不应答只告警并接着等下一个，读出错就停）。每次 setup 打一行：AGC 第几次读到就绪、PHYSID1 一共读了几次与用时。AGC bit17 的含义没在资料里查到，只按原厂的用法等它。
+改法（只在 ID_EN7528 上，复位序列收进 en7528_reset，其它型号的 mt7988_setup 原样）：复位保持 1 ms，释放后照原厂最多 5 次“延时 1 ms、读 AGC”，bit17 置位就结束，等不到只告警。SYS_CTRL_PHY_RST 原厂没有，这里照上游保留：去掉它就要依赖“SCU 复位同时复位了 GPHY”这个没验证过的前提；而失败形态正是复位后第一笔读坏、第二笔就对，只在它之前等不能排除坏读来自这次 PHY 复位，所以它之后对 DT mdio 节点下的每个 PHY 轮询 PHYSID1，读到非 0、非 0xffff 才交给 phylib 扫描（每个最多 50 ms，不应答只告警并接着等下一个，读出错就停）。调试日志（dev_dbg）记 AGC 第几次读到就绪、PHYSID1 一共读了几次与用时。AGC bit17 的含义没在资料里查到，只按原厂的用法等它。
 
 范围：SoC EN7528（mt7530 的 ID_EN7528 分支）；MT7988、EN7581、AN7583 的复位路径不变。
 
 依据：原厂 eth.ko macReset 的复位与等待序列（亲验字节，devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N17、工作稿 S2）；GS2107 判别实验：同一内核只解绑重绑 mt7530-mmio，控制台级别 4 下 2/2 失败（PHY 9 phy_id 0x00009491），级别 7 下 7/7 正常（devices/openwrt/gs2107/captures/hwqos-E2R-20261125-0715/rebind-exp.txt，同伴会话实测）；C45 形态的失败原文 r2-pstore-dmesg-ramoops-0.txt:555-726。
 
-已验证设备：无（W=1 编译通过）。待 GS2107 网络启动测试内核验收：控制台级别 4 下连续重绑 5/5，PHY 9–12 都绑到 EcoNet EN7528 PHY、phy_id 0x03a29491；开机加每次重绑至少 6 组日志计数。之后按数据收窄：PHYSID1 读取次数恒等于 PHY 个数（每个第一笔就读对），说明原厂的 AGC 等待已足够，删掉 PHYSID1 轮询只留原厂序列；会多于 PHY 个数，就保留并把数据写进补丁头；两种情况下诊断日志都降为 dev_dbg 或删掉。
+已验证设备：GS2107（2026-11-25，网络启动测试内核，只进内存，devices/openwrt/gs2107/captures/netboot-917-918-20261125/，亲手实测）：控制台级别 4 连续重绑 5/5，PHY 9–12 每次都由 EcoNet EN7528 PHY 接管、phy_id 0x03a29491；开机与 6 次重绑共 7 组计数：AGC 每次第 1 次读就就绪，PHYSID1 4 个 PHY 共读 5–6 次、用时 0.58–2.2 ms，即 SYS_CTRL_PHY_RST 之后确实有 PHY 要多等一两次，PHYSID1 轮询保留；验收时这行计数是 dev_info，验收后降为 dev_dbg。
 ---
 --- a/drivers/net/dsa/mt7530.c
 +++ b/drivers/net/dsa/mt7530.c
@@ -21,7 +21,7 @@ Subject: [PATCH] net: dsa: mt7530: EN7528 交换机复位照原厂保持并等�
  
 +/* EN7528 的复位序列：交换机复位与就绪等待照原厂 eth.ko macReset（0x1be4）：SCU RST_CTRL1 bit23 置位保持 1 ms 后清掉，再最多 5 次“延时 1 ms、读 AGC”，bit17 置位就提前结束，5 次都没置位也照常继续。 */
 +/* 原厂内置交换不写 SYS_CTRL（eth.ko 只在外接交换分支写 0x7000 = 3），SYS_CTRL_PHY_RST 沿用上游；它之后等 DT mdio 节点下的每个 PHY 读得出 PHYSID1（非 0、非 0xffff）再交给 phylib 扫描。不等时复位后的第一笔读会读成 0，phylib 把 PHY 9 认成 Generic PHY（phy_id 0x00009491）或改按 C45 建设备而绑不上（gs2107 captures/hwqos-E2R-20261125-0715/rebind-exp.txt、r2-pstore-dmesg-ramoops-0.txt）；开机时控制台打印在这之间插进几毫秒，所以开机不出现。 */
-+/* 日志里的两项计数用来判断要等的是哪一次复位：AGC 第几次读到就绪（0 表示 5 次都没置位）；PHYSID1 一共读了几次，多于 PHY 个数说明 SYS_CTRL_PHY_RST 之后确实要等。 */
++/* GS2107 实测（开机与 6 次重绑共 7 组）：AGC 每次第 1 次读就就绪；PHYSID1 4 个 PHY 共读 5–6 次，SYS_CTRL_PHY_RST 之后确实有 PHY 要多等一两次，所以轮询保留。调试日志里的两项计数（AGC 第几次读到就绪，0 表示 5 次都没置位；PHYSID1 读取次数）用来复核这一点。 */
 +static void en7528_reset(struct mt7530_priv *priv)
 +{
 +	struct device_node *mnp;
@@ -79,7 +79,7 @@ Subject: [PATCH] net: dsa: mt7530: EN7528 交换机复位照原厂保持并等�
 +	}
 +	of_node_put(mnp);
 +
-+	dev_info(priv->dev, "reset: AGC ready on read %d, %d PHYSID1 reads for %d PHYs in %lld us\n",
++	dev_dbg(priv->dev, "reset: AGC ready on read %d, %d PHYSID1 reads for %d PHYs in %lld us\n",
 +		 agc_reads, id_reads, phys, ktime_us_delta(ktime_get(), start));
 +}
 +

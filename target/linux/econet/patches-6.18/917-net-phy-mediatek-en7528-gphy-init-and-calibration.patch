@@ -11,7 +11,7 @@ Subject: [PATCH] net: phy: mediatek: EN7528 内置 GPHY 加载原厂配置表并
 
 依据：原厂 eth_ephy.ko 逆向（tcPhyInit 0x12380、ePhyInit 0x5520、配置表 mt75xxGe_cfg_cl45，亲验字节）与原厂同一驱动的源码 tcetherphy_7528.c（打印串、R45 表、偏置常数与本机 .ko 逐字节一致，配置表以本机 .ko 为准）；原厂开机日志的逐口校准结果；规格与对照见 devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N3。
 
-已验证设备：GS2107，测试模块层面（2026-11-25，同一算法以测试模块 gphycal 在运行中的系统上做，initone 模式：配置表只写本口、不重放；devices/openwrt/gs2107/captures/layout-audit-20261125/gphycal-stage-c.log、-d.log，亲手实测）：Rext 0x18 与原厂相同；R45 16 对里 14 对与原厂日志相同、2 对差一档；TX offset 16 对里 14 对相同、2 对差 1（同条件重做有 ±1 的抖动）；TX amp 系统性比原厂高 1–4 码（中位 2，原因未定：原厂在冷开机、各口未连接时做，试验时 WAN 与 lan1 在线）。Rext 必须在第一个 PHY 的校准准备之后做，单独做会饱和。未上硬件：本补丁的内核构建，以及“每轮把配置表写给全部 GPHY”的完整重放顺序，待网络启动测试内核核对开机日志与寄存器终值。
+已验证设备：GS2107。测试模块层面（2026-11-25，gphycal，initone 模式，devices/openwrt/gs2107/captures/layout-audit-20261125/gphycal-stage-c.log、-d.log）：Rext 0x18 与原厂相同，Rext 必须在第一个 PHY 的校准准备之后做、单独做会饱和。本补丁的内核（2026-11-25，网络启动测试内核，只进内存，热重启、两个口在线；devices/openwrt/gs2107/captures/netboot-917-918-20261125/，亲手实测）：开机与 6 次交换机重绑共 7 轮校准都完成（每轮 0.8–1.1 s，无 S/E）；与原厂日志逐对比较 112 对：Rext 每轮 0x18，R45 102 对相同、10 对高一档，TX offset 84 对相同、28 对幅值小 1，TX amp 7 对相同、64 对 +1、34 对 +2、7 对 +3（单向偏高，原因未定，没有链路的口同样偏高；待冷开机、各口不插线时复测）；非校准项终值（1e.0x03e、0x05c、0x037、0x185、0x0fb，PHY 9 的 0x0e0、0x0db/0x0dc，1f.0x115）与原厂推算值一致；chip SCU 0x174[19:18] = 2，走校准分支。
 ---
 --- a/drivers/net/phy/mediatek/mtk-ge-soc.c
 +++ b/drivers/net/phy/mediatek/mtk-ge-soc.c
