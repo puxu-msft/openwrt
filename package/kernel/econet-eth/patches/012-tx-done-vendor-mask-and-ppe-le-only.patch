@@ -1,0 +1,59 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: TX 完成记录按原厂掩码取环号与下标；PPE 只在小端主机上启用
+
+TX 完成记录原来按 airoha EN7581 取环号 [20:16]、下标 [15:0]；原厂 qdma_lan.ko 只取 bit16 作环号（0x8630 ext pos 16 size 1）、[11:0] 作下标（0x8648 andi 0xfff），GPL qdma_bmgr.i:62117-62118 同。高位若带别的信息，旧掩码会把合法记录当越界跳过、漏回收 skb；至今没见过这类 WARN，改成原厂掩码后对现有记录结果相同（驱动只建环 0/1、每环描述符数小于 4096）。
+
+FOE 表项结构体用 u16 成员拼 32 位字，只在小端主机上与硬件布局一致。现在只有 EN7528（小端）标了 has_ppe；大端芯片若被标上，probe 时告警并不启用 PPE，不静默写错表项。
+
+顺带：debugfs qdma*/hwf_descs 第一行读出的 FWD 描述符区基址（hwf_desc_addr）原来只赋值不用，W=1 下编不过，现在随用量一起打印（base=）。
+
+范围：TX 完成记录为芯片家族层（GPL SDK 的 qdma_bmgr 各芯片共用；EN751221 未在实物上验证）；PPE 守卫为通用（与字节序有关的构建条件）。依据：devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N9、N14。已验证设备：GS2107（2026-11-25 模块热换回归，叠在主分支 001–011 之上：PPE 成套用例 plain 16 步 0 失败、TX 卸载回归 verdict=ok、无 WARN；devices/openwrt/gs2107/captures/layout-audit-20261125/eth012-*）。hwf_descs 的 base= 输出待下一次上机读一次核对。
+
+diff --git a/econet_eth.c b/econet_eth.c
+index 32816fd..64d197b 100644
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -502,7 +502,10 @@ static int en75_probe(struct platform_device *pdev)
+ 	}
+ 
+ 	/* Before the ports: their GDM forwards to the engine from ndo_init on. */
+-	if (ppe && eth->soc->has_ppe) {
++	/* FOE 表项结构体用 u16 成员拼 32 位字，只在小端主机上与硬件布局一致：大端芯片若被标成 has_ppe，拒绝启用而不是写错表项 */
++	if (ppe && eth->soc->has_ppe && IS_ENABLED(CONFIG_CPU_BIG_ENDIAN)) {
++		dev_warn(&pdev->dev, "PPE: FOE entry layout assumes a little-endian host, not enabled\n");
++	} else if (ppe && eth->soc->has_ppe) {
+ 		eth->ppe = en75_ppe_init(&pdev->dev, regs);
+ 		if (IS_ERR(eth->ppe)) {
+ 			dev_warn(&pdev->dev, "PPE setup failed: %pe\n", eth->ppe);
+diff --git a/econet_eth_debug.c b/econet_eth_debug.c
+index b90a328..38f6282 100644
+--- a/econet_eth_debug.c
++++ b/econet_eth_debug.c
+@@ -141,9 +141,9 @@ static int en75_qdma_hwf(struct seq_file *m, void *v)
+ 	hwf_desc_addr = en75_rreg(&regs->hwf_desc_addr);
+ 	free_desc_n = en75_rreg(&regs->debug.hwf_desc_free);
+ 
+-	seq_printf(m, "QDMA FWD Descriptors used=%d total=%d\n",
++	seq_printf(m, "QDMA FWD Descriptors used=%d total=%d base=%pad\n",
+ 		get_qregs_hwf_cfg1_fwd_desc_n(&cfg1) - free_desc_n,
+-		get_qregs_hwf_cfg1_fwd_desc_n(&cfg1));
++		get_qregs_hwf_cfg1_fwd_desc_n(&cfg1), &hwf_desc_addr);
+ 
+ 	for (i = 0; i < get_qregs_hwf_cfg1_fwd_desc_n(&cfg1); i++) {
+ 		struct fwdesc *desc = &debug->config->hwf_desc[i];
+diff --git a/econet_qdma.c b/econet_qdma.c
+index 72c2de0..94dc3db 100644
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -490,8 +490,9 @@ static irqreturn_t en75_irq_handler(int irq_num, void *dev_instance)
+ 	return IRQ_HANDLED;
+ }
+ 
+-#define IRQ_RING_IDX_MASK		GENMASK(20, 16)
+-#define IRQ_DESC_IDX_MASK		GENMASK(15, 0)
++/* TX 完成记录：原厂 qdma_lan.ko 只取 bit16 作环号（0x8630 ext pos 16 size 1）、[11:0] 作下标（0x8648 andi 0xfff），GPL qdma_bmgr.i:62117-62118 同；原来的 [20:16]/[15:0] 照的是 airoha EN7581 */
++#define IRQ_RING_IDX_MASK		BIT(16)
++#define IRQ_DESC_IDX_MASK		GENMASK(11, 0)
+ 
+ /* TX-done completions do not reliably raise an interrupt: the
+  * done-queue IRQ only fires on the empty -> non-empty transition, and
