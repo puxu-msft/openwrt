@@ -588,11 +588,12 @@
 		/*
 		 * kernel：8MB。LZMA 流约 3.83MB，余 4.17MB 给后续加驱动。
 		 * 由 U-Boot 读出（gs_nand_boot）并 bootm，不由 bootbase 直接读。
-		 * 不开 econet,enable-remap：开了以后内核以 ECC 读这里、纠错到阈值时会自行把整块搬进保留区并重写 BMT 表，而 BMT 表也是 tcboot 取 mtd2 要用的启动相关存储，改写只经带确认门的工具做。块变弱由每周巡读的纠错增量报警，重写内核即刷新，真磨坏了再用工具重映射。
+		 * 不开 econet,enable-remap：开了以后内核以 ECC 读这里、纠错到阈值时会自行把整块搬进保留区并重写 BMT 表，而 BMT 表也是 tcboot 取 mtd2 要用的启动相关存储，改写只经带确认门的工具做。块变弱由每周巡读的纠错增量报警，重写内核即刷新，真磨坏了再用 tools/openwrt/gs2107-nand-repair.sh 重映射：它经 debugfs 的 mtk-bmt/en75_remap 请求，en75_bmt 只对带 econet,manual-remap 的分区受理这种显式请求：kernel 与 recovery 两个由 U-Boot 整块读出、运行中没人读写的静态镜像分区；bootloader、romfile、uboot、rootfs（运行中挂着，迁进 UBI 后这个分区要撤）、uboot_env、rootfs_data（UBI）与 reservearea 不带。
 		 */
 		partition@480000 {			/* mtd3 8M */
 			label = "kernel";
 			reg = <0x0480000 0x00800000>;
+			econet,manual-remap;
 		};
 
 		/*
@@ -652,6 +653,7 @@
 		partition@2cc0000 {		/* mtd8 16M */
 			label = "recovery";
 			reg = <0x02cc0000 0x01000000>;
+			econet,manual-remap;
 		};
 	};
 };

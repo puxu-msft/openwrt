@@ -1,0 +1,29 @@
+Subject: mtd: mtk_bmt: 各 BMT 实现可往 mtk-bmt 的 debugfs 目录里加自己的文件
+
+mtk_bmt_ops 加一个可选的 add_debugfs 回调，mtk_bmt_add_debugfs 建完通用的 repair、mark_good、mark_bad、debug 之后调它；文件随目录在 mtk_bmt_detach 里一起删。en75_bmt 用它加 en75_remap（显式重映射，不受 econet,enable-remap 约束）与 en75_state（只读状态）。不提供回调的实现不受影响。
+
+范围：芯片家族（mtk_bmt 框架挂接的 en75_bmt，EN751221/EN751627/EN7528 共用）。依据：devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N1。
+---
+--- a/drivers/mtd/nand/mtk_bmt.h
++++ b/drivers/mtd/nand/mtk_bmt.h
+@@ -21,6 +21,8 @@ struct mtk_bmt_ops {
+ 	void (*unmap_block)(u16 block);
+ 	int (*get_mapping_block)(int block);
+ 	int (*debug)(void *data, u64 val);
++	/* 可选：往 mtk-bmt 的 debugfs 目录里加各实现自己的文件，detach 时随目录一起删 */
++	void (*add_debugfs)(struct dentry *dir);
+ };
+ 
+ struct bbbt;
+--- a/drivers/mtd/nand/mtk_bmt.c
++++ b/drivers/mtd/nand/mtk_bmt.c
+@@ -378,6 +378,9 @@ mtk_bmt_add_debugfs(void)
+ 	debugfs_create_file_unsafe("mark_good", S_IWUSR, dir, NULL, &fops_mark_good);
+ 	debugfs_create_file_unsafe("mark_bad", S_IWUSR, dir, NULL, &fops_mark_bad);
+ 	debugfs_create_file_unsafe("debug", S_IWUSR, dir, NULL, &fops_debug);
++
++	if (bmtd.ops->add_debugfs)
++		bmtd.ops->add_debugfs(dir);
+ }
+ 
+ void mtk_bmt_detach(struct mtd_info *mtd)

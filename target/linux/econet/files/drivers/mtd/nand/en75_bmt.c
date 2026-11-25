@@ -58,6 +58,8 @@
  * BMT, so we don't have any mapping to do in the reserve area, we just
  * have to check every block to see if it's bad before using it.
  *
+ * 数池大小时坏块只看 page0 的 spare[0]、不看读状态，与原厂内核和 tcboot 相同；spare[1] 非 FF 或读失败的块计入池大小但不分配。池内的块磨坏时本驱动按原厂在 spare[1] 标记，池底不动；上面说的池底下移只发生在 spare[0] 非 FF 的块上。
+ *
  * Configuration:
  *
  * This driver is configured by device tree properties, the following
@@ -76,6 +78,8 @@
  *   should avoid enabling this on critical partitions like the bootloader, and
  *   you should also avoid enabling this on partitions like UBI which have
  *   their own remapping algorithms.
+ *
+ * - econet,manual-remap; 分区节点上的布尔属性：允许经 debugfs 的 mtk-bmt/en75_remap 显式重映射本分区里的块，不受 econet,enable-remap 约束；I/O 路径（ECC 读、写、擦失败）照旧只看 econet,enable-remap。只认 partitions 下的分区节点，写在 NAND 节点上不生效，免得一条 echo 就能改到 bootloader 所在的块。撤映射（mtk-bmt 的 mark_good、repair）一律拒绝，见 pub_unmap_block。
  *
  * - econet,assert-reserve-size = <u32>;
  *   This allows you to assert that the computed reserve size matches
@@ -112,6 +116,11 @@
  *   entire table, so this must match the firmware that created the BBT. If
  *   not specified, defaults to 1000.
  *
+ * debugfs（mtk-bmt 目录下，本驱动另加的两个文件）：
+ *
+ * - en75_remap（只写）：写入 MTD 内按擦除块对齐的字节偏移，把该用户块显式重映射到保留池：取池底往上第一个可用块、擦除、整块搬过去（映射标记随每页数据一次写入）、新 BMT 写进另一个块并读回核对，通过后才切换映射，再把原块擦掉、打上磨损标记（原块已是备用块时按原厂擦掉后在池内标坏）。写入成功表示映射已落盘；失败时写入返回错误码、BMT 与映射都不变：-EINVAL 偏移不对齐或越界，-EPERM 不在 econet,manual-remap 的分区里，-ENOSPC 池里没有可用块，-EIO 搬运或写表失败。
+ * - en75_state（只读）：池与表的状态、重映射允许的范围（[起, 止)）、最近一次显式重映射的结果，每行“键 值”，按键名取值、不以行序为接口，供修复工具前后对照。last_retire 说明最后一步做了没有：done 已退役原块；skipped <块> 映射已生效，但旧 BMT 所在的那一块擦不掉、原块没有退役（不要重试）；- 还没走到这一步。
+ *
  * Copyright (C) 2025 Caleb James DeLisle <cjd@cjdns.fr>
  */
 
@@ -121,6 +130,9 @@
 #include <linux/types.h>
 #include <linux/module.h>
 #include <linux/moduleparam.h>
+#include <linux/mutex.h>
+#include <linux/seq_file.h>
+#include <asm/barrier.h>
 #include "mtk_bmt.h"
 
 #define MAX_BMT_SIZE				256
@@ -138,16 +150,13 @@
 #define BLOCK_WORN_MARK				0x55
 
 /* How hard to try, these must be at least one. */
-#define WRITE_TRIES				3
 #define ERASE_TRIES				3
 /*
  * Number of blocks to try to write updated tables to before failing.
- * Total write attempts will be WRITE_TRIES * UPDATE_TABLE_TRIES
+ *
+ * 每块只写一次：同一页再编程会把新算的 ECC 校验叠进旧校验（见 w_retire_user_block），写失败就换块。
  */
 #define UPDATE_TABLE_TRIES			3
-
-/* This is a lot, but if this fails, we're probably losing data. */
-#define REMAP_COPY_TRIES			10
 
 #define INITIAL_READ_TRIES			3
 
@@ -160,6 +169,7 @@ const char *name_factory_badblocks	= "econet,factory-badblocks";
 const char *name_enable_remap		= "econet,enable-remap";
 const char *name_assert_reserve_size	= "econet,assert-reserve-size";
 const char *name_bbt_table_size	= "econet,bbt-table-size";
+const char *name_manual_remap		= "econet,manual-remap";
 
 /* To promote readability, most functions must have their inputs passed in. */
 #define bmtd dont_directly_reference_mtk_bmtd
@@ -240,9 +250,25 @@ enum block_status {
 	BS_NEED_ERASE,
 };
 
+/* 池块状态的补充说明，只供 en75_state 显示 */
+enum block_note {
+	BN_NONE,
+	/* BS_BAD：page0 spare[0] 不是 FF，不计入池大小 */
+	BN_SPARE0,
+	/* BS_BAD：spare[0] 是 FF、spare[1] 不是，原厂给池内坏块打的标记，计入池大小 */
+	BN_SPARE1,
+	/* BS_BAD：page0 读失败，计不计入池大小只看读到的 spare[0] */
+	BN_READ,
+	/* BS_MAPPED：page0 带映射标记（spare[2..3] = from） */
+	BN_MARKER,
+	/* BS_MAPPED：没有映射标记，只凭 BMT 表项认出（标记被分区重写擦掉了） */
+	BN_BMT_ONLY,
+};
+
 struct block_info {
 	struct block_index index;
-	enum block_status status : 16;
+	enum block_status status : 8;
+	enum block_note note : 8;
 };
 
 static_assert(sizeof(struct block_info) == 4);
@@ -250,6 +276,29 @@ static_assert(sizeof(struct block_info) == 4);
 struct block_range {
 	u16 begin;
 	u16 end;
+	/* 分区名（DT label），整个用户区时为 NULL；只供显示 */
+	const char *label;
+};
+
+/* 一次显式重映射（debugfs en75_remap）的结果，en75_state 里显示 */
+struct manual_remap_result {
+	/* 第几次显式重映射，0 表示还没有过 */
+	int seq;
+	int ret;
+	int user_block;
+	/* BBT 平移后的物理块，即 BMT 表项的 from */
+	int from;
+	/* 重映射前数据所在的块：from 本身或旧备用块 */
+	int old;
+	/* 新备用块，没分到时为 -1 */
+	int to;
+	/* 新 BMT 所在块，没写成时为 -1 */
+	int bmt_block;
+	/* 搬运时读到不可纠错的页数（照搬，与原厂一样不看读状态） */
+	int uncorrectable_pages;
+	/* 映射切换之后有没有退役原块：旧表擦不掉时不退役，stale_bmt 记旧表所在块 */
+	enum { RETIRE_NONE, RETIRE_DONE, RETIRE_SKIPPED } retire;
+	int stale_bmt;
 };
 
 /*
@@ -289,6 +338,19 @@ struct en75_bmt_m {
 
 	/* Unless set, fail any attempt to write the BBT. */
 	s8 can_write_factory_bbt;
+
+	/*
+	 * 允许经 debugfs 显式重映射的用户块范围，来自分区节点的 econet,manual-remap，按用户块号、不经 BBT 平移。
+	 */
+	u16 manual_remap_range_count;
+	struct block_range *manual_remap_ranges;
+
+	/*
+	 * 串行化改写 BMT 与保留池状态的入口：I/O 路径的自动重映射、debugfs 的显式重映射、读 en75_state。查表（get_mapping_block）不持锁，表项按 bmt_publish_entry() 的次序发布。
+	 */
+	struct mutex lock;
+
+	struct manual_remap_result last_remap;
 };
 
 /*
@@ -381,16 +443,89 @@ static int get_mapping_block_bbt(const struct en75_bmt_m *ctx, int block)
 
 static int get_mapping_block(const struct en75_bmt_m *ctx, int block)
 {
+	int size;
+
 	block = get_mapping_block_bbt(ctx, block);
 
 	if (block < 0)
 		return block;
 
-	for (int i = ctx->bmt.header.size - 1; i >= 0; i--)
+	/* 与 bmt_publish_entry() 配对：先读计数，再读表项 */
+	size = READ_ONCE(ctx->bmt.header.size);
+	smp_rmb();
+	for (int i = size - 1; i >= 0; i--)
 		if (ctx->bmt.table[i].from == block)
-			return ctx->bmt.table[i].to;
+			return READ_ONCE(ctx->bmt.table[i].to);
 
 	return block;
+}
+
+/* 物理块（BBT 平移后）对应的用户块：减去它下面的出厂坏块数 */
+static int get_user_block(const struct en75_bmt_m *ctx, int block)
+{
+	int user = block;
+
+	for (int i = 0; i < ctx->bbt.header.size; i++)
+		if (ctx->bbt.table[i] < block)
+			user--;
+	return user;
+}
+
+/* from 的 BMT 表项下标，没有时返回 -1；与查表一样最后一项胜 */
+static int bmt_find_from(const struct en75_bmt_m *ctx, u16 from)
+{
+	for (int i = ctx->bmt.header.size - 1; i >= 0; i--)
+		if (ctx->bmt.table[i].from == from)
+			return i;
+	return -1;
+}
+
+/*
+ * 改内存里的 BMT 表项。查表的 I/O 路径不持锁：新表项先写好再加计数，原位改 to 用一次 16 位写。调用方持 ctx->lock。
+ */
+static void bmt_publish_entry(struct en75_bmt_m *ctx, int idx, u16 from, u16 to)
+{
+	if (idx < ctx->bmt.header.size) {
+		WRITE_ONCE(ctx->bmt.table[idx].to, to);
+		return;
+	}
+	ctx->bmt.table[idx] = (struct bmt_entry){ .from = from, .to = to };
+	smp_wmb();
+	WRITE_ONCE(ctx->bmt.header.size, idx + 1);
+}
+
+static struct block_info *rblock_by_index(const struct en75_bmt_m *ctx, int block)
+{
+	int rblocks = reserve_block_count(ctx);
+
+	for (int i = 0; i < rblocks; i++)
+		if (ctx->rblocks[i].index.index == block)
+			return &ctx->rblocks[i];
+	return NULL;
+}
+
+static bool block_in_ranges(const struct block_range *ranges, int count,
+			    int block, const char **label)
+{
+	for (int i = 0; i < count; i++) {
+		if (block >= ranges[i].begin && block < ranges[i].end) {
+			if (label)
+				*label = ranges[i].label;
+			return true;
+		}
+	}
+	return false;
+}
+
+static bool block_is_erased(u8 *data, u32 datalen, u8 *oob, u32 ooblen)
+{
+	for (int i = 0; i < datalen; i++)
+		if (data[i] != 0xff)
+			return false;
+	for (int i = 0; i < ooblen; i++)
+		if (oob[i] != 0xff)
+			return false;
+	return true;
 }
 
 static bool block_index_is_sane(const struct en75_bmt_m *ctx,
@@ -431,14 +566,10 @@ static int w_write(const struct en75_bmt_m *ctx,
 	if (WARN_ON(!block_index_is_sane(ctx, bi, user_area)))
 		return -EINVAL;
 
-	for (int i = 0; i < WRITE_TRIES; i++) {
-		ret = ctx->mtk->_write_oob(
-			ctx->mtk->mtd,
-			((loff_t)bi.index) << ctx->mtk->blk_shift,
-			&ops);
-		if (!ret)
-			break;
-	}
+	ret = ctx->mtk->_write_oob(
+		ctx->mtk->mtd,
+		((loff_t)bi.index) << ctx->mtk->blk_shift,
+		&ops);
 	if (ret)
 		pr_warn("%s: error writing %s at %d\n",
 			log_pfx, name, bi.index);
@@ -462,6 +593,31 @@ static int w_mark_bad(
 	 */
 	return w_write(ctx, bi, user_area, "BAD_BLK",
 		       sizeof(fdm), fdm, true);
+}
+
+/*
+ * 给保留池里的块标坏，按原厂：先擦，再在 page0 的 spare[1] 写 0x00（原厂 en7512_nand_mark_badblock(offset, BMT_BADBLOCK_GENERATE_LATER)，vmlinux 0x802d6eac；GPL spi_nand_flash.c:3947-3988）。spare[0] 保持 FF，池大小因此不变（原厂与我们都只按 spare[0] 数池大小），spare[1] 非 FF 让这块不再被分配。
+ */
+static int w_mark_bad_reserve(const struct en75_bmt_m *ctx, struct block_info *bif)
+{
+	u8 fdm[4] = {0xff, 0x00, 0xff, 0xff};
+
+	bbt_nand_erase(bif->index.index);
+	bif->status = BS_BAD;
+	bif->note = BN_SPARE1;
+	return w_write(ctx, bif->index, false, "POOL_BAD", sizeof(fdm), fdm, true);
+}
+
+/*
+ * 退役一个用户块：按原厂先擦（en7512_nand_mark_badblock 先 spi_nand_erase_block，GPL spi_nand_flash.c:3977），再在 page0 的 spare[0] 写磨损标记 0x55（与出厂坏块的 0x00 区分，见文件头）。spare[0..3] 落在片上 ECC 保护的 metadata 里，在已编程的 page0 上以 ECC 开启再编程，片上 ECC 会把新算的校验叠进已有校验位，读出来多半不可纠（推断，GS2107 docs/35 N25、N26），所以不在原数据上直接补标记。调用方须在新 BMT 落盘、数据已在备用块上之后才调用。
+ */
+static int w_retire_user_block(const struct en75_bmt_m *ctx, u16 block)
+{
+	u8 fdm[4] = {BLOCK_WORN_MARK, 0xff, 0xff, 0xff};
+
+	bbt_nand_erase(block);
+	return w_write(ctx, (struct block_index) { .index = block }, true,
+		       "WORN", sizeof(fdm), fdm, true);
 }
 
 static int w_erase_one(
@@ -499,12 +655,12 @@ static void w_erase_pending(const struct en75_bmt_m *ctx)
 		if (ret) {
 			if (WARN_ON_ONCE(ret == -EINVAL)) {
 				/* Just set status bad so we ignore it */
+				ctx->rblocks[i].status = BS_BAD;
 			} else {
 				pr_info("%s: failed to erase block %d, marking bad\n",
 					log_pfx, bif.index.index);
-				w_mark_bad(ctx, bif.index, false);
+				w_mark_bad_reserve(ctx, &ctx->rblocks[i]);
 			}
-			ctx->rblocks[i].status = BS_BAD;
 		} else {
 			ctx->rblocks[i].status = BS_AVAILABLE;
 		}
@@ -542,12 +698,22 @@ static struct block_info *w_update_table(
 		int ret;
 
 		if (IS_ERR(bif)) {
+			/* 池里没有空块时才先擦待擦块，平时它们要等新表落盘之后再擦 */
+			w_erase_pending(ctx);
+			bif = find_available_block(ctx, start_from_end);
+		}
+		if (IS_ERR(bif)) {
 			pr_err("%s: no space to store %s\n", log_pfx, name);
 			return bif;
 		}
-		ret = w_write(
-			ctx, bif->index, false, name,
-			len, buf, false);
+		/*
+		 * 先擦：原厂写表的块都是擦过的（write_bmt_to_flash 原地擦了再写，新块取自 find_available_block 擦过的池，GPL bmt.c:561-598、735-745），可用块在这里只按 page0 的数据与 spare[0..3] 判过擦除态，已编程的页不再编程（见 w_retire_user_block）。
+		 */
+		ret = w_erase_one(ctx, bif->index, false);
+		if (!ret)
+			ret = w_write(
+				ctx, bif->index, false, name,
+				len, buf, false);
 		if (ret) {
 			bif->status = BS_NEED_ERASE;
 			continue;
@@ -557,26 +723,50 @@ static struct block_info *w_update_table(
 	return ERR_PTR(-EIO);
 }
 
+/*
+ * 把 bmt 写进保留池里自末端往下第一个可用块并读回逐字节核对，核对不过的块记为待擦、换下一块。成功后旧表所在块记为待擦（由 w_erase_pending 擦掉），新块记为 BS_BMT。写出的格式与原厂一致：[size, 池大小) 的表项清 0，校验和只算 size 项——原厂按池大小项算和（vmlinux fill_nand_bmt_buffer 0x802da674），多出的表项都是 0，结果相同。
+ */
+static struct block_info *w_write_bmt(struct en75_bmt_m *ctx, struct bmt_table *bmt)
+{
+	int clear_to = min(reserve_block_count(ctx), MAX_BMT_SIZE);
+
+	for (int i = bmt->header.size; i < clear_to; i++)
+		bmt->table[i] = (struct bmt_entry){ 0 };
+	bmt->header.checksum = bmt_checksum(bmt, bmt->header.size);
+
+	for (int i = 0; i < UPDATE_TABLE_TRIES; i++) {
+		struct block_info *bif;
+		u8 fdm[4];
+		int ret;
+
+		bif = w_update_table(ctx, true, "BMT", sizeof(*bmt), (u8 *)bmt);
+		if (IS_ERR(bif))
+			return bif;
+
+		ret = bbt_nand_read(blk_pg(bif->index.index), ctx->mtk->data_buf,
+				    ctx->mtk->pg_size, fdm, sizeof(fdm));
+		if (!ret && !memcmp(ctx->mtk->data_buf, bmt, sizeof(*bmt))) {
+			mark_for_erasure(ctx, BS_BMT);
+			bif->status = BS_BMT;
+			return bif;
+		}
+		pr_warn("%s: BMT read back from block %d does not match (%d)\n",
+			log_pfx, bif->index.index, ret);
+		bif->status = BS_NEED_ERASE;
+	}
+	return ERR_PTR(-EIO);
+}
+
+/*
+ * 先写表、后擦：待擦的块里有旧表和被换下的备用块，新表落盘之前闪存上那张表还指着它们，先擦的话中间掉电就丢数据。
+ */
 static int w_sync_tables(struct en75_bmt_m *ctx)
 {
-	w_erase_pending(ctx);
-
 	if (ctx->bmt_dirty) {
 		int dirty = ctx->bmt_dirty;
 		struct block_info *new_bmt_block;
-		int rblocks;
 
-		rblocks = reserve_block_count(ctx);
-		for (int i = ctx->bmt.header.size; i < rblocks; i++)
-			ctx->bmt.table[i] = (struct bmt_entry){ 0 };
-		ctx->bmt.header.checksum =
-			bmt_checksum(&ctx->bmt, ctx->bmt.header.size);
-		new_bmt_block = w_update_table(
-			ctx,
-			true,
-			"BMT",
-			sizeof(ctx->bmt),
-			(u8 *)&ctx->bmt);
+		new_bmt_block = w_write_bmt(ctx, &ctx->bmt);
 
 		/*
 		 * If we can't write the BMT, we won't try to write the BBT.
@@ -588,8 +778,6 @@ static int w_sync_tables(struct en75_bmt_m *ctx)
 		}
 		pr_info("%s: BMT written to block %d\n",
 			log_pfx, new_bmt_block->index.index);
-		mark_for_erasure(ctx, BS_BMT);
-		new_bmt_block->status = BS_BMT;
 
 		ctx->bmt_dirty -= dirty;
 		WARN_ON(ctx->bmt_dirty);
@@ -635,28 +823,95 @@ static int w_sync_tables(struct en75_bmt_m *ctx)
  * Remap
  */
 
-static int w_make_mapping(const struct en75_bmt_m *ctx,
-			  const struct block_info replacement_block,
-			  u16 bad_block_index)
+/*
+ * 把 src 块的 [0, copy_len) 字节搬到已擦除的保留池块 dst，映射标记（spare[2..3] = from，主机序）随每页数据一次写入：原厂 update_bmt 内联的 migrate_from_bad 每页先读、set_bad_index_to_oob 填索引、再整页写一次（vmlinux 0x802db3e0 读、0x802db400 填、0x802db42c 写；GPL bmt.c:675-711），page0 只编程一次（spare[0..3] 在片上 ECC 保护区内，同一页编程两次读出来多半不可纠，见 w_retire_user_block）。spare[0..1] 写 FF：新块是好块。读到不可纠错的页照样搬并计数（原厂在 0x802db3e0 之后不判读状态）；page0 以外数据与 spare[0..3] 全 FF 的页不写，留着擦除态。返回 0；读源块出传输错误时返回负码、*dst_failed 为假；写 dst 失败时返回负码、*dst_failed 为真。
+ */
+static int w_copy_block(const struct en75_bmt_m *ctx, u16 dst, u16 src, u16 from,
+			int copy_len, int *uncorrectable, bool *dst_failed)
 {
-	u8 fdm[4] = {0xff, 0xff, 0xff, 0xff};
+	struct bmt_desc *mtk = ctx->mtk;
+	int pages = mtk->blk_size >> mtk->pg_shift;
 
-	if (WARN_ON_ONCE(bad_block_index >= ctx->reserve_area_begin))
-		return -EINVAL;
+	*dst_failed = false;
+	for (int p = 0; p < pages; p++) {
+		loff_t off = (loff_t)p << mtk->pg_shift;
+		u8 oob[4];
+		struct mtd_oob_ops rd = {
+			.mode = MTD_OPS_PLACE_OOB,
+			.datbuf = mtk->data_buf,
+			.len = mtk->pg_size,
+			.oobbuf = oob,
+			.ooblen = sizeof(oob),
+		};
+		struct mtd_oob_ops wr = rd;
+		int ret;
 
-	if (WARN_ON_ONCE(replacement_block.status != BS_AVAILABLE))
-		return -EINVAL;
+		if (off >= copy_len)
+			break;
 
-	/* vendor firmware uses host order */
-	memcpy(&fdm[2], &bad_block_index, sizeof(bad_block_index));
-	return w_write(
-		ctx,
-		replacement_block.index,
-		false,
-		"REMAP",
-		sizeof(fdm),
-		fdm,
-		true);
+		ret = mtk->_read_oob(mtk->mtd, ((loff_t)src << mtk->blk_shift) + off, &rd);
+		if (mtd_is_eccerr(ret)) {
+			(*uncorrectable)++;
+		} else if (ret < 0) {
+			pr_err("%s: copy %d->%d: reading page %d failed: %d\n",
+			       log_pfx, src, dst, p, ret);
+			return ret;
+		}
+
+		if (p && block_is_erased(mtk->data_buf, mtk->pg_size, oob, sizeof(oob)))
+			continue;
+
+		oob[0] = 0xff;
+		oob[1] = 0xff;
+		/* vendor firmware uses host order */
+		memcpy(&oob[2], &from, sizeof(from));
+		ret = mtk->_write_oob(mtk->mtd, ((loff_t)dst << mtk->blk_shift) + off, &wr);
+		if (ret < 0) {
+			pr_err("%s: copy %d->%d: writing page %d failed: %d\n",
+			       log_pfx, src, dst, p, ret);
+			*dst_failed = true;
+			return ret;
+		}
+	}
+	return 0;
+}
+
+/*
+ * 取一个备用块：池底往上第一个可用块（原厂 update_bmt 调 find_available_block(false)，vmlinux 0x802db1c4、0x802db324），先擦（原厂第一次分配前把池里未映射的块全擦一遍，GPL bmt.c:561-598），再从 src 搬 [0, copy_len)。copy_len 为 0 时只擦不写：调用方接着要擦或写这块，先写映射标记只会被擦掉或让 page0 再编程一次。擦或写失败的块按原厂在池内标坏、换下一块，最多 UPDATE_TABLE_TRIES 块，都不行返回 -EIO。读源块出传输错误时返回该错误码并置 *src_failed。返回的块仍是 BS_AVAILABLE，调用方在 BMT 落盘或改好之后改成 BS_MAPPED。
+ */
+static struct block_info *w_alloc_spare(struct en75_bmt_m *ctx, u16 src, u16 from,
+					int copy_len, int *uncorrectable,
+					bool *src_failed)
+{
+	*src_failed = false;
+	for (int i = 0; i < UPDATE_TABLE_TRIES; i++) {
+		struct block_info *bif = find_available_block(ctx, false);
+		bool dst_failed = true;
+		int bad_pages = 0;
+		int ret;
+
+		if (IS_ERR(bif))
+			return bif;
+
+		ret = w_erase_one(ctx, bif->index, false);
+		if (!ret && copy_len)
+			ret = w_copy_block(ctx, bif->index.index, src, from,
+					   copy_len, &bad_pages, &dst_failed);
+		if (!ret) {
+			*uncorrectable = bad_pages;
+			return bif;
+		}
+		if (!dst_failed) {
+			/* 源块读不出来，换备用块也没用 */
+			bif->status = BS_NEED_ERASE;
+			*src_failed = true;
+			return ERR_PTR(ret);
+		}
+		pr_warn("%s: spare block %d failed (%d), marking bad\n",
+			log_pfx, bif->index.index, ret);
+		w_mark_bad_reserve(ctx, bif);
+	}
+	return ERR_PTR(-EIO);
 }
 
 static int w_remap_block(struct en75_bmt_m *ctx,
@@ -664,79 +919,62 @@ static int w_remap_block(struct en75_bmt_m *ctx,
 			 struct block_info *maybe_mapped_block,
 			 int copy_len)
 {
-	int bmt_size = ctx->bmt.header.size;
-	bool mapped_already_in_bmt = false;
-	int ret;
 	struct block_info *new_block;
+	u16 copy_from = block;
+	int uncorrectable = 0;
+	bool copied = copy_len;
+	bool src_failed;
+	int bmt_index;
 
 	if (ctx->bmt.header.size == 0xff) {
 		pr_err("%s: BMT full, cannot add more mappings\n", log_pfx);
 		return -ENOSPC;
 	}
 
-	new_block = find_available_block(ctx, false);
+	if (maybe_mapped_block)
+		copy_from = maybe_mapped_block->index.index;
+
+	new_block = w_alloc_spare(ctx, copy_from, block, copy_len, &uncorrectable,
+				  &src_failed);
+	/*
+	 * 只有源块读不出来时才退回只擦不搬；备用块擦写失败就报错、不建映射，否则会把用户块映射到空块上。
+	 */
+	if (IS_ERR(new_block) && src_failed) {
+		/*
+		 * We can either return an error or continue.
+		 * If the user is reading, not returning an error means
+		 * they're going to suddenly switch to reading a another
+		 * (empty) block and won't know it.
+		 *
+		 * If the user is erasing, returning an error means we're
+		 * not doing our job. In any case, we ideally should be
+		 * refusing to read newly remapped blocks until the user
+		 * has issued an erase command, but we're using the mtk_bmt
+		 * framework which does not support that, so we're going to
+		 * have to continue.
+		 *
+		 * Good luck, user.
+		 */
+		pr_err("%s: remap copy from %d failed LIKELY DATA LOSS!\n",
+		       log_pfx, copy_from);
+		new_block = w_alloc_spare(ctx, copy_from, block, 0, &uncorrectable,
+					  &src_failed);
+		copied = false;
+	}
 	if (IS_ERR(new_block)) {
-		pr_err("%s: no space to remap block %d\n", log_pfx, block);
-		return -ENOSPC;
+		pr_err("%s: cannot remap block %d: %ld\n",
+		       log_pfx, block, PTR_ERR(new_block));
+		return PTR_ERR(new_block);
 	}
 
-	ret = w_make_mapping(ctx, *new_block, block);
-	if (ret) {
-		new_block->status = BS_NEED_ERASE;
-		return ret;
-	}
-
-	if (copy_len) {
-		int ret;
-		u16 copy_from = block;
-
-		if (maybe_mapped_block)
-			copy_from = maybe_mapped_block->index.index;
-
-		for (int i = 0; i < REMAP_COPY_TRIES; i++) {
-			ret = bbt_nand_copy(new_block->index.index,
-					    copy_from, copy_len);
-			if (!ret)
-				break;
-		}
-		if (ret) {
-			/*
-			 * We can either return an error or continue.
-			 * If the user is reading, not returning an error means
-			 * they're going to suddenly switch to reading a another
-			 * (empty) block and won't know it.
-			 *
-			 * If the user is erasing, returning an error means we're
-			 * not doing our job. In any case, we ideally should be
-			 * refusing to read newly remapped blocks until the user
-			 * has issued an erase command, but we're using the mtk_bmt
-			 * framework which does not support that, so we're going to
-			 * have to continue.
-			 *
-			 * Good luck, user.
-			 */
-			pr_err("%s: remap copy %d->%d failed LIKELY DATA LOSS!\n",
-			       log_pfx, copy_from, new_block->index.index);
-		}
-	}
-
-	for (int i = 0; i < bmt_size; i++)
-		if (ctx->bmt.table[i].from == block) {
-			ctx->bmt.table[i].to = new_block->index.index;
-			mapped_already_in_bmt = true;
-			ctx->bmt_dirty++;
-			break;
-		}
-
-	if (!mapped_already_in_bmt) {
-		ctx->bmt.table[ctx->bmt.header.size++] = (struct bmt_entry) {
-			.from = block,
-			.to = new_block->index.index
-		};
-		ctx->bmt_dirty++;
-	}
+	bmt_index = bmt_find_from(ctx, block);
+	if (bmt_index < 0)
+		bmt_index = ctx->bmt.header.size;
+	bmt_publish_entry(ctx, bmt_index, block, new_block->index.index);
+	ctx->bmt_dirty++;
 
 	new_block->status = BS_MAPPED;
+	new_block->note = copied ? BN_MARKER : BN_BMT_ONLY;
 
 	/*
 	 * Directly mark the user block bad (if possible), the mapped block we can
@@ -935,17 +1173,6 @@ static int r_reconstruct_bbt(struct bbt_table *bbt_out, const struct en75_bmt_m 
 	return 0;
 }
 
-static bool block_is_erased(u8 *data, u32 datalen, u8 *oob, u32 ooblen)
-{
-	for (int i = 0; i < datalen; i++)
-		if (data[i] != 0xff)
-			return false;
-	for (int i = 0; i < ooblen; i++)
-		if (oob[i] != 0xff)
-			return false;
-	return true;
-}
-
 static int try_parse_bbt(struct bbt_table *out, u8 *buf, int len, u16 table_size)
 {
 	static struct bbt_table workspace;
@@ -1039,6 +1266,8 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 		}
 
 		for (int i = 0; i < INITIAL_READ_TRIES; i++) {
+			/* 传输失败时 fdm 可能没被填：按擦除态起步，不沿用上一块的值 */
+			memset(fdm, 0xff, sizeof(fdm));
 			ret = bbt_nand_read(blk_pg(cursor),
 					    data_buf,
 					   pg_size,
@@ -1051,12 +1280,19 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 			.status = BS_INVALID
 		};
 
-		if (ret || fdm_is_bad(fdm)) {
+		if (ret) {
+			pr_info("%s: reserve block %d unreadable (%d), spare[0]=%02x\n",
+				log_pfx, cursor, ret, fdm[0]);
+			bif.status = BS_BAD;
+			bif.note = BN_READ;
+		} else if (fdm_is_bad(fdm)) {
 			pr_info("%s: skipping bad block %d in reserve area\n", log_pfx, cursor);
 			bif.status = BS_BAD;
+			bif.note = fdm[0] != 0xff ? BN_SPARE0 : BN_SPARE1;
 		} else if (fdm_is_mapped(fdm)) {
 			pr_debug("%s: found mapped block %d\n", log_pfx, cursor);
 			bif.status = BS_MAPPED;
+			bif.note = BN_MARKER;
 		} else if (!try_parse_bbt(&ctx->bbt, data_buf, pg_size, ctx->bbt_table_size)) {
 			pr_info("%s: found BBT in block %d\n", log_pfx, cursor);
 			bif.status = BS_BBT;
@@ -1067,6 +1303,7 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 		} else if (bmt_has_mapping_to(ctx, cursor)) {
 			pr_debug("%s: found BMT-mapped block %d\n", log_pfx, cursor);
 			bif.status = BS_MAPPED;
+			bif.note = BN_BMT_ONLY;
 		} else if (block_is_erased(data_buf, pg_size, fdm, sizeof(fdm))) {
 			pr_debug("%s: found available block %d\n", log_pfx, cursor);
 			bif.status = BS_AVAILABLE;
@@ -1076,7 +1313,10 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 		}
 
 		ctx->rblocks[rblock++] = bif;
-		good_blocks += (bif.status != BS_BAD);
+		/*
+		 * 池大小按原厂口径数：只看 page0 的 spare[0]，不管读状态。原厂内核 calc_bmt_pool_size 在 0x802d3c10、tcboot 在 0x87fd50f0 以 BAD_BLOCK_RAW 调坏块检查，检查函数（0x802d3a34、0x87fd4f24）不看页读的返回值、只比 spare[0]。-EBADMSG 时 spinand 照常把片内缓存读出的字节填进 fdm，与原厂看到的是同一份；传输错误时 fdm 是上面填的 FF。spare[1] 非 FF 或读失败的块照样计入池大小，但仍是 BS_BAD、不分配，与原厂 find_available_block 同口径（GPL bmt.c:625）。
+		 */
+		good_blocks += (fdm[0] == 0xff);
 
 		if (good_blocks >= REQUIRED_GOOD_BLOCKS(total_blks))
 			break;
@@ -1088,6 +1328,26 @@ static int r_scan_reserve(struct en75_bmt_m *ctx)
 	}
 	ctx->reserve_area_begin = cursor;
 	return 0;
+}
+
+/*
+ * BMT 从闪存读到时，page0 带映射标记、但 BMT 不指向它的池块是孤儿：重映射写好新表、擦掉旧表之前掉电留下的搬运副本。记为待擦，pub_init 的 w_sync_tables 在末尾擦掉，所以只有出现孤儿时才写闪存。留着的话，BMT 一旦读不到，tcboot 按标记重建（reconstruct_bmt，GPL bmt.c:820-872）会让它以同一个 from 认领用户块，而里面是掉电那一刻的旧副本；写路径补标记之后，真正的映射块也带同一个 from，两块冲突。原厂第一次分配前同样会擦掉 BMT 里没有的池块（find_available_block，GPL bmt.c:561-598）。
+ */
+static void r_mark_orphan_spares(struct en75_bmt_m *ctx)
+{
+	int rblocks = reserve_block_count(ctx);
+
+	for (int i = 0; i < rblocks; i++) {
+		struct block_info *b = &ctx->rblocks[i];
+
+		if (b->status != BS_MAPPED || b->note != BN_MARKER ||
+		    bmt_has_mapping_to(ctx, b->index.index))
+			continue;
+		pr_info("%s: spare block %d has a mapping marker but is not in the BMT, erasing\n",
+			log_pfx, b->index.index);
+		b->status = BS_NEED_ERASE;
+		b->note = BN_NONE;
+	}
 }
 
 static int w_factory_badblocks(struct en75_bmt_m *ctx, const u32 *blocks, int count)
@@ -1206,24 +1466,77 @@ static int w_factory_badblocks(struct en75_bmt_m *ctx, const u32 *blocks, int co
 	return 0;
 }
 
-static int add_remap_range(struct en75_bmt_m *ctx, u16 begin_block, u16 size_blocks)
+static int add_block_range(struct en75_bmt_m *ctx, struct block_range **ranges,
+			   u16 *count, u16 begin_block, u16 size_blocks,
+			   const char *label)
 {
+	struct block_range *grown;
+
 	if (((int)begin_block) + size_blocks > ctx->reserve_area_begin) {
 		pr_err("%s: remap range %d->%d exceeds user area\n",
 		       log_pfx, begin_block, size_blocks);
 		return -EINVAL;
 	}
-	ctx->can_remap_ranges = krealloc(
-		ctx->can_remap_ranges,
-		(ctx->can_remap_range_count + 1) * sizeof(*ctx->can_remap_ranges),
-		GFP_KERNEL);
-	if (!ctx->can_remap_ranges)
+	grown = krealloc(*ranges, (*count + 1) * sizeof(**ranges), GFP_KERNEL);
+	if (!grown)
 		return -ENOMEM;
-	ctx->can_remap_ranges[ctx->can_remap_range_count++] = (struct block_range) {
+	*ranges = grown;
+	(*ranges)[(*count)++] = (struct block_range) {
 		.begin = begin_block,
-		.end = begin_block + size_blocks
+		.end = begin_block + size_blocks,
+		.label = label,
 	};
 	return 0;
+}
+
+/* partitions 下带 prop 的分区所占的块加进 ranges；起点或长度不按块对齐的分区跳过 */
+static void of_add_partition_ranges(struct en75_bmt_m *ctx, struct device_node *np,
+				    const char *prop, struct block_range **ranges,
+				    u16 *count)
+{
+	struct device_node *parts_np;
+
+	parts_np = of_get_child_by_name(np, "partitions");
+	for_each_child_of_node_scoped(parts_np, part_np) {
+		u32 start;
+		u32 size;
+		const __be32 *reg;
+		int ret;
+
+		if (!of_property_read_bool(part_np, prop))
+			continue;
+
+		reg = of_get_property(part_np, "reg", NULL);
+		if (!reg) {
+			pr_warn("%s: can't %s on %pOF, no reg property\n",
+				log_pfx, prop, part_np);
+			continue;
+		}
+
+		start = be32_to_cpup(reg);
+		if (start & ((1 << ctx->mtk->blk_shift) - 1)) {
+			pr_warn("%s: can't %s on %pOF start not aligned\n",
+				log_pfx, prop, part_np);
+			continue;
+		}
+		size = be32_to_cpup(&reg[1]);
+		if (size & ((1 << ctx->mtk->blk_shift) - 1)) {
+			pr_warn("%s: can't %s on %pOF size not aligned\n",
+				log_pfx, prop, part_np);
+			continue;
+		}
+		ret = add_block_range(ctx, ranges, count,
+				      start >> ctx->mtk->blk_shift,
+				      size >> ctx->mtk->blk_shift,
+				      of_get_property(part_np, "label", NULL));
+		if (ret)
+			pr_warn("%s: failed %s on %pOF: %d\n",
+				log_pfx, prop, part_np, ret);
+		else
+			pr_info("%s: %s set for %pOF\n",
+				log_pfx, prop, part_np);
+	}
+	of_node_put(parts_np);
 }
 
 static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
@@ -1231,6 +1544,7 @@ static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 	u32 factory_badblocks[MAX_FACTORY_BAD_BLOCKS_OF];
 	int factory_badblocks_count = -1;
 	int assert_reserve_size = -1;
+	bool bmt_on_flash;
 	u32 bbt_table_size;
 	int ret;
 
@@ -1247,6 +1561,7 @@ static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 	ret = r_scan_reserve(ctx);
 	if (ret)
 		return ret;
+	bmt_on_flash = ctx->bmt.header.version;
 
 	if (!of_property_read_u32(np, name_assert_reserve_size, &assert_reserve_size)) {
 		if (assert_reserve_size != reserve_block_count(ctx)) {
@@ -1265,53 +1580,17 @@ static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 	if (ret >= 0)
 		factory_badblocks_count = ret;
 
-	if (of_property_read_bool(np, name_enable_remap)) {
-		add_remap_range(ctx, 0, ctx->reserve_area_begin);
-	} else {
-		struct device_node *parts_np;
-
-		parts_np = of_get_child_by_name(np, "partitions");
-		for_each_child_of_node_scoped(parts_np, part_np) {
-			u32 start;
-			u32 size;
-			const __be32 *reg;
-			int ret;
-
-			if (!of_property_read_bool(part_np, name_enable_remap))
-				continue;
-
-			reg = of_get_property(part_np, "reg", NULL);
-			if (!reg) {
-				pr_warn("%s: can't enable-remap on %pOF, no reg property\n",
-					log_pfx, part_np);
-				continue;
-			}
-
-			start = be32_to_cpup(reg);
-			if (start & ((1 << ctx->mtk->blk_shift) - 1)) {
-				pr_warn("%s: can't enable-remap on %pOF start not aligned\n",
-					log_pfx, part_np);
-				continue;
-			}
-			size = be32_to_cpup(&reg[1]);
-			if (size & ((1 << ctx->mtk->blk_shift) - 1)) {
-				pr_warn("%s: can't enable-remap on %pOF size not aligned\n",
-					log_pfx, part_np);
-				continue;
-			}
-			ret = add_remap_range(ctx,
-					      start >> ctx->mtk->blk_shift,
-					      size >> ctx->mtk->blk_shift);
-			if (ret)
-				pr_warn("%s: failed enable-remap on %pOF: %d\n",
-					log_pfx, part_np, ret);
-			else
-				pr_info("%s: enable-remap set for %pOF\n",
-					log_pfx, part_np);
-		}
-		if (parts_np)
-			of_node_put(parts_np);
-	}
+	if (of_property_read_bool(np, name_enable_remap))
+		add_block_range(ctx, &ctx->can_remap_ranges,
+				&ctx->can_remap_range_count,
+				0, ctx->reserve_area_begin, NULL);
+	else
+		of_add_partition_ranges(ctx, np, name_enable_remap,
+					&ctx->can_remap_ranges,
+					&ctx->can_remap_range_count);
+	of_add_partition_ranges(ctx, np, name_manual_remap,
+				&ctx->manual_remap_ranges,
+				&ctx->manual_remap_range_count);
 
 	if (ctx->bbt.header.version) {
 		if (!ctx->bmt.header.version) {
@@ -1352,6 +1631,9 @@ static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 			return ret;
 	}
 
+	if (bmt_on_flash)
+		r_mark_orphan_spares(ctx);
+
 	pr_info("%s: blocks: total: %d, user: %d, factory_bad: %d, worn: %d reserve: %d\n",
 		log_pfx,
 		ctx->mtk->total_blks,
@@ -1371,6 +1653,105 @@ static int w_init(struct en75_bmt_m *ctx, struct device_node *np)
 		(ctx->reserve_area_begin - ctx->bbt.header.size) << ctx->mtk->blk_shift;
 	pr_info("%s: %u MiB usable space", log_pfx, (u32)ctx->mtk->mtd->size >> 20);
 
+	return 0;
+}
+
+/*
+ * 显式重映射一个用户块（debugfs en75_remap），调用方持 ctx->lock 且已核过范围。次序按原厂 update_bmt（vmlinux 0x802db174）：先备好新块（搬数据，映射标记随页写入），再写 BMT，最后给坏块打标记。与原厂不同的是新 BMT 写进另一个块、读回核对通过才切换内存里的映射；失败时 BMT 与映射都不变。
+ */
+static int w_manual_remap(struct en75_bmt_m *ctx, int user_block,
+			  struct manual_remap_result *res)
+{
+	struct block_info *old_spare = NULL;
+	struct block_info *old_bmt = NULL;
+	struct block_info *new_block;
+	struct block_info *bmt_block;
+	struct bmt_table *cand;
+	bool src_failed;
+	int from, cur, idx;
+	u8 checksum;
+
+	from = get_mapping_block_bbt(ctx, user_block);
+	if (from < 0)
+		return -EINVAL;
+	cur = get_mapping_block(ctx, user_block);
+	res->from = from;
+	res->old = cur;
+
+	/*
+	 * 旧备用块可能已是 BS_BAD（开机扫描时它的 page0 读不出来），这正是要退役它的情形，照样搬、照样标坏。
+	 */
+	if (cur != from) {
+		old_spare = rblock_by_index(ctx, cur);
+		if (WARN_ON_ONCE(!old_spare))
+			return -EIO;
+	}
+
+	idx = bmt_find_from(ctx, from);
+	if (idx < 0 && ctx->bmt.header.size == 0xff) {
+		pr_err("%s: BMT full, cannot add more mappings\n", log_pfx);
+		return -ENOSPC;
+	}
+
+	cand = kmalloc(sizeof(*cand), GFP_KERNEL);
+	if (!cand)
+		return -ENOMEM;
+
+	new_block = w_alloc_spare(ctx, cur, from, ctx->mtk->blk_size,
+				  &res->uncorrectable_pages, &src_failed);
+	if (IS_ERR(new_block)) {
+		kfree(cand);
+		w_erase_pending(ctx);
+		return PTR_ERR(new_block);
+	}
+	res->to = new_block->index.index;
+
+	for (int i = 0; i < reserve_block_count(ctx); i++)
+		if (ctx->rblocks[i].status == BS_BMT)
+			old_bmt = &ctx->rblocks[i];
+
+	memcpy(cand, &ctx->bmt, sizeof(*cand));
+	if (idx < 0) {
+		idx = cand->header.size++;
+		cand->table[idx].from = from;
+	}
+	cand->table[idx].to = new_block->index.index;
+
+	bmt_block = w_write_bmt(ctx, cand);
+	checksum = cand->header.checksum;
+	kfree(cand);
+	if (IS_ERR(bmt_block)) {
+		new_block->status = BS_NEED_ERASE;
+		w_erase_pending(ctx);
+		res->to = -1;
+		return PTR_ERR(bmt_block);
+	}
+	res->bmt_block = bmt_block->index.index;
+
+	bmt_publish_entry(ctx, idx, from, new_block->index.index);
+	ctx->bmt.header.checksum = checksum;
+	new_block->status = BS_MAPPED;
+	new_block->note = BN_MARKER;
+
+	/*
+	 * 先擦旧表、再退役原块：新表可能比旧表低（自末端往下取空块），两表并存时开机取较高的旧表，旧表指着的原块在旧表擦掉之前必须原样留着。旧表擦不掉（标了坏也不保证读不出）就不退役，原块只是不带标记，映射以新表为准。
+	 */
+	w_erase_pending(ctx);
+	if (old_bmt && old_bmt->status != BS_AVAILABLE) {
+		pr_warn("%s: old BMT block %d not erased, leaving block %d unmarked\n",
+			log_pfx, old_bmt->index.index, cur);
+		res->retire = RETIRE_SKIPPED;
+		res->stale_bmt = old_bmt->index.index;
+		return 0;
+	}
+	res->retire = RETIRE_DONE;
+
+	if (old_spare)
+		/* 原厂：映射块变坏时在池内标坏、不回收（update_bmt 0x802db570，a1=1） */
+		w_mark_bad_reserve(ctx, old_spare);
+	else
+		/* 原厂：update_bmt 0x802db2a8，a1=0 */
+		w_retire_user_block(ctx, from);
 	return 0;
 }
 
@@ -1411,14 +1792,9 @@ static bool pub_remap_block(
 	struct block_info *maybe_mapped_block = NULL;
 	int ret;
 
-	for (int i = 0; i < en75_bmt_m.can_remap_range_count; i++) {
-		if (user_block >= en75_bmt_m.can_remap_ranges[i].begin &&
-		    user_block < en75_bmt_m.can_remap_ranges[i].end)
-			goto in_range;
-	}
-	return false;
-
-in_range:
+	if (!block_in_ranges(en75_bmt_m.can_remap_ranges,
+			     en75_bmt_m.can_remap_range_count, user_block, NULL))
+		return false;
 
 	block = get_mapping_block_bbt(&en75_bmt_m, user_block);
 	if (block < 0 || user_block >= en75_bmt_m.reserve_area_begin) {
@@ -1427,43 +1803,181 @@ in_range:
 		return false;
 	}
 
-	if (mapped_block_idx != block) {
-		int rblocks = reserve_block_count(&en75_bmt_m);
+	mutex_lock(&en75_bmt_m.lock);
+	/* 并发的另一次 I/O 已经把它换走了：让 mtk_bmt 按新映射重试 */
+	if (get_mapping_block(&en75_bmt_m, user_block) != mapped_block_idx) {
+		mutex_unlock(&en75_bmt_m.lock);
+		return true;
+	}
 
-		for (int i = 0; i < rblocks; i++)
-			if (en75_bmt_m.rblocks[i].index.index == mapped_block_idx) {
-				maybe_mapped_block = &en75_bmt_m.rblocks[i];
-				break;
-			}
-		if (WARN_ON_ONCE(!maybe_mapped_block))
+	if (mapped_block_idx != block) {
+		maybe_mapped_block = rblock_by_index(&en75_bmt_m, mapped_block_idx);
+		if (WARN_ON_ONCE(!maybe_mapped_block)) {
+			mutex_unlock(&en75_bmt_m.lock);
 			return false;
+		}
 	}
 
 	ret = w_remap_block(&en75_bmt_m, block, maybe_mapped_block, copy_len);
 	w_sync_tables(&en75_bmt_m);
-	if (ret == -ENOSPC)
-		return false;
+	mutex_unlock(&en75_bmt_m.lock);
 
-	return true;
+	/*
+	 * 只有映射换好了才让 mtk_bmt 重试；其余失败直接报给调用方，免得外层每次重试都再烧掉几个池块（mtk_bmt.c 的读、写、擦都最多重试 10 次）。
+	 */
+	return ret == 0;
 }
 
+/*
+ * 只从 debugfs 的 mark_good、repair 进来，一律拒绝。原厂从不删 BMT 表项；repair（mtk_bmt.c mtk_bmt_debug_repair）撤映射之后从旧备用块拷回原块，而 en75 撤映射会把旧备用块擦掉（记待擦、写表后擦），拷回的是空块，en75 又分不出调用方是 mark_good 还是 repair。退役块用 en75_remap。
+ */
 static void pub_unmap_block(u16 user_block)
 {
-	int block;
-
-	block = get_mapping_block_bbt(&en75_bmt_m, user_block);
-	if (block < 0 || user_block >= en75_bmt_m.reserve_area_begin) {
-		pr_info("%s: unmap: block %d out of range\n",
-			log_pfx, user_block);
-		return;
-	}
-	w_unmap_block(&en75_bmt_m, block, UE_REQUIRE_ERASE);
-	w_sync_tables(&en75_bmt_m);
+	pr_err("%s: unmap of block %d refused: en75_bmt does not unmap, retire blocks with en75_remap\n",
+	       log_pfx, user_block);
 }
 
 static int pub_debug(void *data, u64 val)
 {
 	return 0;
+}
+
+/* debugfs en75_remap：val 是 MTD 内按擦除块对齐的字节偏移，与 mark_bad 等同一口径 */
+static int pub_debugfs_remap(void *data, u64 val)
+{
+	struct manual_remap_result res = { .to = -1, .bmt_block = -1, .stale_bmt = -1 };
+	u32 blk_mask = en75_bmt_m.mtk->blk_size - 1;
+	u64 user_blocks = en75_bmt_m.mtk->mtd->size >> en75_bmt_m.mtk->blk_shift;
+	const char *label = NULL;
+	int ret;
+
+	if (val & blk_mask) {
+		pr_err("%s: en75_remap: 0x%llx is not an erase-block aligned byte offset\n",
+		       log_pfx, val);
+		return -EINVAL;
+	}
+	val >>= en75_bmt_m.mtk->blk_shift;
+	if (val >= user_blocks) {
+		pr_err("%s: en75_remap: block %llu beyond user area (%llu blocks)\n",
+		       log_pfx, val, user_blocks);
+		return -EINVAL;
+	}
+	if (!block_in_ranges(en75_bmt_m.manual_remap_ranges,
+			     en75_bmt_m.manual_remap_range_count, val, &label)) {
+		pr_err("%s: en75_remap: block %llu is not in an %s partition, refused\n",
+		       log_pfx, val, name_manual_remap);
+		return -EPERM;
+	}
+	res.user_block = val;
+
+	mutex_lock(&en75_bmt_m.lock);
+	ret = w_manual_remap(&en75_bmt_m, val, &res);
+	res.ret = ret;
+	res.seq = en75_bmt_m.last_remap.seq + 1;
+	en75_bmt_m.last_remap = res;
+	mutex_unlock(&en75_bmt_m.lock);
+
+	if (ret)
+		pr_err("%s: en75_remap: block %d (%s) failed: %d, BMT unchanged\n",
+		       log_pfx, res.user_block, label ?: "?", ret);
+	else
+		pr_info("%s: en75_remap: block %d (%s) %d -> %d, BMT written to block %d, %d uncorrectable pages copied\n",
+			log_pfx, res.user_block, label ?: "?", res.old, res.to,
+			res.bmt_block, res.uncorrectable_pages);
+	return ret;
+}
+
+static const char *const block_note_names[] = {
+	[BN_NONE] = "-",
+	[BN_SPARE0] = "spare0",
+	[BN_SPARE1] = "spare1",
+	[BN_READ] = "read",
+	[BN_MARKER] = "marker",
+	[BN_BMT_ONLY] = "bmt_only",
+};
+
+/*
+ * debugfs en75_state：每行“键 值…”，修复工具按键名取值、不依赖行的次序；manual_remap/auto_remap 的范围是 [起, 止)，止不含在内。
+ */
+static int en75_state_show(struct seq_file *s, void *unused)
+{
+	struct en75_bmt_m *ctx = &en75_bmt_m;
+	const struct manual_remap_result *r = &ctx->last_remap;
+	struct block_info *next;
+	int rblocks;
+	int available = 0;
+
+	mutex_lock(&ctx->lock);
+	rblocks = reserve_block_count(ctx);
+	seq_printf(s, "total_blocks %d\n", ctx->mtk->total_blks);
+	seq_printf(s, "required_good %d\n", REQUIRED_GOOD_BLOCKS(ctx->mtk->total_blks));
+	seq_printf(s, "reserve_begin %d\n", ctx->reserve_area_begin);
+	seq_printf(s, "reserve_blocks %d\n", rblocks);
+	seq_printf(s, "user_blocks %d\n", ctx->reserve_area_begin - ctx->bbt.header.size);
+	for (int i = 0; i < ctx->bbt.header.size; i++)
+		seq_printf(s, "bbt %d\n", ctx->bbt.table[i]);
+	seq_printf(s, "bmt_entries %d\n", ctx->bmt.header.size);
+	for (int i = 0; i < ctx->bmt.header.size; i++)
+		seq_printf(s, "map %d %d %d\n",
+			   get_user_block(ctx, ctx->bmt.table[i].from),
+			   ctx->bmt.table[i].from, ctx->bmt.table[i].to);
+	for (int i = 0; i < rblocks; i++) {
+		const struct block_info *b = &ctx->rblocks[i];
+
+		switch (b->status) {
+		case BS_BBT:
+			seq_printf(s, "bbt_block %d\n", b->index.index);
+			break;
+		case BS_BMT:
+			seq_printf(s, "bmt_block %d\n", b->index.index);
+			break;
+		case BS_BAD:
+			seq_printf(s, "pool_bad %d %s\n", b->index.index,
+				   block_note_names[b->note]);
+			break;
+		case BS_MAPPED:
+			seq_printf(s, "pool_mapped %d %s\n", b->index.index,
+				   block_note_names[b->note]);
+			break;
+		case BS_AVAILABLE:
+			available++;
+			break;
+		default:
+			break;
+		}
+	}
+	seq_printf(s, "pool_available %d\n", available);
+	next = find_available_block(ctx, false);
+	seq_printf(s, "next_spare %d\n", IS_ERR(next) ? -1 : next->index.index);
+	next = find_available_block(ctx, true);
+	seq_printf(s, "next_bmt_block %d\n", IS_ERR(next) ? -1 : next->index.index);
+	for (int i = 0; i < ctx->manual_remap_range_count; i++)
+		seq_printf(s, "manual_remap %d %d %s\n", ctx->manual_remap_ranges[i].begin,
+			   ctx->manual_remap_ranges[i].end,
+			   ctx->manual_remap_ranges[i].label ?: "-");
+	for (int i = 0; i < ctx->can_remap_range_count; i++)
+		seq_printf(s, "auto_remap %d %d %s\n", ctx->can_remap_ranges[i].begin,
+			   ctx->can_remap_ranges[i].end,
+			   ctx->can_remap_ranges[i].label ?: "-");
+	seq_printf(s, "last_remap %d %d %d %d %d %d %d %d\n", r->seq, r->ret,
+		   r->user_block, r->from, r->old, r->to, r->bmt_block,
+		   r->uncorrectable_pages);
+	if (r->retire == RETIRE_SKIPPED)
+		seq_printf(s, "last_retire %d skipped %d\n", r->seq, r->stale_bmt);
+	else
+		seq_printf(s, "last_retire %d %s\n", r->seq,
+			   r->retire == RETIRE_DONE ? "done" : "-");
+	mutex_unlock(&ctx->lock);
+	return 0;
+}
+DEFINE_SHOW_ATTRIBUTE(en75_state);
+
+DEFINE_DEBUGFS_ATTRIBUTE(fops_en75_remap, NULL, pub_debugfs_remap, "%llu\n");
+
+static void pub_add_debugfs(struct dentry *dir)
+{
+	debugfs_create_file_unsafe("en75_remap", S_IWUSR, dir, NULL, &fops_en75_remap);
+	debugfs_create_file("en75_state", S_IRUSR, dir, NULL, &en75_state_fops);
 }
 
 static int pub_get_mapping_block(int user_block)
@@ -1474,6 +1988,7 @@ static int pub_get_mapping_block(int user_block)
 #undef bmtd
 static struct en75_bmt_m en75_bmt_m = {
 	.mtk = &bmtd,
+	.lock = __MUTEX_INITIALIZER(en75_bmt_m.lock),
 };
 
 const struct mtk_bmt_ops en75_bmt_ops = {
@@ -1482,4 +1997,5 @@ const struct mtk_bmt_ops en75_bmt_ops = {
 	.unmap_block = pub_unmap_block,
 	.get_mapping_block = pub_get_mapping_block,
 	.debug = pub_debug,
+	.add_debugfs = pub_add_debugfs,
 };
