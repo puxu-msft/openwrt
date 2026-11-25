@@ -1,0 +1,11 @@
+. /lib/functions.sh
+
+case "$(board_name)" in
+chinamobile,gs2107)
+	# 保留配置升级上来的设备沿用旧的 /etc/config/system：里面的 compat_version 是当初生成配置时写的 '1.0'（board.json 有 system 对象时 config_generate 明写 1.0，没有时不写、fwtool.sh 按 1.0 算），board.d 的 2.0 只进新生成的配置。新镜像从 NAND 起来时根已经在 ubi_rootfs 的卷里，布局就是 2.0。
+	uci set system.@system[0].compat_version="2.0"
+	uci commit system
+	;;
+esac
+
+exit 0

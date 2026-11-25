@@ -1,0 +1,15 @@
+. /lib/functions.sh
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+chinamobile,gs2107)
+	# 2.0：根在 UBI 设备 ubi_rootfs 的卷里（mtd-concat 布局）。设备侧的 2.0 让同为 2.0 的镜像通过 fwtool.sh 的主版本比较；旧布局的私有 tar 没有元数据，由 platform.sh 的 gs2107_check_image 判为不可强刷（74）。
+	ucidef_set_compat_version "2.0"
+	;;
+esac
+
+board_config_flush
+
+exit 0

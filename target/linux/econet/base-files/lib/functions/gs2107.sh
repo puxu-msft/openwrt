@@ -2,8 +2,8 @@
 # 调用方先 source /lib/functions.sh（用到其中的 find_mtd_index；rc.common 与 hotplug-call 已经 source 过）。
 # GS2107_CMDLINE、GS2107_FW_ENV_CONFIG、GS2107_KMSG、GS2107_PROC、GS2107_RUN、GS2107_SYS 只供主机侧离线测试替换路径（devices/gs2107/tools/openwrt/check_bootcount_clear.sh），设备上不设。
 
-# 自救镜像（mtd8，U-Boot 的 gs_rescue_boot）启动时内核命令行带 gs2107.recovery=1，主系统（gs_nand_boot）不带。自救镜像与主系统共用同一份 rootfs，自救模式的行为都以此为开关。
-# 还要求根文件系统在内存里（initramfs 经 /init switch_root 到 tmpfs）：ramdisk 没被内核用上时，内核会照命令行挂 NAND 上的 rootfs，带着 gs2107.recovery=1 进主系统，这时根是 overlay，不能把自救模式的配置写进持久 overlay。
+# 自救系统（自救 FIT：主系统同一内核 + 自救 DTB + rootfs ramdisk，留在开发机上，网络救援时经 TFTP 载入内存）启动时内核命令行带 gs2107.recovery=1，主系统（gs_nand_boot）不带。自救系统与主系统共用同一份 rootfs，自救模式的行为都以此为开关。
+# 还要求根文件系统在内存里（initramfs 经 /init switch_root 到 tmpfs）：命令行不带 root=，ramdisk 没被内核用上时，自救 DTB 下不 attach UBI、没有可挂的根；主 DTB 下根是 OpenWrt 493 设定的 UBI 卷 rootfs，带着 gs2107.recovery=1 进的其实是主系统，根是 overlay，不能把自救模式的配置写进持久 overlay。
 gs2107_recovery_mode() {
 	local cmdline="" rootfs=""
 
@@ -98,7 +98,7 @@ gs2107_bootcount_ram() {
 
 # 清零 U-Boot 的启动计数。$1 是日志标签，其余参数是要一并写进 env 的 名=值（经 gs2107_env_set 合成同一次 fw_setenv）。都写好或不需要写返回 0；任何一处写不进去、或没有内存接口时返回 1，都已记日志。
 # 计数在哪取决于 mtd2 上的 U-Boot：新 U-Boot（BOOTCOUNT_GENERIC）在保留内存，旧 U-Boot（BOOTCOUNT_ENV）在 env 的 bootcount。镜像要同时兼容两者（先部署 Linux 镜像、再写 mtd2）：env 的 bootcount 只在不是 0 时清——旧 U-Boot 每次启动存进 N≥1；新 U-Boot 不从 env 读计数，平常也不保存 env，这一项不再变化（只有 gs_fallback 保存 env 时会顺带存进当时内存里的值，之后由这里清一次），不为它擦写 NAND。内存里的计数不是 0 就清（旧 U-Boot 下魔数无效读作 0，不写）。
-# 先写 env 再清内存：自救模式下 env 写不进去时回不了主系统（recovery 仍是 1），内存计数也留着，自救系统反复崩溃时照样累加到 bootlimit、轮回主系统；主系统下 env 写不进去也照清内存计数，免得新 U-Boot 下 env 坏了就每 bootlimit 次热复位进一次自救镜像。
+# 先写 env 再清内存：自救模式下 env 写不进去时 recovery 仍是 1、下次启动照样进网络救援模式，内存计数也不清（累到 bootlimit 时 gs_fallback 只是再置一次 recovery=1，去向不变）；主系统下 env 写不进去也照清内存计数，免得新 U-Boot 下 env 坏了就每 bootlimit 次热复位被 gs_fallback 置 recovery=1、进一次网络救援模式。
 # 本镜像的设备树与包里都带着内存接口，接口不在说明驱动没加载或镜像不配套：新 U-Boot 下计数清不掉，所以记 err（旧 U-Boot 下无害，env 照常清）。
 gs2107_bootcount_clear() {
 	local tag="$1" ram count ret=0

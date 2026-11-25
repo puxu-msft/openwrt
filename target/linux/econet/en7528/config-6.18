@@ -276,7 +276,7 @@ CONFIG_ZSTD_DECOMPRESS=y
 
 # ---------------------------------------------------------------------------
 # GS2107 "U 盘优先启动" 引导内核内置项（2026-11-07，USB-BOOT-PLAN.md §0/§3.1）
-# 该内核与 initramfs 一起刷进 mtd4，rootfs 由 initramfs /init 在运行期探测，
+# 该内核与 initramfs 一起刷进 tcboot 时代的 mtd4（原 rootfs 区，现在是 ubi_seg0），rootfs 由 initramfs /init 在运行期探测，
 # 因此 USB 存储 / 块设备 / ext4 / devtmpfs 必须全部内置（不能依赖模块：
 # 模块在 rootfs 里，而 rootfs 正是我们要找的东西）。
 # ---------------------------------------------------------------------------
@@ -287,45 +287,6 @@ CONFIG_USB_STORAGE=y
 CONFIG_EXT4_FS=y
 # devtmpfs：让 /dev/sda1 自动出现（/init 里另有 /sys mknod 兜底）
 CONFIG_DEVTMPFS=y
-# ---------------------------------------------------------------------------
-# bootargs 双保险：DTS chosen{bootargs} 为主（CONFIG_MIPS_CMDLINE_FROM_DTB=y
-# 在上面已设），这里再兜一层。
-#
-# [11-08 v5] 板载 flash 启动：root=/dev/mtdblock4（rootfs 分区，0xC80000 起）。
-# ★ init=/etc/preinit 必须有：squashfs 根的 overlay 由 /etc/preinit 的
-#   preinit_mount_root 钩子调 /sbin/mount_root 挂载（11-08 实证：无它则
-#   overlay 退回 tmpfs、配置重启即丢）。
-# 新增 uboot 4MB 槽后 rootfs 从 mtd3 变为 mtd4（节点顺序第 5 位）。
-# **必须与 DTS chosen{bootargs} 写同一组值**：bootcmdline_init()
-# 把本 builtin_cmdline 追加在 DTS bootargs 之后，而后出现的同名参数胜出
-# （parse_args 顺序处理）——两处不一致时，这里会把 DTS 的 root= 覆盖掉。
-#
-# 历史：initramfs 时代这里是 root=/dev/sda1 rootwait 作双保险（/init 正常
-# 驻留时内核不看它）。改成板载直挂后，root= 成了唯一的挂载依据。
-# 为什么去掉 initramfs：内嵌后 LZMA 出来 4.29~4.38MB，超出 bootbase 的 4MB
-# kernel 分区；截断 LZMA 流会让 bootbase 报 "decompression error"
-# （11-08 两次实证，详见 dts/en7528_gs2107.dts chosen 段注释）。
-# ---------------------------------------------------------------------------
-# [11-09] 与 dts/en7528_gs2107.dts chosen{bootargs} 必须逐字同值。
-# ★ 删掉 init=/etc/preinit / PREINIT=1：procd 的 initd/early.c early_mounts()
-#   负责挂 /dev(tmpfs)+mknod /dev/null+/tmp(tmpfs)，initd/preinit.c preinit()
-#   负责 setenv("PREINIT","1") 后 fork /etc/preinit，mount_root.c:48 的
-#   PREINIT 检查也由它保证。cmdline 上再写 init=/etc/preinit 会把 preinit
-#   提成 1 号进程、跳过 early_mounts() → /dev/null 缺失 + 根只读 →
-#   preinit 退出 1 → "Attempted to kill init!"（11-09 boot log 实证）。
-# ---------------------------------------------------------------------------
-CONFIG_CMDLINE_BOOL=y
-CONFIG_CMDLINE="console=ttyS0,115200 root=/dev/mtdblock4 rootfstype=squashfs rootwait"
-# CMDLINE_BOOL=y 会让 MIPS_CMDLINE_BUILTIN_EXTEND 变成"可见但无值"的新符号，
-# kconfig syncconfig 会因此进入 "Restart config..." 交互提问（stdin EOF 即失败）。
-# 显式写死它 = n，choice 保持 MIPS_CMDLINE_FROM_DTB：
-#   arch/mips/kernel/setup.c bootcmdline_init() 在 CMDLINE_BOOL=y 且非
-#   BUILTIN_EXTEND 时，把 builtin_cmdline **追加** 到 DTS bootargs 之后——
-#   DTS 与内核 config 两层同时生效（真双保险，不是二选一）。
-# CONFIG_MIPS_CMDLINE_BUILTIN_EXTEND is not set
-# 同上：CMDLINE_BOOL=y 会让 CMDLINE_OVERRIDE 变成"可见但无值"的新符号，
-# 同样必须显式写死 = n（否则 syncconfig 交互提问失败）。
-# CONFIG_CMDLINE_OVERRIDE is not set
 
 # USB storage 的硬依赖：USB_STORAGE / BLK_DEV_SD 都 depends on SCSI
 # （drivers/usb/storage/Kconfig:8、drivers/scsi/Kconfig:82）。
@@ -333,8 +294,6 @@ CONFIG_CMDLINE="console=ttyS0,115200 root=/dev/mtdblock4 rootfstype=squashfs roo
 # 内核 .config 里 USB_STORAGE/BLK_DEV_SD 整行消失，内核镜像里
 # 搜不到 "usb-storage"/"scsi_mod" 字符串 → U 盘根本不会被识别。
 CONFIG_SCSI=y
-# The GS2107 layout declares its own rootfs_data partition; the squashfs splitter would create a second partition with the same name inside rootfs.
-# CONFIG_MTD_SPLIT_SQUASHFS_ROOT is not set
 
 # EN7528 timer-block hardware watchdog (drivers/watchdog/en7528_wdt.c)
 CONFIG_WATCHDOG_CORE=y

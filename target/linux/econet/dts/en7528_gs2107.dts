@@ -76,33 +76,27 @@
 		memory-region = <&bootcount_mem>;
 	};
 
+	/* 命令行只来自 U-Boot：bootm 用 env 的 bootargs 改写 /chosen/bootargs，控制台由 stdout-path 给出。命令行不带 root=：根是 UBI 卷 rootfs，OpenWrt 491 在 attach 时为它建 ubiblock，493 在 ROOT_DEV 未设时把它设为根（devices/openwrt/gs2107 docs/33 §2.2）。 */
 	chosen {
 		stdout-path = "/serial@1fbf0000:115200";
-		/*
-		 * [v4 改·11-09] ★ 删掉 init=/etc/preinit 与 PREINIT=1 —— 这两个参数
-		 * 是 11-08 那次 "Attempted to kill init! exitcode=0x00000100" 的直接
-		 * 根因。机制（源码实证 openwrt/package/system/procd/src/initd/）：
-		 *   1) /sbin/init(=procd) 的 early_mounts()（early.c:75）负责 mount
-		 *      /proc /sys、**把 /dev 挂 tmpfs 并 mkdev + mknod /dev/null**、
-		 *      /tmp 挂 tmpfs、建 /tmp/run /tmp/lock /tmp/state；
-		 *   2) 随后 preinit()（preinit.c:124）**自己 setenv("PREINIT","1",1)**
-		 *      再 fork /bin/sh /etc/preinit；
-		 *   3) /etc/preinit 第 3 行 [ -z "$PREINIT" ] && exec /sbin/init，
-		 *      PREINIT 已置位故继续跑 do_mount_root → mount_root；
-		 *   4) mount_root.c:48 的 getenv("PREINIT") 检查同样由 procd 保证。
-		 * 即 preinit 与 mount_root 的触发条件 procd 全都自备，cmdline 上
-		 * **不需要也不应该**出现 init= 或 PREINIT=。
-		 *
-		 * 一旦写了 init=/etc/preinit，preinit 被提成 1 号进程、early_mounts()
-		 * 整段跳过 → /dev/null 不存在、根分区只读 → diag.sh:50 "can't create
-		 * /dev/null"、preinit "can't open /dev/null" → 退出 1 → 内核 panic。
-		 * 11-09 实测 boot log 完整记录该链。
-		 *
-		 * root= 仍须显式给：DTB bootargs 与 CONFIG_CMDLINE 会被内核拼接
-		 * （boot log 里同一条出现两次即此故），两处必须写同一组值，
-		 * 详见 en7528/config-6.18 同值注释。
-		 */
-		bootargs = "console=ttyS0,115200 root=/dev/mtdblock4 rootfstype=squashfs rootwait";
+	};
+
+	/* UBI 设备 ubi_rootfs：&nand 里两段不相邻的分区 ubi_seg0、ubi_seg1 按地址顺序拼成一个 MTD，squashfs 根是卷 rootfs，overlay 是 UBIFS 卷 rootfs_data。attach 只靠 linux,ubi（ubi_notify_add，MTD 何时注册都能 attach）；自救 DTB 由本 DTB 去掉这一条派生，自救系统不自动 attach。分区名避开三个会被 OpenWrt 补丁按名字处理的名字：rootfs（hack 420 在 MTD 注册时把它设成根，抢在 UBI attach 之前）、ubi 与 data（pending 490 在 late_initcall 里自动 attach，自救 DTB 就没法只靠去掉 linux,ubi 保持不 attach）。 */
+	ubi-concat {
+		compatible = "mtd-concat";
+		devices = <&ubi_seg0 &ubi_seg1>;
+
+		partitions {
+			compatible = "fixed-partitions";
+			#address-cells = <1>;
+			#size-cells = <1>;
+
+			ubi_rootfs: partition@0 {	/* mtd8 209M（0x2000000 + 0xb100000），1672 PEB */
+				label = "ubi_rootfs";
+				reg = <0x0 0x0d100000>;
+				compatible = "linux,ubi";
+			};
+		};
 	};
 
 	/*
@@ -528,27 +522,11 @@
 		#size-cells = <1>;
 
 		/*
-		 * [11-08 重划 v5] 全 128KB 块对齐、无重叠视图。
-		 *
-		 * 设计前提（用户 11-08 定稿）：
-		 *   - squashfs 只读根 + UBIFS overlay；支持 ext4/vfat/exfat，**不支持 btrfs**
-		 *     （btrfs 面向有 FTL 的块设备；裸 NAND 上无磨损均衡/坏块管理，COW 写放大
-		 *      直接烧 NAND，且 btrfs.ko 一个就 1.6MB）
-		 *   - **不死 u-boot 链路**：内置 bootbase(mtd0) → 不死 u-boot(mtd2) →
-		 *     kernel(mtd3) → rootfs(mtd4)，从而实现 uart-free 管理。
-		 *     bootbase 固定从 0x80000 读 HDR2，故 4MB uboot 槽必须落在 0x80000。
-		 *     该槽放 uboot.hdr2：bootbase 解压后执行 tools/uboot/stub.S，stub 把
-		 *     内嵌的 U-Boot 搬到 0x81000000 再跳过去；U-Boot 从 mtd3 读 FIT 启动内核。
-		 *   - **不保留原厂 A/B backup 与 java**（无 Android 了）。原厂 11 个分区已
-		 *     全量 dump 到 devices/gs2107/firmware/，设备端 SHA256 **8/8 字节级一致**；
-		 *     需要时从 host 备份经串口 console + flash 裸原语重刷即可。
-		 *   - bootloader / romfile / reservearea 三个分区**永不写入**：
-		 *       · bootloader(mtd0)  = tcboot stage1+2，唯一启动入口
-		 *       · romfile(mtd1)     = 厂商配置的唯一副本，tcboot 不读它（docs/23 §4）
-		 *       · reservearea(mtd7) = A/B flag 在 +0x200000（芯片偏移 0xDFC0000）
-		 *
-		 * 空间账：0x80000 起共 0xDD40000（221.25MB）= uboot 4M + kernel 8M + rootfs 32M + uboot_env 256K + recovery 16M + overlay 161M，严丝合缝到 reservearea 前一刻。
-		 * recovery 在地址上位于 uboot_env 与 rootfs_data 之间，但节点排在最后（mtd8），mtd0–mtd7 的编号不变。
+		 * 分区按地址排（节点顺序即 mtd 编号），128 KiB 块对齐、互不重叠；布局的唯一来源是设备目录的 tools/u-boot/layout.py（devices/openwrt/gs2107 docs/33 §1.3），文件系统取舍见同目录 docs/15。
+		 * 启动链：tcboot（bootloader，唯一启动入口）固定从 0x80000 读 HDR2，所以 uboot 槽从 0x80000 起，里面是 uboot.hdr2（stub 把内嵌的 U-Boot 搬到 0x81000000 再跳过去）；U-Boot 读 kernel（内核 FIT）后 bootm，不碰 UBI 区。板载闪存上不放自救镜像：自救 FIT 留在开发机上，作网络救援件经 TFTP 载入内存。
+		 * Linux 不写 bootloader、romfile、reservearea：romfile 是厂商配置的唯一副本，tcboot 不读它（docs/23 §4）；reservearea 的 +0x200000（芯片偏移 0xDFC0000）是 tcboot 的 A/B 旗标。
+		 * ubi_seg0（原 rootfs 区）与 ubi_seg1（原 recovery 与 rootfs_data 两区，地址相连）是根节点下 ubi-concat 的成员段，拼成 UBI 设备 ubi_rootfs；工具只经 ubi_rootfs 上的 UBI 写这两段，成员段上的原始写入会绕过 UBI。两段都不开 econet,enable-remap：坏块由 UBI 自己处理（en75_bmt.c 头部注释同样要求 UBI 分区不开 remap）。
+		 * 空间账：0x80000 起共 0xDD40000（221.25 MiB）= uboot 4M + kernel 8M + ubi_seg0 32M + uboot_env 256K + ubi_seg1 177M，到 reservearea 前一刻；ubi_rootfs = 32M + 177M = 209M（1672 PEB）。0xE000000 起是 en75_bmt 用户区余下的块与 BMT 保留池，不分区。
 		 */
 		partition@0 {			/* mtd0 256K */
 			label = "bootloader";
@@ -578,7 +556,7 @@
 		/*
 		 * uboot：不死 u-boot 槽。bootbase 固定从 0x80000 读 HDR2 并解压到
 		 * 0x80002000，故本槽必须从 0x80000 起。4MB。
-		 * 现居者 = uboot.hdr2（stub + 内嵌 U-Boot，见上方设计前提）。
+		 * 现居者 = uboot.hdr2（stub + 内嵌 U-Boot，见上方分区表注释）。
 		 */
 		partition@80000 {			/* mtd2 4M */
 			label = "uboot";
@@ -586,9 +564,8 @@
 		};
 
 		/*
-		 * kernel：8MB。LZMA 流约 3.83MB，余 4.17MB 给后续加驱动。
-		 * 由 U-Boot 读出（gs_nand_boot）并 bootm，不由 bootbase 直接读。
-		 * 不开 econet,enable-remap：开了以后内核以 ECC 读这里、纠错到阈值时会自行把整块搬进保留区并重写 BMT 表，而 BMT 表也是 tcboot 取 mtd2 要用的启动相关存储，改写只经带确认门的工具做。块变弱由每周巡读的纠错增量报警，重写内核即刷新，真磨坏了再用 tools/openwrt/gs2107-nand-repair.sh 重映射：它经 debugfs 的 mtk-bmt/en75_remap 请求，en75_bmt 只对带 econet,manual-remap 的分区受理这种显式请求：kernel 与 recovery 两个由 U-Boot 整块读出、运行中没人读写的静态镜像分区；bootloader、romfile、uboot、rootfs（运行中挂着，迁进 UBI 后这个分区要撤）、uboot_env、rootfs_data（UBI）与 reservearea 不带。
+		 * kernel：内核 FIT（vmlinuz.bin + DTB），由 U-Boot 读出（gs_nand_boot）并 bootm，不由 bootbase 直接读。
+		 * 不开 econet,enable-remap：开了以后内核以 ECC 读这里、纠错到阈值时会自行把整块搬进保留区并重写 BMT 表，而 BMT 表也是 tcboot 取 mtd2 要用的启动相关存储，改写只经带确认门的工具做。块变弱由每周巡读的纠错增量报警，重写内核即刷新，真磨坏了再用 tools/openwrt/gs2107-nand-repair.sh 重映射：它经 debugfs 的 mtk-bmt/en75_remap 请求，en75_bmt 只对带 econet,manual-remap 的分区受理这种显式请求。本表只有 kernel 带它：由 U-Boot 整块读出、运行中没人读写的静态镜像分区；bootloader、romfile、uboot、uboot_env、reservearea 不带，UBI 的两个成员段 ubi_seg0、ubi_seg1 也不带（坏块由 UBI 处理）。
 		 */
 		partition@480000 {			/* mtd3 8M */
 			label = "kernel";
@@ -596,41 +573,20 @@
 			econet,manual-remap;
 		};
 
-		/*
-		 * rootfs：squashfs 只读根。32MB（当前占用 4.55MB，余 27.45MB）。
-		 * bootargs / CONFIG_CMDLINE：root=/dev/mtdblock4 rootfstype=squashfs
-		 * （mtd4 = 本表第 5 个分区；改表必须同步改 cmdline）。
-		 */
-		partition@c80000 {			/* mtd4 32M */
-			label = "rootfs";
-			reg = <0x0c80000 0x02000000>;
-			linux,rootfs;
+		ubi_seg0: partition@c80000 {		/* mtd4 32M：ubi-concat 第 1 段（原 rootfs 区） */
+			label = "ubi_seg0";
+			reg = <0x00c80000 0x02000000>;
 		};
 
-		/* uboot_env：两份 128KB 的冗余 U-Boot env；rootfs_data：UBIFS overlay。 */
+		/* uboot_env：两份 128KB 的冗余 U-Boot env。 */
 		partition@2c80000 {		/* mtd5 256K */
 			label = "uboot_env";
 			reg = <0x02c80000 0x00040000>;
 		};
 
-		partition@3cc0000 {		/* mtd6 161M */
-			label = "rootfs_data";
-			reg = <0x03cc0000 0x0a100000>;
-			/*
-			 * overlay：UBIFS 卷。`linux,ubi` 让内核 ubi_notify_add()
-			 * 在注册这个 MTD 分区时自动 ubiattach，否则要用户在
-			 * preinit 里手工 ubiattach + ubimkvol，而 fstools 的
-			 * mount_root 找不到卷就静默退化成 tmpfs overlay
-			 * （配置重启即丢）。卷本身在首次安装时用 ubiformat +
-			 * ubimkvol 建好，之后由内核每次启动自动 attach。
-			 */
-			compatible = "linux,ubi";
-
-			volumes {
-				ubi-volume-rootfs-data {
-					volname = "rootfs_data";
-				};
-			};
+		ubi_seg1: partition@2cc0000 {		/* mtd6 177M：ubi-concat 第 2 段（原 recovery 与 rootfs_data 两区） */
+			label = "ubi_seg1";
+			reg = <0x02cc0000 0x0b100000>;
 		};
 
 		/*
@@ -643,17 +599,6 @@
 			label = "reservearea";
 			reg = <0x0ddc0000 0x00240000>;
 			read-only;
-		};
-
-		/*
-		 * recovery：自救镜像（主系统同一内核 + DTB + rootfs ramdisk 的 FIT）。
-		 * U-Boot 进 recovery 时整区读出后 bootm（gs_rescue_boot），镜像坏了
-		 * 就继续试主系统 NAND。地址在 uboot_env 之后，节点放最后成为 mtd8。
-		 */
-		partition@2cc0000 {		/* mtd8 16M */
-			label = "recovery";
-			reg = <0x02cc0000 0x01000000>;
-			econet,manual-remap;
 		};
 	};
 };

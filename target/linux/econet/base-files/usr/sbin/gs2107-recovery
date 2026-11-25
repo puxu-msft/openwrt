@@ -1,12 +1,12 @@
 #!/bin/sh
 # GS2107 单槽 U-Boot 的 recovery 辅助命令，不需要串口。
-# U-Boot 在 env 里 recovery=1 时走 gs_recovery：依次试 U 盘 → 网络（TFTP boot.scr）→ mtd8 上的自救镜像 → 主系统 NAND（U-Boot local/0030 之前的构建是网络在 U 盘之前）。启动计数（新 U-Boot 在保留内存，旧 U-Boot 在 env 的 bootcount）超过 bootlimit（3）时，altbootcmd → gs_fallback 在主系统与自救镜像之间轮流（recovery 是 1 就清掉，否则置 1）。主系统的 gs2107-bootok 每次开机清启动计数；自救模式不清，自救系统反复崩溃时也会轮回主系统。
-# 自救镜像（内核命令行带 gs2107.recovery=1）整个在内存里跑；gs2107-recovery-return 服务在连续 N 秒（默认 1800，内核命令行 gs2107.recovery_return=<秒> 可改）既没有 hold、也没有登录后的 SSH 会话时，清掉 recovery 与启动计数并重启，重试主系统。
+# env 里 recovery=1 表示下次启动 U-Boot 走救援顺序：网络探测在前（链路起来后约 3 s，主机要先起好服务，经 TFTP 把自救 FIT 送进内存），再试 U 盘，都没取到才起 NAND 上的主系统；平常顺序是 U 盘 → 网络探测 → NAND。板载闪存上不放自救镜像，自救 FIT 留在开发机上作网络救援件。U-Boot 走救援顺序有两种情形：recovery=1；内核起来以后反复崩溃，启动计数（新 U-Boot 在保留内存，旧 U-Boot 在 env 的 bootcount）超过 bootlimit（3）时 altbootcmd → gs_fallback 清掉计数、把 recovery 置 1（只置 1，不翻回 0）再走一遍 gs_boot。NAND 上的内核读不出或 bootm 失败时 bootcmd 返回、5 s 后重跑一遍启动顺序，每一轮都有网络探测。recovery 只由 Linux 清回 0：主系统的 gs2107-bootok 每次开机清启动计数与 recovery；自救模式不清，由下面的 clear、auto-return 清。
+# 自救系统（经网络载入的自救 FIT，内核命令行带 gs2107.recovery=1）整个在内存里跑；gs2107-recovery-return 服务在连续 N 秒（默认 1800，内核命令行 gs2107.recovery_return=<秒> 可改）既没有 hold、也没有登录后的 SSH 会话时，清掉 recovery 与启动计数并重启，重试主系统。
 # 子命令：
-#   reboot   置 recovery=1 并重启，下次启动走 gs_recovery
+#   reboot   置 recovery=1 并重启，下次启动 U-Boot 进网络救援模式
 #   clear    清掉 recovery 与启动计数（下次启动走正常顺序）
 #   status   打印当前模式、hold 状态、env 里的 recovery/bootcount 与保留内存里的启动计数
-#   hold     阻止自救模式自动回主系统（标记在 /tmp，重启即失）
+#   hold     阻止自救系统自动回主系统（标记在 /tmp，重启即失）
 #   release  撤销 hold
 #   auto-return  由 gs2107-recovery-return 服务调用，不手动运行
 # env 写入走 gs2107_env_set、启动计数清零走 gs2107_bootcount_clear：只在 env 读回来是 GS2107 的 env 时写，只写有变化的值、合成一次 fw_setenv；保留内存里的计数经 uboot-bootcount 驱动清。
@@ -66,7 +66,7 @@ auto_return() {
 		fi
 	done
 
-	# 写不进去时不重启：env 的 recovery 仍是 1 时重启只会再进自救镜像，启动计数没清时可能又被 gs_fallback 翻回自救镜像；留在这里等人处理。
+	# 写不进去时不重启：env 的 recovery 仍是 1 时重启只会再进网络救援模式（主机还在送自救 FIT 时又回到自救系统）；留在这里等人处理。
 	if ! gs2107_bootcount_clear gs2107-recovery recovery=0; then
 		logger -t gs2107-recovery "could not clear recovery and the boot counter; staying in recovery mode"
 		return 1
@@ -111,7 +111,7 @@ case "$1" in
 		;;
 	hold)
 		touch "$HOLD"
-		gs2107_recovery_mode || echo "note: not in recovery mode; hold only affects the recovery image" >&2
+		gs2107_recovery_mode || echo "note: not in recovery mode; hold only affects the rescue system loaded over the network" >&2
 		;;
 	release)
 		rm -f "$HOLD"

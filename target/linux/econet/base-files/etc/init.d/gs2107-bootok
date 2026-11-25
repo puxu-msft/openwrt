@@ -1,12 +1,12 @@
 #!/bin/sh /etc/rc.common
-# 向 U-Boot 标记本次启动成功：U-Boot 每次启动把启动计数加 1，超过 bootlimit → altbootcmd → gs_fallback（在主系统与自救镜像之间轮流），OpenWrt 起来后由这里清零，并把 env 的 recovery 置 0。
+# 向 U-Boot 标记本次启动成功：U-Boot 每次启动把启动计数加 1，超过 bootlimit → altbootcmd → gs_fallback（清掉计数、把 env 的 recovery 置 1，走网络救援模式），OpenWrt 起来后由这里清零，并把 env 的 recovery 置 0——recovery 只有 Linux 会清回 0。
 # 计数在保留内存（新 U-Boot）还是在 env（旧 U-Boot）都由 gs2107_bootcount_clear（/lib/functions/gs2107.sh）处理：内存里的经 uboot-bootcount 驱动清；env 只写与现值不同的项、合成一次 fw_setenv，且只在 env 读回来是 GS2107 的 env 时才写，所以新 U-Boot 下平常的启动不写 NAND。
 START=99
 
 mark_boot_ok() {
 	. /lib/functions/gs2107.sh
 
-	# 自救模式（自救镜像在内存里跑）不清启动计数、不写 env：计数留着让 U-Boot 继续累加，自救系统若每次撑过这里才崩溃，连续 bootlimit 次后 gs_fallback 就轮到主系统，不会无限循环在自救镜像里；回主系统由 gs2107-recovery-return 或 gs2107-recovery clear 清 recovery 与启动计数。
+	# 自救模式（经网络载入的自救系统在内存里跑）不清启动计数、不写 env：recovery 留在 1，自救系统重启后仍进网络救援模式（主机不再送自救 FIT 时，网络探测约 3 s 放弃、再试 U 盘后起 NAND 上的主系统）；计数累到 bootlimit 时 gs_fallback 也只是清掉计数、再置一次 recovery=1，去向不变。回主系统由 gs2107-recovery-return 或 gs2107-recovery clear 清 recovery 与启动计数，在自救系统里 sysupgrade 时由 platform.sh 的 platform_pre_upgrade 清。
 	if gs2107_recovery_mode; then
 		return 0
 	else

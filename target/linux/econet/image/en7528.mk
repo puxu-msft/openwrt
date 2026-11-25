@@ -58,37 +58,47 @@ define Device/jiofiber_jcow407
 endef
 TARGET_DEVICES += jiofiber_jcow407
 
-# GS2107（中移杭研智能家庭网关）—— 自维护板级
-# 事实依据：devices/gs2107/{DEVICE-PROFILE,OPENWRT-FEASIBILITY,OPENWRT-PORT-PLAN}.md
-#  - bootloader 为 free bootbase 变体（解压目标 0x80002000），与 JioFiber 同模式
-#  - 镜像写到 tclinux 分区（24MB）：HDR2 头 + kernel(LZMA, 垫 4MB) + rootfs(squashfs)
+# GS2107（中移杭研智能家庭网关）—— 自维护板级，设备文档在 devices/openwrt/gs2107/（docs/33 是本布局与升级路径的设计）
+#  - 启动链：tcboot（free bootbase，解压目标 0x80002000）→ mtd2 里的 U-Boot → kernel 分区的内核 FIT
+#  - 根：squashfs 是 UBI 设备 ubi_rootfs（DTS 里 ubi_seg0 + ubi_seg1 拼成的 mtd-concat）的卷 rootfs，overlay 是卷 rootfs_data
 #  - WiFi: MT7603E(2.4G) + MT7663E(5G) 均 PCIe
-#  - mtd8(java) 严禁触碰 = CoAP RCE 回退通道
 #
-# [v2] 两种镜像（USB-BOOT-PLAN.md §0）：
-#   tclinux.trx                    —— 常规镜像（kernel + squashfs rootfs 段）
+# 产物：
+#   kernel.bin（KERNEL_INSTALL）—— 内核 FIT（自解压的 vmlinuz.bin 以 compression = none 放入 + DTB，load/entry 0x80020000），写 kernel 分区或经 TFTP 启动
+#   sysupgrade.bin                —— 标准 sysupgrade：tar（CONTROL、kernel = 内核 FIT、root = squashfs）+ fwtool 元数据（compat_version 2.0）
+#   factory-ubi.bin               —— 整个 ubi_rootfs 的 ubinize 镜像（卷 rootfs + autoresize 的 rootfs_data + EOF 标记）+ fwtool 元数据，UBI 不可用时从自救系统 sysupgrade
+#
+# tcboot 时代的两种 HDR2 镜像（USB-BOOT-PLAN.md §0；去留待定，见设备 docs/36 §10 D3）：
+#   tclinux.trx                    —— kernel + squashfs rootfs 段；只保留格式，新布局下起不了 NAND 根，去留随 D3
 #   tclinux-usbboot-initramfs.trx  —— U 盘优先引导内核：kernel 段里内嵌 initramfs
 #                                     （/init 探测脚本：U盘→板载→驻留救援），
 #                                     **无 rootfs 段**（rootfs 运行期才定）。
 #                                     内核由 CONFIG_EXTERNAL_CPIO 指定，
 #                                     见 target/linux/econet/image/usbboot-initramfs.sh
+
 define Device/chinamobile_gs2107
 	DEVICE_VENDOR := ChinaMobile
 	DEVICE_MODEL := GS2107
 	DEVICE_DTS := en7528_gs2107
+	# 2.0：根从裸 mtd4 搬进 UBI。旧布局的设备（compat_version 1.0）在 sysupgrade 时拒绝本镜像，要先经自救系统迁移（设备 docs/33 §5）。
+	DEVICE_COMPAT_VERSION := 2.0
+	DEVICE_COMPAT_MESSAGE := Root moved into UBI (squashfs volume rootfs on the ubi_rootfs mtd-concat). Migrate through the rescue system as described in devices/openwrt/gs2107/docs/33-ROOTFS-IN-UBI.md
 	TRX_LOADADDR := 0x80002000
 	TRX_MODEL := GS2107
-	KERNEL := kernel-bin | append-dtb | tclinux-free-bootbase-jump | lzma
+	# kernel 分区 8 MiB；框架在 KERNEL 之后按 KERNEL_SIZE 做 check-size。
+	KERNEL_SIZE := 8192k
+	KERNEL := kernel-bin | fit none $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
+	KERNEL_INSTALL := 1
 	KERNEL_INITRAMFS := kernel-bin | append-dtb | tclinux-free-bootbase-jump | lzma
-	IMAGES := tclinux.trx tclinux-usbboot-initramfs.trx
-	IMAGE/tclinux.trx := append-kernel | tclinux-hdr2-trx
+	IMAGES := sysupgrade.bin factory-ubi.bin tclinux.trx tclinux-usbboot-initramfs.trx
+	IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
+	# 214016k = 0xD100000，ubi_rootfs 的大小
+	IMAGE/factory-ubi.bin := append-ubi | check-size 214016k | append-metadata
+	# tclinux.trx 的内核段仍是改用 FIT 之前的格式（原始内核 + DTB，前置 free bootbase 跳转后 LZMA 压缩，由 tcboot 解压）：KERNEL 已是 FIT，这里从原始内核重做，不取 append-kernel。
+	IMAGE/tclinux.trx := copy-file $$(KDIR)/$$(KERNEL_NAME) | append-dtb | tclinux-free-bootbase-jump | lzma | tclinux-hdr2-trx
 	IMAGE/tclinux-usbboot-initramfs.trx := tclinux-hdr2-initramfs-trx
-	# ★ 11-08 加 block-mount：没有它 rootfs 里就没有 `block` 命令、也没有
-	#   /etc/config/fstab，fstools 的 mount_root 找不到 rootfs_data 分区 →
-	#   退回 tmpfs overlay（/tmp/root），配置每次重启全丢。
-	#   DTS 里 rootfs_data（mtd7 @0x980000，15MB）和内核 CONFIG_MTD_UBI=y
-	#   都已就位，缺的只是用户态这一环。
-	# kmod-uboot-bootcount：U-Boot 把启动计数放在保留内存时（DTS 的 bootcount 节点），gs2107-bootok 经它清零；镜像里少了它，计数清不掉，连续 bootlimit 次热复位后就会改走自救镜像。
+	# block-mount：提供 block 命令与 /etc/config/fstab；11-08 实测缺了它 fstools 的 mount_root 找不到 rootfs_data，overlay 退回 tmpfs（/tmp/root），配置每次重启全丢。
+	# kmod-uboot-bootcount：U-Boot 把启动计数放在保留内存时（DTS 的 bootcount 节点），gs2107-bootok 经它清零；镜像里少了它，计数清不掉，连续 bootlimit 次热复位后 gs_fallback 就把 recovery 置 1、改走网络救援模式。
 	DEVICE_PACKAGES := kmod-usb2 kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap \
 		block-mount uboot-envtools kmod-uboot-bootcount
 endef

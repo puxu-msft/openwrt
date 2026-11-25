@@ -1,7 +1,7 @@
 . /lib/functions.sh
 . /lib/functions/gs2107.sh
 
-# 自救模式的配置。自救镜像与主系统共用同一份 rootfs，以 initramfs 方式整个在内存里跑、不挂 overlay，每次启动 /etc 都是镜像原样，这个脚本每次都会执行；主系统（内核命令行没有 gs2107.recovery=1）下直接退出、不改任何配置（随后照常被删掉）。
+# 自救模式的配置。自救系统（网络救援时经 TFTP 载入内存的自救 FIT）与主系统共用同一份 rootfs，以 initramfs 方式整个在内存里跑、不挂 overlay，每次启动 /etc 都是镜像原样，这个脚本每次都会执行；主系统（内核命令行没有 gs2107.recovery=1）下直接退出、不改任何配置（随后照常被删掉）。
 # LAN（192.168.21.7/24，lan1–lan3）与 WAN（lan4，DHCP）沿用 board.d/02_network 的板级默认，root 口令由 92_gs2107-root-password 按构建时的凭据设置，这里都不改。Wi-Fi AP 由 hotplug.d/ieee80211/90_gs2107-recovery-wifi 配置：无线配置在网卡驱动加载后才由 hotplug 生成，与 uci-defaults 的先后不确定。
 case "$(board_name)" in
 chinamobile,gs2107)
