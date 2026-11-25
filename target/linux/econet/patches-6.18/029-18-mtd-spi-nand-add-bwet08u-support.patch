@@ -1,33 +1,23 @@
-Subject: [PATCH] mtd: spi-nand: add support for the BWET08U (0xBC/0xB2) SPI NAND
+Subject: [PATCH] mtd: spi-nand: 支持 BWET08U（0xBC/0xB2）SPI NAND
 
-The ChinaMobile GS2107 (EcoNet EN7528) uses a 256MB SPI NAND that the stock 3.18 kernel identifies as _SPI_NAND_DEVICE_ID_BWET08U (manufacturer 0xBC, device 0xB2). The generic spi-nand core has no entry for manufacturer 0xBC, so even with a working low-level driver the probe fails at the ID match stage ("unknown raw ID").
+中国移动 GS2107（EcoNet EN7528）板载 256 MB 的 SPI NAND，原厂 3.18 内核把它认作 _SPI_NAND_DEVICE_ID_BWET08U（厂商 0xBC、器件 0xB2），即佰维 BIWIN BWET08U。spi-nand 核心没有 0xBC 的厂商表项，读 ID 阶段就会报 “unknown raw ID”。
 
-All parameters were reverse-engineered from the stock kernel's NAND table (scan_spi_nand_table@0x802cfa50, entry 43) and are documented with evidence levels in devices/gs2107/docs/11-NAND-ROOTCAUSE.md §12:
-- geometry: 2048B pages, 64 pages/block, 2048 blocks/LUN, SLC, OOB 64
-- on-die ECC enabled via SET_FEATURE(0xB0, bit4) in configure_chip
-- block unlock via SET_FEATURE(0xA0, & ~0x38)
-- ID read method OPCODE_ADDR (the clean ID read on this board)
-
-ECC strength/step and the exact OOB ECC byte layout are placeholders pending datasheet confirmation (docs/11 §12.8).
-
-ECC status (status register bits 5:4): only 10 = uncorrectable is backed by evidence (the stock driver's ecc_fail_check {0x30, 0x20}); the stock driver uses the data on 01 and 11. Without a get_status hook the core fails the read on 11 (-EINVAL) and reports 01 as the full strength, which reaches bitflip_threshold, so every read that needed any correction made UBI scrub the PEB (copy and erase) or, in the enable-remap kernel partition, mtk_bmt retire the block for good into the reserve pool and rewrite the BMT.
-
-01 now reports half the strength, below the threshold. Trade-off: a block that only ever reports 01 is no longer scrubbed by UBI or remapped by mtk_bmt (mtk_bmt_read() remaps only at or above the threshold); in the kernel partition, which has no UBI, a weakening block has to be found from increments of /sys/class/mtd/mtd3/corrected_bits.
-
-The meaning of 11 is unknown: the stock table applies the same check to W25N01GV, MX35LF1GE4AB and F50L1G41LB, whose drivers fail the read on 11, while GD5FxGQ4xA, HYF1GQ4UDACAE, PN26G0xA and W25N0xKV use 11 for their highest corrected class. Following the stock driver (use the data) and the HYF1GQ4UDACAE driver (full strength for its refresh code), 11 reports the full strength, with a rate-limited warning so that real occurrences can be checked against the data.
+参数与依据（证据等级见 devices/openwrt/gs2107/docs/11-NAND-ROOTCAUSE.md §12、docs/35-VENDOR-LAYOUT-AUDIT.md N31）：
+- 几何：每页 2048 字节、每块 64 页、2048 块，SLC；MTD 的 OOB 取 64 字节（物理备用区 128 字节；原厂 3.18 的 nand_scan_ident 也按页大小 / 32 取 64，vmlinux 0x802e0db4 `srl a0,v0,5`，第 3、4 扇区的备用区没有人用）。
+- 片上 ECC：configure_chip 里置 feature 0xB0 bit4；解锁：feature 0xA0 清 bit5..3。以上取自原厂芯片表第 43 项（scan_spi_nand_table@0x802cfa50，表项 0x807ef304）。
+- 读 ID 用 OPCODE_ADDR：手册图 5-1 是 9FH 后跟 1 个地址字节；只发 9FH 不发地址时读到的首字节 00 落在地址周期（图中这 8 个时钟 SO 高阻），不是 ID。
+- 纠错能力 NAND_ECCREQ(8, 512)：BWET08U 手册 1.1 节“每 512 字节 + 32 字节 8 位 ECC”。
+- OOB 布局：每 512 字节扇区配 32 字节备用区，前 18 字节 metadata、后 14 字节 ECC 校验（手册表 1-2，800h–811h / 812h–81Fh 起每 32 字节一段），与原厂芯片表的可用区 ooblayout_type10（0x8098831c：(0,18) (32,18) (64,18) (96,18)）一致。可用区从第 4 字节起：0–1 是坏块标记，2–3 是 EcoNet BMT 记被映射原块号的位置（原厂 LINUX_USE_OOB_START_OFFSET = 4）。在 64 字节里即可用 (4,14) (32,18)、ECC (18,14) (50,14)。
+- ECC 状态（状态寄存器 bit5:4）：00 无错；01 已纠正、位数低于上限，报强度减一（7），达到 bitflip_threshold（6），读返回 -EUCLEAN：UBI 管的分区随即 scrub，其余分区只计进 corrected_bits，设备树开了 econet,enable-remap 的分区会把该块永久重映射进保留区；10 不可纠（-EBADMSG，与原厂 ecc_fail_check {0x30, 0x20} 相同）；11 已纠正、位数等于上限，报强度（8）。同家族手册没有列出读纠正位数的寄存器，只能按档报。01 与 11 的含义取自同家族 Etron EM73 手册表 13-1（BWET08U 手册这一节没有取到）；BWET08U 与 Etron EM73 同家族的依据是功能寄存器表、指令集表、存储映射图与原厂芯片表各字段逐项相同。
 
 --- /dev/null
 +++ b/drivers/mtd/nand/spi/bwet.c
-@@ -0,0 +1,155 @@
+@@ -0,0 +1,147 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
-+ * Support for the SPI NAND found in the ChinaMobile GS2107 (EcoNet EN7528),
-+ * identified by the stock 3.18 kernel as _SPI_NAND_DEVICE_ID_BWET08U
-+ * (manufacturer 0xBC, device 0xB2, 256MB, SLC, on-die ECC).
++ * 佰维 BIWIN BWET08U SPI NAND（厂商 0xBC、器件 0xB2）：2 Gbit SLC，每页 2048 + 128 字节、每块 64 页、2048 块，片上 ECC。中国移动 GS2107（EcoNet EN7528）板载，原厂 3.18 内核芯片表第 43 项（scan_spi_nand_table@0x802cfa50，表项 0x807ef304）就是它。
 + *
-+ * All parameters were reverse-engineered from the stock kernel's NAND table
-+ * (scan_spi_nand_table@0x802cfa50, entry 43 @0x807ef304) and are documented
-+ * with evidence levels in devices/gs2107/docs/11-NAND-ROOTCAUSE.md §12.
++ * 参数依据（证据与等级见 devices/openwrt/gs2107/docs/11-NAND-ROOTCAUSE.md §12 与 docs/35-VENDOR-LAYOUT-AUDIT.md N31）：纠错能力与备用区布局取 BWET08U 手册（1.1 节“每 512 字节 + 32 字节 8 位 ECC”、表 1-2 ECC 保护与备用区），与原厂芯片表的可用区 ooblayout_type10（0x8098831c）一致；状态位 ECCS 的取值按同家族 Etron EM73 手册表 13-1（BWET08U 手册这一节没有取到）。
 + */
 +
 +#include <linux/device.h>
@@ -36,14 +26,14 @@ The meaning of 11 is unknown: the stock table applies the same check to W25N01GV
 +
 +#define SPINAND_MFR_BWET			0xbc
 +
-+/* Feature registers and bitfields (vendor init sequence, docs/11 §12) */
++/* 功能寄存器（BWET08U 手册表 4-1） */
 +#define BWET_FR_BLOCK_LOCK			0xa0
 +#define BWET_FR_BLOCK_LOCK_UNLOCK_MASK		0x38
 +#define BWET_FR_ECC				0xb0
 +#define BWET_FR_ECC_ON_DIE			BIT(4)
 +
-+/* ECC status, status register bits 5:4; no register with the exact bitflip count is known. There is no datasheet, and only 10 = uncorrectable is backed by evidence: the stock EcoNet driver fails a read only on (status & 0x30) == 0x20. The meaning of 11 is unknown. The stock driver uses the data, but its table applies the same check to W25N01GV, MX35LF1GE4AB and F50L1G41LB, whose Linux and U-Boot drivers fail the read on 11, while GD5FxGQ4xA, PN26G0xA, W25N0xKV and the Linux HYF1GQ4UDACAE driver use 11 for their highest corrected class. */
-+#define BWET_STATUS_ECC_11			(3 << 4)
++/* 状态寄存器 C0H 的 ECCS1:ECCS0（bit5:4）：00 无错；01 已纠正、位数低于纠错上限；10 不可纠；11 已纠正、位数等于纠错上限。同家族 Etron 手册没有列出读纠正位数的寄存器（参数页的 Advanced ECC status 字段为 0），只能按档报。原厂驱动只判 10（0x802d2af4：(status & 0x30) == 0x20），01 与 11 照用数据、不上报。 */
++#define BWET_STATUS_ECC_MAX_BITFLIPS		(3 << 4)
 +
 +static SPINAND_OP_VARIANTS(read_cache_variants,
 +		SPINAND_PAGE_READ_FROM_CACHE_1S_1S_1S_OP(0, 1, NULL, 0, 0),
@@ -55,12 +45,7 @@ The meaning of 11 is unknown: the stock table applies the same check to W25N01GV
 +static SPINAND_OP_VARIANTS(update_cache_variants,
 +		SPINAND_PROG_LOAD_1S_1S_1S_OP(false, 0, NULL, 0));
 +
-+/*
-+ * Vendor init order (fixed): on-die ECC (feature 0xB0 bit4) -> unlock all
-+ * blocks (feature 0xA0 & ~0x38). The ECC is on-die, so no host-side ECC
-+ * engine is needed; the ECC strength/step below are placeholders pending
-+ * datasheet confirmation (docs/11 §12.8).
-+ */
++/* 初始化顺序照原厂芯片表（ecc_en、unlock_block_info）：先置 feature 0xB0 bit4 开片上 ECC，再清 feature 0xA0 的 bit5..3 解锁全部块。ECC 在片上，主机侧不需要 ECC 引擎。 */
 +static int bwet08u_cfg(struct spinand_device *spinand,
 +		       enum spinand_bus_interface iface)
 +{
@@ -92,26 +77,34 @@ The meaning of 11 is unknown: the stock table applies the same check to W25N01GV
 +}
 +
 +/*
-+ * OOB layout: 64 bytes (page>>5, the value the stock kernel reports to the
-+ * MTD layer -- NOT the 128 "page+spare" field of the vendor table). The ECC
-+ * is on-die, so the whole OOB is exposed as free; the exact ECC byte
-+ * positions inside the OOB are not known (docs/11 §12.8).
++ * 备用区按 512 字节扇区分 4 段、每段 32 字节：前 18 字节 metadata（受 ECC 保护），后 14 字节是该扇区的 ECC 校验（手册表 1-2：800h–811h / 812h–81Fh，820h–831h / 832h–83Fh，依此类推）。MTD 只用前 64 字节（原厂 3.18 nand_scan_ident 也按页大小 / 32 取 64，0x802e0db4），所以这里只描述前两段。可用区从第 4 字节起：0–1 是坏块标记，2–3 是 EcoNet BMT（en75_bmt）在备用块上记被映射原块号的位置（原厂 LINUX_USE_OOB_START_OFFSET = 4）。
 + */
 +static int bwet_ooblayout_ecc(struct mtd_info *mtd, int section,
 +			      struct mtd_oob_region *region)
 +{
-+	return -ERANGE;
++	if (section > 1)
++		return -ERANGE;
++
++	region->offset = 32 * section + 18;
++	region->length = 14;
++	return 0;
 +}
 +
 +static int bwet_ooblayout_free(struct mtd_info *mtd, int section,
 +			       struct mtd_oob_region *region)
 +{
-+	if (section > 0)
-+		return -ERANGE;
++	switch (section) {
++	case 0:
++		region->offset = 4;
++		region->length = 14;
++		return 0;
++	case 1:
++		region->offset = 32;
++		region->length = 18;
++		return 0;
++	}
 +
-+	region->offset = 0;
-+	region->length = 64;
-+	return 0;
++	return -ERANGE;
 +}
 +
 +static const struct mtd_ooblayout_ops bwet_ooblayout = {
@@ -131,12 +124,10 @@ The meaning of 11 is unknown: the stock table applies the same check to W25N01GV
 +		return -EBADMSG;
 +
 +	case STATUS_ECC_HAS_BITFLIPS:
-+		/* Corrected, count unknown. Stay below mtd->bitflip_threshold (3/4 of the strength): reaching it makes UBI scrub the PEB (copy and erase) and, in enable-remap partitions, mtk_bmt retire the block for good into the reserve pool and rewrite the BMT, on every read that needed any correction. Both values are relative to the strength, so they stay on their side of the threshold while NAND_ECCREQ is a placeholder. */
-+		return nanddev_get_ecc_conf(nand)->strength / 2;
++		/* 位数未知、低于上限：报上限减一（与 etron.c、alliancememory.c、gigadevice.c 对同类两位状态的口径相同），达到 bitflip_threshold（强度 8 的 3/4 即 6），读返回 -EUCLEAN：UBI 管的分区随即 scrub 该 PEB，其余分区只计进 corrected_bits；设备树给分区开了 econet,enable-remap 的，EcoNet BMT 会把该块永久重映射进保留区（mtk_bmt_read → en75_bmt pub_remap_block）。 */
++		return nanddev_get_ecc_conf(nand)->strength - 1;
 +
-+	case BWET_STATUS_ECC_11:
-+		/* Meaning unknown (see above). Like the stock driver, use the data; like the HYF1GQ4UDACAE driver for its refresh code, report the full strength so that the block gets refreshed. The warning lets real occurrences be checked against the data. */
-+		dev_warn_ratelimited(&spinand->spimem->spi->dev, "ECC status 11 (meaning unknown), data used as corrected\n");
++	case BWET_STATUS_ECC_MAX_BITFLIPS:
 +		return nanddev_get_ecc_conf(nand)->strength;
 +	}
 +
@@ -146,12 +137,7 @@ The meaning of 11 is unknown: the stock table applies the same check to W25N01GV
 +static const struct spinand_info bwet_spinand_table[] = {
 +	SPINAND_INFO("BWET08U",
 +		     /*
-+		      * ID method OPCODE_ADDR: the clean ID read on this board
-+		      * is the variant with one address byte after RDID
-+		      * (debug boot log: "read 5B: bcb2bcb2bc"); the plain
-+		      * variant still returns one residual leading byte.
-+		      * devid = 0xB2 only: the manufacturer byte (0xBC) is
-+		      * provided by the manufacturer entry below.
++		      * 读 ID 用 OPCODE_ADDR：手册图 5-1 是 9FH 后跟 1 个地址字节（00H 出厂商 BCH，01H 出器件 B2H），本板的干净读法即此（调试日志 “read 5B: bcb2bcb2bc”）。只发 9FH 不发地址就读，头一个字节 00 落在地址周期（图 5-1 里这 8 个时钟 SO 是高阻），不是 ID。devid 只写 0xB2，厂商字节 0xBC 由下面的厂商表项给出。
 +		      */
 +		     SPINAND_ID(SPINAND_READID_METHOD_OPCODE_ADDR, 0xb2),
 +		     NAND_MEMORG(1, 2048, 64, 64, 2048, 20, 1, 1, 1),
