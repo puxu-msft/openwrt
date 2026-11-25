@@ -1,0 +1,108 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] net: dsa: mt7530: EN7528 交换机复位照原厂保持并等就绪，PHY 复位后等 PHY 应答再扫描
+
+现象：EN7528 上解绑再重绑 mt7530-mmio（econet-eth 热换时也会这样），控制台日志级别 4 下 PHY 9（口 1）多半认不出：复位后的第一笔 MDIO 读把 PHYSID1 读成 0，phylib 把它绑成 Generic PHY（phy_id 0x00009491），或 PHYSID1/2 都读成 0 时改按 C45 建设备而绑不上（phylink 以 NA 接口校验失败，-EINVAL）；PHY 10–12 从不出错。控制台级别 7 时这一段之间的串口打印插进几毫秒，开机与级别 7 下的重绑都正常。
+
+原厂做法（eth.ko macReset，0x1be4–0x1ca0，亲验字节）：SCU RST_CTRL1（0x1fb00834）bit23 置位，udelay(1000)，清掉；外接交换时先写 SYS_CTRL 0x7000 = 3（0x1ca4），内置交换不写；然后两种都走同一个循环（0x1c48–0x1c80）：最多 5 次“udelay(1000)，读交换机偏移 0x000c（AGC）”，bit17 置位就提前结束，5 次都没置位也照常返回。上游 mt7988_setup 只保持复位 20–50 µs、释放后 20–50 µs 就写 SYS_CTRL_PHY_RST 并继续，紧接着扫 MDIO。
+
+改法（只在 ID_EN7528 上，复位序列收进 en7528_reset，其它型号的 mt7988_setup 原样）：复位保持 1 ms，释放后照原厂最多 5 次“延时 1 ms、读 AGC”，bit17 置位就结束，等不到只告警。SYS_CTRL_PHY_RST 原厂没有，这里照上游保留：去掉它就要依赖“SCU 复位同时复位了 GPHY”这个没验证过的前提；而失败形态正是复位后第一笔读坏、第二笔就对，只在它之前等不能排除坏读来自这次 PHY 复位，所以它之后对 DT mdio 节点下的每个 PHY 轮询 PHYSID1，读到非 0、非 0xffff 才交给 phylib 扫描（每个最多 50 ms，不应答只告警并接着等下一个，读出错就停）。每次 setup 打一行：AGC 第几次读到就绪、PHYSID1 一共读了几次与用时。AGC bit17 的含义没在资料里查到，只按原厂的用法等它。
+
+范围：SoC EN7528（mt7530 的 ID_EN7528 分支）；MT7988、EN7581、AN7583 的复位路径不变。
+
+依据：原厂 eth.ko macReset 的复位与等待序列（亲验字节，devices/openwrt/gs2107/docs/35-VENDOR-LAYOUT-AUDIT.md N17、工作稿 S2）；GS2107 判别实验：同一内核只解绑重绑 mt7530-mmio，控制台级别 4 下 2/2 失败（PHY 9 phy_id 0x00009491），级别 7 下 7/7 正常（devices/openwrt/gs2107/captures/hwqos-E2R-20261125-0715/rebind-exp.txt，同伴会话实测）；C45 形态的失败原文 r2-pstore-dmesg-ramoops-0.txt:555-726。
+
+已验证设备：无（W=1 编译通过）。待 GS2107 网络启动测试内核验收：控制台级别 4 下连续重绑 5/5，PHY 9–12 都绑到 EcoNet EN7528 PHY、phy_id 0x03a29491；开机加每次重绑至少 6 组日志计数。之后按数据收窄：PHYSID1 读取次数恒等于 PHY 个数（每个第一笔就读对），说明原厂的 AGC 等待已足够，删掉 PHYSID1 轮询只留原厂序列；会多于 PHY 个数，就保留并把数据写进补丁头；两种情况下诊断日志都降为 dev_dbg 或删掉。
+---
+--- a/drivers/net/dsa/mt7530.c
++++ b/drivers/net/dsa/mt7530.c
+@@ -3341,10 +3341,79 @@
+ 	}
+ }
+ 
++/* EN7528 的复位序列：交换机复位与就绪等待照原厂 eth.ko macReset（0x1be4）：SCU RST_CTRL1 bit23 置位保持 1 ms 后清掉，再最多 5 次“延时 1 ms、读 AGC”，bit17 置位就提前结束，5 次都没置位也照常继续。 */
++/* 原厂内置交换不写 SYS_CTRL（eth.ko 只在外接交换分支写 0x7000 = 3），SYS_CTRL_PHY_RST 沿用上游；它之后等 DT mdio 节点下的每个 PHY 读得出 PHYSID1（非 0、非 0xffff）再交给 phylib 扫描。不等时复位后的第一笔读会读成 0，phylib 把 PHY 9 认成 Generic PHY（phy_id 0x00009491）或改按 C45 建设备而绑不上（gs2107 captures/hwqos-E2R-20261125-0715/rebind-exp.txt、r2-pstore-dmesg-ramoops-0.txt）；开机时控制台打印在这之间插进几毫秒，所以开机不出现。 */
++/* 日志里的两项计数用来判断要等的是哪一次复位：AGC 第几次读到就绪（0 表示 5 次都没置位）；PHYSID1 一共读了几次，多于 PHY 个数说明 SYS_CTRL_PHY_RST 之后确实要等。 */
++static void en7528_reset(struct mt7530_priv *priv)
++{
++	struct device_node *mnp;
++	int agc_reads, id_reads = 0, phys = 0;
++	ktime_t start;
++	u32 val = 0;
++
++	reset_control_assert(priv->rstc);
++	usleep_range(1000, 1100);
++	reset_control_deassert(priv->rstc);
++	for (agc_reads = 1; agc_reads <= 5; agc_reads++) {
++		usleep_range(1000, 1100);
++		val = mt7530_read(priv, MT753X_AGC);
++		if (val & EN7528_AGC_READY)
++			break;
++	}
++	if (!(val & EN7528_AGC_READY)) {
++		dev_warn(priv->dev, "switch not ready after reset (AGC 0x%08x)\n", val);
++		agc_reads = 0;
++	}
++
++	mt7530_write(priv, MT7530_SYS_CTRL, SYS_CTRL_PHY_RST);
++
++	start = ktime_get();
++	mnp = of_get_available_child_by_name(priv->dev->of_node, "mdio");
++	if (!mnp)
++		return;
++
++	for_each_available_child_of_node_scoped(mnp, child) {
++		ktime_t deadline = ktime_add_us(ktime_get(), 50000);
++		bool expired;
++		u32 addr;
++		int id1;
++
++		if (of_property_read_u32(child, "reg", &addr) || addr >= PHY_MAX_ADDR)
++			continue;
++
++		phys++;
++		for (;;) {
++			expired = ktime_after(ktime_get(), deadline);
++			id1 = priv->info->phy_read_c22(priv, addr, MII_PHYSID1);
++			id_reads++;
++			if (id1 < 0 || (id1 && id1 != 0xffff) || expired)
++				break;
++			usleep_range(50, 100);
++		}
++		/* 读出错是 MDIO 访问本身超时（每次最多 100 ms），不再等其余 PHY；只是不应答的照样等下一个 */
++		if (id1 < 0) {
++			dev_warn(priv->dev, "PHY %u: PHYSID1 read failed (%d)\n", addr, id1);
++			break;
++		}
++		if (!id1 || id1 == 0xffff)
++			dev_warn(priv->dev, "PHY %u not answering after reset (PHYSID1 0x%04x)\n",
++				 addr, id1);
++	}
++	of_node_put(mnp);
++
++	dev_info(priv->dev, "reset: AGC ready on read %d, %d PHYSID1 reads for %d PHYs in %lld us\n",
++		 agc_reads, id_reads, phys, ktime_us_delta(ktime_get(), start));
++}
++
+ static int mt7988_setup(struct dsa_switch *ds)
+ {
+ 	struct mt7530_priv *priv = ds->priv;
+ 
++	if (priv->id == ID_EN7528) {
++		en7528_reset(priv);
++		return mt7531_setup_common(ds);
++	}
++
+ 	/* Reset the switch */
+ 	reset_control_assert(priv->rstc);
+ 	usleep_range(20, 50);
+--- a/drivers/net/dsa/mt7530.h
++++ b/drivers/net/dsa/mt7530.h
+@@ -38,6 +38,8 @@
+ /* Register for ARL global control */
+ #define MT753X_AGC			0xc
+ #define  LOCAL_EN			BIT(7)
++/* EN7528：交换机复位释放后原厂 eth.ko macReset（0x1c48-0x1c80）轮询这一位，置位就提前结束、5 次等不到也照常继续；数据手册含义未查到，运行期读数 0x00071899，置位 */
++#define  EN7528_AGC_READY		BIT(17)
+ 
+ /* Register for MAC forward control */
+ #define MT753X_MFC			0x10
