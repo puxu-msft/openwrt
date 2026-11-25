@@ -1,0 +1,100 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: 驱动自己丢的帧与 QDMA 丢的帧计进 tx_dropped/rx_dropped；收包照原厂丢弃带 drop 位的描述符
+
+现象：en75_dev_get_stats64() 的 tx_dropped/rx_dropped 只取 GDM 硬件计数，发送 drop 路径里记的 dev->stats.tx_dropped 被覆盖掉，在 ip -s 与 /sys 里都看不到（hw-qos 强制判卡住时丢了 27026 帧，eth0 的 tx_dropped 一直是 0）；发送 drop 路径用的是非原子的 dev->stats.tx_dropped++。QDMA 自己丢的帧（拥塞的尾丢弃、DEI 丢弃，带 drop 位完成）GDM 计数看不到，驱动也没记；收包在交给协议栈之前丢的帧（描述符长度不对、NLS、建不出 skb）同样没记。
+
+改法：
+- 发送 drop 路径改用 DEV_STATS_INC；get_stats64 在硬件计数之上加上 DEV_STATS_READ(dev, tx_dropped/rx_dropped)。
+- 发送完成时描述符带 drop 位，记到发包设备的 tx_dropped（原厂记进 txDscpDropErrs，GPL qdma_bmgr.i:62159-62162）。
+- 收包在交给协议栈之前丢的帧都记到来源口的 rx_dropped。
+
+行为变化（只有这一处，其余都是计数）：收包描述符带 drop 位时，这一帧不再交给协议栈，丢掉并记来源口的 rx_dropped。依据：原厂收包路径见到 drop 位就记 rxDscpIncorrect、打印“pkt size is overflow”并回收这一帧的缓冲，不往上送（GPL qdma_bmgr.i:61226-61234）；原来的驱动不看这一位，照常把这类描述符交给协议栈。范围：所有走 econet-eth 收包路径的帧，PPE 硬件转发的帧不经过这里，不受影响。
+
+范围：芯片家族层（econet-eth 各芯片共用的收发路径；drop 位的含义取自 GPL SDK 的 qdma_bmgr，各芯片共用；EN751221 未在实物上验证）。依据：hw-qos 的现象（gs2107 TASKS）与上面的原厂源码行。已验证设备：GS2107，模块热换回归（devices/openwrt/gs2107/captures/layout-audit-20261125/eth014-*）：PPE 成套用例 0 失败，TX 卸载回归 verdict=ok，无 WARN。回归期间没有发生软件丢包，tx_dropped 一直是 0，所以计数会不会涨还没正面验证，要等一次 QDMA 拥塞丢包或强制判卡住。
+
+diff --git a/econet_eth.c b/econet_eth.c
+index 64d197b..8f133e2 100644
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -166,6 +166,12 @@ static struct net_device *en75_get_sport_dev(struct en75_eth_pvt *eth,
+ 	return eth->ports[0];
+ }
+ 
++/* 收包在交给协议栈之前就丢掉的帧（描述符长度不对、NLS、建不出 skb）记到来源口的 rx_dropped */
++void en75_rx_count_drop(struct en75_eth *eth, enum etx_fport sport)
++{
++	DEV_STATS_INC(en75_get_sport_dev((struct en75_eth_pvt *)eth, sport), rx_dropped);
++}
++
+ /* For a frame marked CHECKSUM_UNNECESSARY: count what the GDM rule let through (struct en75_rx_csum_stats). The fields read share the cache line that eth_type_trans() reads next. */
+ static void en75_rx_csum_audit(struct en75_rx_csum_stats *st,
+ 			       const struct sk_buff *skb, unsigned int proto_off)
+diff --git a/econet_eth.h b/econet_eth.h
+index 443666f..34ec4a7 100644
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -195,6 +195,7 @@ struct en75_eth {
+ };
+ 
+ /* Called in softirq context. l4_csum_ok: the RX descriptor passes the checksum rule of en75_erx_l4_csum_ok(). */
++void en75_rx_count_drop(struct en75_eth *eth, enum etx_fport sport);
+ int en75_rx_before_recv(struct en75_eth *eth, struct sk_buff *skb,
+ 			enum etx_fport sport, u8 crsn, u16 ppe_entry,
+ 			bool l4_csum_ok);
+diff --git a/econet_port.c b/econet_port.c
+index fb43a37..2c93d73 100644
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -324,7 +324,7 @@ drop:
+ 	if (!netdev_xmit_more())
+ 		en75_qdma_tx_flush(port->qdma, 0);
+ 	dev_kfree_skb_any(skb);
+-	dev->stats.tx_dropped++;
++	DEV_STATS_INC(dev, tx_dropped);
+ 	return NETDEV_TX_OK;
+ }
+ 
+@@ -413,6 +413,9 @@ static void en75_dev_get_stats64(struct net_device *dev,
+ 			storage->rx_crc_errors = port->stats.rx_crc_error;
+ 		}
+ 	} while (u64_stats_fetch_retry(&port->stats.syncp, start));
++	/* 硬件计数之外，驱动自己丢的帧（发送 drop 路径、收包交给协议栈之前丢的）记在 dev->stats，一并报出 */
++	storage->tx_dropped += DEV_STATS_READ(dev, tx_dropped);
++	storage->rx_dropped += DEV_STATS_READ(dev, rx_dropped);
+ }
+ 
+ static void en75_ethtool_get_drvinfo(struct net_device *dev,
+diff --git a/econet_qdma.c b/econet_qdma.c
+index 94dc3db..bb12379 100644
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -243,6 +243,10 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+ 	/* Make debug more readable */
+ 	WRITE_ONCE(q->desc[cpu_i].pkt_addr, 0);
+ 
++	/* 原厂 qdma_bmgr.c 收包时见到 drop_pkt 就记 rxDscpIncorrect、丢掉这一帧（GPL qdma_bmgr.i:61226-61234，打印“pkt size is overflow”） */
++	if (is_desc_info_dropped(&desc.info))
++		goto return_page;
++
+ 	len = get_desc_info_pkt_len(&desc.info);
+ 	if (!len || len > dma_len)
+ 		goto return_page;
+@@ -272,6 +276,7 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+ 	return;
+ 
+ return_page:
++	en75_rx_count_drop(q->qdma->eth, get_erx_sport(&desc.msg.erx));
+ 	page = virt_to_head_page(e->buf);
+ 	page_pool_put_full_page(q->page_pool, page, false);
+ }
+@@ -614,6 +619,10 @@ static u32 en75_tx_done_process(struct en75_tx_doneq *done_q, u32 limit,
+ 		if (!skb)
+ 			continue;
+ 
++		/* QDMA 自己丢掉的帧（拥塞的尾丢弃、DEI 丢弃等）带 drop 位完成，GDM 的发送计数看不到；原厂记进 txDscpDropErrs（GPL qdma_bmgr.i:62159-62162），这里记到发包设备的 tx_dropped */
++		if (is_desc_info_dropped(&desc.info))
++			DEV_STATS_INC(skb->dev, tx_dropped);
++
+ 		/* every packet was queued on TX queue 0 (en75_dev_xmit()) */
+ 		/* skb->dev 由 en75_dev_xmit() 设成记账的那个设备 */
+ 		txq = netdev_get_tx_queue(skb->dev, 0);
