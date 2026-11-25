@@ -6,13 +6,14 @@ Subject: [PATCH] mtd: spi-nand: 支持 BWET08U（0xBC/0xB2）SPI NAND
 - 几何：每页 2048 字节、每块 64 页、2048 块，SLC；MTD 的 OOB 取 64 字节（物理备用区 128 字节；原厂 3.18 的 nand_scan_ident 也按页大小 / 32 取 64，vmlinux 0x802e0db4 `srl a0,v0,5`，第 3、4 扇区的备用区没有人用）。
 - 片上 ECC：configure_chip 里置 feature 0xB0 bit4；解锁：feature 0xA0 清 bit5..3。以上取自原厂芯片表第 43 项（scan_spi_nand_table@0x802cfa50，表项 0x807ef304）。
 - 读 ID 用 OPCODE_ADDR：手册图 5-1 是 9FH 后跟 1 个地址字节；只发 9FH 不发地址时读到的首字节 00 落在地址周期（图中这 8 个时钟 SO 高阻），不是 ID。
+- 读缓存有双线 0x3B（地址单线、1 个哑元字节、数据双线，与原厂芯片表 read_mode = DUAL、dummy_mode = APPEND 相同，docs/35 N32）与单线两种；spinand 核心按控制器支持与整页传输时长选最快的变体，rx 双线在 SoC 级 dtsi 声明（en7528.dtsi 的 spi-nand 节点 spi-rx-bus-width = <2>），控制器的 DMA 读按 0x3B 置 rd_mode = 1。
 - 纠错能力 NAND_ECCREQ(8, 512)：BWET08U 手册 1.1 节“每 512 字节 + 32 字节 8 位 ECC”。
 - OOB 布局：每 512 字节扇区配 32 字节备用区，前 18 字节 metadata、后 14 字节 ECC 校验（手册表 1-2，800h–811h / 812h–81Fh 起每 32 字节一段），与原厂芯片表的可用区 ooblayout_type10（0x8098831c：(0,18) (32,18) (64,18) (96,18)）一致。可用区从第 4 字节起：0–1 是坏块标记，2–3 是 EcoNet BMT 记被映射原块号的位置（原厂 LINUX_USE_OOB_START_OFFSET = 4）。在 64 字节里即可用 (4,14) (32,18)、ECC (18,14) (50,14)。
 - ECC 状态（状态寄存器 bit5:4）：00 无错；01 已纠正、位数低于上限，报强度减一（7），达到 bitflip_threshold（6），读返回 -EUCLEAN：UBI 管的分区随即 scrub，其余分区只计进 corrected_bits，设备树开了 econet,enable-remap 的分区会把该块永久重映射进保留区；10 不可纠（-EBADMSG，与原厂 ecc_fail_check {0x30, 0x20} 相同）；11 已纠正、位数等于上限，报强度（8）。同家族手册没有列出读纠正位数的寄存器，只能按档报。01 与 11 的含义取自同家族 Etron EM73 手册表 13-1（BWET08U 手册这一节没有取到）；BWET08U 与 Etron EM73 同家族的依据是功能寄存器表、指令集表、存储映射图与原厂芯片表各字段逐项相同。
 
 --- /dev/null
 +++ b/drivers/mtd/nand/spi/bwet.c
-@@ -0,0 +1,147 @@
+@@ -0,0 +1,149 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * 佰维 BIWIN BWET08U SPI NAND（厂商 0xBC、器件 0xB2）：2 Gbit SLC，每页 2048 + 128 字节、每块 64 页、2048 块，片上 ECC。中国移动 GS2107（EcoNet EN7528）板载，原厂 3.18 内核芯片表第 43 项（scan_spi_nand_table@0x802cfa50，表项 0x807ef304）就是它。
@@ -35,7 +36,9 @@ Subject: [PATCH] mtd: spi-nand: 支持 BWET08U（0xBC/0xB2）SPI NAND
 +/* 状态寄存器 C0H 的 ECCS1:ECCS0（bit5:4）：00 无错；01 已纠正、位数低于纠错上限；10 不可纠；11 已纠正、位数等于纠错上限。同家族 Etron 手册没有列出读纠正位数的寄存器（参数页的 Advanced ECC status 字段为 0），只能按档报。原厂驱动只判 10（0x802d2af4：(status & 0x30) == 0x20），01 与 11 照用数据、不上报。 */
 +#define BWET_STATUS_ECC_MAX_BITFLIPS		(3 << 4)
 +
++/* 读缓存有双线 0x3B（地址单线、1 个哑元字节、数据双线，即原厂芯片表的 read_mode = DUAL、dummy_mode = APPEND）与单线两种；spinand 核心逐个变体核控制器是否支持、算整页传输时长，取最快的（spinand_select_op_variant），设备树没给 rx 双线或控制器不支持时落到单线。 */
 +static SPINAND_OP_VARIANTS(read_cache_variants,
++		SPINAND_PAGE_READ_FROM_CACHE_1S_1S_2S_OP(0, 1, NULL, 0, 0),
 +		SPINAND_PAGE_READ_FROM_CACHE_1S_1S_1S_OP(0, 1, NULL, 0, 0),
 +		SPINAND_PAGE_READ_FROM_CACHE_FAST_1S_1S_1S_OP(0, 1, NULL, 0, 0));
 +
