@@ -76,31 +76,20 @@ def main():
     ap.add_argument("--endian", default="le", choices=["le", "be"])
     ap.add_argument("--model", default="")
     ap.add_argument("--loadaddr", default="0x80020000")
-    ap.add_argument("--pad", default=None,
-                    help="kernel 段垫到的偏移（默认 0x400000 = 4MB，同上游 "
-                         "tclinux-trx.sh）。仅内核镜像（无 rootfs 段）时可放宽——"
-                         "bootloader 按头里的 kernel 段长读，LZMA 流结束即停。")
     a = ap.parse_args()
-
-    pad_to = PAD_ROOTFS_OFFSET_TO
-    if a.pad is not None:
-        pad_to = int(a.pad, 0)
-        if pad_to <= HDRLEN:
-            sys.exit(f"--pad too small ({pad_to})")
 
     loadaddr = int(a.loadaddr, 0)
     kernel = open(a.kernel, "rb").read()
     rootfs = open(a.rootfs, "rb").read() if a.rootfs else b""
 
     header_plus_kernel = HDRLEN + len(kernel)
-    if pad_to <= header_plus_kernel:
-        sys.exit(f"kernel is too large ({len(kernel)}B > {pad_to - HDRLEN}B, "
-                 f"pad target 0x{pad_to:x})")
-    padding = b"\xff" * (pad_to - header_plus_kernel)
+    if PAD_ROOTFS_OFFSET_TO <= header_plus_kernel:
+        sys.exit(f"kernel is too large ({len(kernel)}B > {PAD_ROOTFS_OFFSET_TO - HDRLEN}B)")
+    padding = b"\xff" * (PAD_ROOTFS_OFFSET_TO - header_plus_kernel)
 
     padded_kernel_len = len(kernel) + len(padding)
     rootfs_len = len(rootfs)
-    total_len = pad_to + rootfs_len
+    total_len = PAD_ROOTFS_OFFSET_TO + rootfs_len
 
     payload = kernel + padding + rootfs
     jamcrc = (zlib.crc32(payload) & 0xFFFFFFFF) ^ 0xFFFFFFFF
@@ -111,7 +100,7 @@ def main():
     sys.stderr.write(
         f"endian={a.endian} kernel={len(kernel)}B padding={len(padding)}B "
         f"rootfs={rootfs_len}B total={total_len}B jamcrc=0x{jamcrc:08x} "
-        f"loadaddr=0x{loadaddr:08x} pad_to=0x{pad_to:x}\n")
+        f"loadaddr=0x{loadaddr:08x}\n")
     sys.stdout.buffer.write(hdr + payload)
 
 

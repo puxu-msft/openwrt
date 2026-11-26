@@ -274,26 +274,11 @@ CONFIG_ZSTD_COMMON=y
 CONFIG_ZSTD_COMPRESS=y
 CONFIG_ZSTD_DECOMPRESS=y
 
-# ---------------------------------------------------------------------------
-# GS2107 "U 盘优先启动" 引导内核内置项（2026-11-07，USB-BOOT-PLAN.md §0/§3.1）
-# 该内核与 initramfs 一起刷进 tcboot 时代的 mtd4（原 rootfs 区，现在是 ubi_seg0），rootfs 由 initramfs /init 在运行期探测，
-# 因此 USB 存储 / 块设备 / ext4 / devtmpfs 必须全部内置（不能依赖模块：
-# 模块在 rootfs 里，而 rootfs 正是我们要找的东西）。
-# ---------------------------------------------------------------------------
-# USB storage（U 盘 rootfs 主路线）
+# U 盘的块设备栈与 ext4 内置（GS2107 的取舍，写在子目标配置里，对 en7528 的别的板同样生效）：镜像里没有 kmod-usb-storage、kmod-fs-ext4（FAT 由 kmod-fs-vfat 提供），Linux 读写 U 盘只靠这几项；现行启动顺序的第一级就是 U 盘（U-Boot 从它的第 1 分区读 FAT 或 ext4 上的 gs2107/boot.scr），设备 docs/36 §8.3 的测试系统要从运行中的系统往这块盘写启动件。内置而不是模块，openwrt 组的按需救援 initramfs（devices/openwrt/tools/bridge-initramfs/）才能用这个内核直接挂 U 盘根、不重链接内核。USB_STORAGE 与 BLK_DEV_SD 都 depends on SCSI，漏掉 SCSI 时 kconfig 会静默丢掉这两项。
+CONFIG_SCSI=y
 CONFIG_BLK_DEV_SD=y
 CONFIG_USB_STORAGE=y
-# ext4（U 盘方案A：ext4 目录树；ext2/ext3 也走 ext4 驱动）
 CONFIG_EXT4_FS=y
-# devtmpfs：让 /dev/sda1 自动出现（/init 里另有 /sys mknod 兜底）
-CONFIG_DEVTMPFS=y
-
-# USB storage 的硬依赖：USB_STORAGE / BLK_DEV_SD 都 depends on SCSI
-# （drivers/usb/storage/Kconfig:8、drivers/scsi/Kconfig:82）。
-# 少了 CONFIG_SCSI 时 kconfig 会静默把上面两项丢掉——已实测踩坑：
-# 内核 .config 里 USB_STORAGE/BLK_DEV_SD 整行消失，内核镜像里
-# 搜不到 "usb-storage"/"scsi_mod" 字符串 → U 盘根本不会被识别。
-CONFIG_SCSI=y
 
 # EN7528 timer-block hardware watchdog (drivers/watchdog/en7528_wdt.c)
 CONFIG_WATCHDOG_CORE=y

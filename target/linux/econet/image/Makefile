@@ -85,23 +85,3 @@ define Build/tclinux-hdr2-trx
 		$(if $(TRX_MODEL),--model $(TRX_MODEL)) > $@.new
 	mv $@.new $@
 endef
-
-# GS2107 "U 盘优先启动" 引导内核（USB-BOOT-PLAN.md §0）
-# 与 tclinux-hdr2-trx 的差别：
-#   1) kernel 取 **initramfs 内核**（$(KDIR)/tmp/$(KERNEL_INITRAMFS_IMAGE)，
-#      即 bin/targets/ 下的 *-initramfs-kernel.bin），不是普通内核；
-#   2) **不给 --rootfs**：rootfs 段为空，root 由 initramfs /init 在运行期探测；
-#   3) --pad 0x500000：该内核内嵌 initramfs 后 LZMA 出来 4288266B，超过上游
-#      固定的 4MB 垫目标。这里没有 rootfs 段，padding 只剩 "A-length bug"
-#      规避一个用途（tclinux-trx.sh 原注：LZMA 解压器到流尾自停），故放到 5MB；
-#      镜像总长 5MB，远小于 mtd4(tclinux) 的 24MB。
-# 注意：define 体内的设备变量用**单** $（make 展开一次即到位）；写 $$ 会原样
-#       吐给 shell 造成 "syntax error near unexpected token )"。
-define Build/tclinux-hdr2-initramfs-trx
-	python3 $(TOPDIR)/target/linux/$(BOARD)/image/tclinux-hdr2.py \
-		--kernel $(KDIR)/tmp/$(KERNEL_INITRAMFS_IMAGE) \
-		--version $(VERSION_DIST)-$(REVISION) \
-		--endian $(TRX_ENDIAN) --loadaddr $(TRX_LOADADDR) --pad 0x500000 \
-		$(if $(TRX_MODEL),--model $(TRX_MODEL)) > $@.new
-	mv $@.new $@
-endef

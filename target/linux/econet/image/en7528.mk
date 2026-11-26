@@ -67,14 +67,10 @@ TARGET_DEVICES += jiofiber_jcow407
 #   kernel.bin（KERNEL_INSTALL）—— 内核 FIT（自解压的 vmlinuz.bin 以 compression = none 放入 + DTB，load/entry 0x80020000），写 kernel 分区或经 TFTP 启动
 #   sysupgrade.bin                —— 标准 sysupgrade：tar（CONTROL、kernel = 内核 FIT、root = squashfs）+ fwtool 元数据（compat_version 2.0）
 #   factory-ubi.bin               —— 整个 ubi_rootfs 的 ubinize 镜像（卷 rootfs + autoresize 的 rootfs_data + EOF 标记）+ fwtool 元数据，UBI 不可用时从自救系统 sysupgrade
+#   tclinux.trx                   —— tcboot 时代的常规 HDR2 镜像（kernel + squashfs rootfs 段）；只保留格式，新布局下起不了 NAND 根
 #
-# tcboot 时代的两种 HDR2 镜像（USB-BOOT-PLAN.md §0；去留待定，见设备 docs/36 §10 D3）：
-#   tclinux.trx                    —— kernel + squashfs rootfs 段；只保留格式，新布局下起不了 NAND 根，去留随 D3
-#   tclinux-usbboot-initramfs.trx  —— U 盘优先引导内核：kernel 段里内嵌 initramfs
-#                                     （/init 探测脚本：U盘→板载→驻留救援），
-#                                     **无 rootfs 段**（rootfs 运行期才定）。
-#                                     内核由 CONFIG_EXTERNAL_CPIO 指定，
-#                                     见 target/linux/econet/image/usbboot-initramfs.sh
+# tcboot 时代 U 盘优先的桥接启动件（内嵌五模式 /init 的 initramfs 内核与它的 HDR2 镜像）不在缺省构建里：救援 initramfs 改由 openwrt 组的按需工具 devices/openwrt/tools/bridge-initramfs/ 构建（设备 docs/36 §10 D3）。
+# 不另写 KERNEL_INITRAMFS：配置开了 ramdisk（CONFIG_TARGET_ROOTFS_INITRAMFS）时取缺省的 KERNEL；GS2107 的配置基线不开它，不产出 initramfs-kernel.bin（设备 docs/36 §10 D3）。
 
 define Device/chinamobile_gs2107
 	DEVICE_VENDOR := ChinaMobile
@@ -89,14 +85,12 @@ define Device/chinamobile_gs2107
 	KERNEL_SIZE := 8192k
 	KERNEL := kernel-bin | fit none $$(KDIR)/image-$$(firstword $$(DEVICE_DTS)).dtb
 	KERNEL_INSTALL := 1
-	KERNEL_INITRAMFS := kernel-bin | append-dtb | tclinux-free-bootbase-jump | lzma
-	IMAGES := sysupgrade.bin factory-ubi.bin tclinux.trx tclinux-usbboot-initramfs.trx
+	IMAGES := sysupgrade.bin factory-ubi.bin tclinux.trx
 	IMAGE/sysupgrade.bin := sysupgrade-tar | append-metadata
 	# 214016k = 0xD100000，ubi_rootfs 的大小
 	IMAGE/factory-ubi.bin := append-ubi | check-size 214016k | append-metadata
 	# tclinux.trx 的内核段仍是改用 FIT 之前的格式（原始内核 + DTB，前置 free bootbase 跳转后 LZMA 压缩，由 tcboot 解压）：KERNEL 已是 FIT，这里从原始内核重做，不取 append-kernel。
 	IMAGE/tclinux.trx := copy-file $$(KDIR)/$$(KERNEL_NAME) | append-dtb | tclinux-free-bootbase-jump | lzma | tclinux-hdr2-trx
-	IMAGE/tclinux-usbboot-initramfs.trx := tclinux-hdr2-initramfs-trx
 	# block-mount：提供 block 命令与 /etc/config/fstab；11-08 实测缺了它 fstools 的 mount_root 找不到 rootfs_data，overlay 退回 tmpfs（/tmp/root），配置每次重启全丢。
 	# kmod-uboot-bootcount：U-Boot 把启动计数放在保留内存时（DTS 的 bootcount 节点），gs2107-bootok 经它清零；镜像里少了它，计数清不掉，连续 bootlimit 次热复位后 gs_fallback 就把 recovery 置 1、改走网络救援模式。
 	DEVICE_PACKAGES := kmod-usb2 kmod-mt7603 kmod-mt7615e kmod-mt7663-firmware-ap \
