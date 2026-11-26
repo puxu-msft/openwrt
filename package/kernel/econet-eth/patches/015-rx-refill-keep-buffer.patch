@@ -1,0 +1,306 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: 收包时先换上新缓冲再交出旧缓冲，申请不到就丢帧、原缓冲挂回，环里不留空项
+
+现象（hw-qos 第二轮评审 P1）：en75_qdma_rx_process() 先把一批收到的项处理完（缓冲交给协议栈或还回 page_pool），再由 en75_fill_rx_queue() 统一补缓冲；补到第 k 项申请失败就停下，并把 q->cpu_i 退回 k-1。k 及之后的项其实已经处理过，下一轮 poll 却从 k 开始再处理一次：用硬件没改写过的旧描述符、对已交给协议栈或已回收的缓冲再建 skb，同一块缓冲被处理两次（双重处理、释放后使用）。另外 (cpu_i - 1) % ndesc 在 cpu_i 为 0、ndesc 不是 2 的幂时算错。
+
+改法（照原厂 qdma_bm_receive_packets：先申请新缓冲，申请不到就记 rxAllocFailDropErrs、丢掉这一帧、把原缓冲挂回去，GPL qdma_bmgr.i:61237-61242 “Revert received packet as new skb”；带 drop 位的帧同样复用原缓冲，:61226-61234）：
+- 每处理一项就当场给它换上新缓冲；申请不到时，以及带 drop 位、长度为 0 或超出缓冲、NLS 的帧，把原缓冲挂回这一项（dma_sync_single_for_device 之后交还）。长度为 0 时原厂是停止处理（:61217-61221），超长与 NLS 原厂没有对应处理，这里一律丢帧、复用。丢帧计到来源口的 rx_dropped。处理到哪一项就把 rx_cpui 写到哪一项，处理与补缓冲不再分成两个下标。
+- en75_fill_rx_queue() 只在建环（probe 时）填满整个环（GFP_KERNEL），填不满就返回 -ENOMEM、probe 失败，不再留下永远补不上的空项；销毁时跳过没挂缓冲的项，没登记的收包 NAPI 不再 netif_napi_del()（建环中途失败时原来会对它锁 NULL 的 napi->dev，基线就有）。
+- debugfs econet_eth/rx_alloc_fail：写入 N，接下来 N 次收包时的缓冲申请按失败处理（故障注入，上机验证失败路径用），读出剩余次数；0 或负数不注入，建环不受影响。
+
+范围：芯片家族层（econet-eth 各芯片共用的收包路径）。依据：GPL 原厂收包函数（上面的行号）与 hw-qos 的评审。已验证设备：GS2107（模块热换，devices/openwrt/gs2107/captures/eth015-016-20261126/：收包时 rx_alloc_fail 注入 300 次，eth0 rx_dropped 0→300、ping 只在注入那几秒连丢 207 个、之后全通、计数读回 0、无 WARN；PPE 成套 plain 0 失败）；独立评审用用户态模型复现了基线的双重处理与取模错误，修复后为 0。
+
+diff --git a/econet_eth.c b/econet_eth.c
+index 8f133e2..14e1a3e 100644
+--- a/econet_eth.c
++++ b/econet_eth.c
+@@ -166,7 +166,7 @@ static struct net_device *en75_get_sport_dev(struct en75_eth_pvt *eth,
+ 	return eth->ports[0];
+ }
+ 
+-/* 收包在交给协议栈之前就丢掉的帧（描述符长度不对、NLS、建不出 skb）记到来源口的 rx_dropped */
++/* 收包在交给协议栈之前就丢掉的帧（描述符带 drop 位、长度不对、NLS、申请不到替换缓冲、建不出 skb）记到来源口的 rx_dropped */
+ void en75_rx_count_drop(struct en75_eth *eth, enum etx_fport sport)
+ {
+ 	DEV_STATS_INC(en75_get_sport_dev((struct en75_eth_pvt *)eth, sport), rx_dropped);
+diff --git a/econet_eth.h b/econet_eth.h
+index 34ec4a7..77a50bb 100644
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -176,6 +176,9 @@ struct en75_debug_conf {
+ 	struct en75_rx_csum_stats		*rx_csum;
+ };
+ 
++/* econet_qdma.c：debugfs rx_alloc_fail 的计数，见 en75_qdma_rx_process_one() */
++extern atomic_t en75_rx_alloc_fail;
++
+ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config);
+ void en75_debugfs_exit(struct en75_debug *debug);
+ 
+diff --git a/econet_eth_debug.c b/econet_eth_debug.c
+index 621b5a9..1caed49 100644
+--- a/econet_eth_debug.c
++++ b/econet_eth_debug.c
+@@ -729,6 +729,9 @@ struct en75_debug *en75_debugfs_init(struct en75_debug_conf *config)
+ 		debugfs_create_file("rx_csum", 0400, debug->dir, config->rx_csum,
+ 				    &en75_rx_csum_fops);
+ 
++	/* 写入 N：接下来 N 次收包时的缓冲申请按失败处理（故障注入），读出剩余次数；0 或负数不注入 */
++	debugfs_create_atomic_t("rx_alloc_fail", 0600, debug->dir, &en75_rx_alloc_fail);
++
+ 	BUILD_BUG_ON(ARRAY_SIZE(debug->qdma) != ARRAY_SIZE(config->qdma));
+ 	for (int i = 0; i < ARRAY_SIZE(debug->qdma); i++) {
+ 		char qdma_dirname[8] = {0};
+diff --git a/econet_qdma.c b/econet_qdma.c
+index bb12379..25e7d00 100644
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -172,41 +172,53 @@ EN75_NAPI_PARAM(napi_defer_hard_irqs, uint,
+ EN75_NAPI_PARAM(gro_flush_timeout, ulong,
+ 		"Re-poll delay in ns while hard IRQs are deferred");
+ 
+-static void en75_fill_rx_queue(struct en75_q_rx *q, u32 end_i)
++/* debugfs rx_alloc_fail：让接下来这么多次收包时的缓冲申请按失败处理（故障注入，验证申请失败时丢帧、原缓冲挂回的路径）；写 0 或负数不注入。建环（probe 时）的填环不受影响。 */
++atomic_t en75_rx_alloc_fail = ATOMIC_INIT(0);
++
++/* 申请一块收包缓冲填进 @e（收包 NAPI 里 GFP_ATOMIC；建环时可以睡着申请）；失败时不改 @e。 */
++static bool en75_rx_ent_alloc(struct en75_q_rx *q, struct en75_q_rx_ent *e,
++			      gfp_t gfp)
+ {
+-	u32 ndesc = q->ndesc;
+-	u32 cpu_i = (q->cpu_i + 1) % ndesc;
++	struct page *page;
++	unsigned int offset;
+ 
+-	for (; cpu_i != end_i; cpu_i = (cpu_i + 1) % ndesc) {
+-		struct en75_q_rx_ent *e = &q->entry[cpu_i];
+-		struct desc *pdesc = &q->desc[cpu_i];
+-		struct page *page;
+-		int offset;
+-		int i;
++	page = page_pool_alloc_frag(q->page_pool, &offset, q->buf_size, gfp);
++	if (!page)
++		return false;
+ 
+-		page = page_pool_dev_alloc_frag(q->page_pool, &offset,
+-						q->buf_size);
++	e->buf = page_address(page) + offset;
++	e->dma_addr = page_pool_get_dma_addr(page) + offset + NET_SKB_PAD;
++	e->dma_len = SKB_WITH_OVERHEAD(q->buf_size) - EN75_RX_HEADROOM;
++	return true;
++}
+ 
+-		if (!page)
+-			break;
++/* 把收包项 @i 的缓冲交给硬件：描述符写成空的、长度为缓冲长度。交还由调用方写 rx_cpui。 */
++static void en75_rx_desc_arm(struct en75_q_rx *q, u32 i)
++{
++	struct en75_q_rx_ent *e = &q->entry[i];
++	struct desc *pdesc = &q->desc[i];
++	int j;
++
++	WRITE_ONCE(pdesc->info, ((struct desc_info) {
++		.word = FIELD_PREP(DESC_INFO_PKT_LEN_MASK, e->dma_len)
++	}));
++	WRITE_ONCE(pdesc->pkt_addr, e->dma_addr);
++	for (j = 0; j < ARRAY_SIZE(pdesc->msg.raw); j++)
++		WRITE_ONCE(pdesc->msg.raw[j], 0);
++}
+ 
+-		WARN_ON_ONCE(e->dma_addr);
+-		e->buf = page_address(page) + offset;
+-		e->dma_addr = page_pool_get_dma_addr(page) + offset + NET_SKB_PAD;
+-		e->dma_len = SKB_WITH_OVERHEAD(q->buf_size) - EN75_RX_HEADROOM;
+-
+-		WRITE_ONCE(pdesc->info, ((struct desc_info) {
+-			.word = FIELD_PREP(DESC_INFO_PKT_LEN_MASK, e->dma_len)
+-		}));
+-		WRITE_ONCE(pdesc->pkt_addr, e->dma_addr);
+-		for (i = 0; i < ARRAY_SIZE(pdesc->msg.raw); i++)
+-			WRITE_ONCE(pdesc->msg.raw[i], 0);
++/*
++ * 建环（probe 时）给每一项申请缓冲并挂进描述符。此后每一项在收包处理时当场换上新缓冲或挂回原缓冲
++ * （en75_qdma_rx_process_one），环里任何时候都没有空项，处理到哪一项就交还到哪一项。
++ */
++static int en75_fill_rx_queue(struct en75_q_rx *q)
++{
++	for (u32 i = 0; i < q->ndesc; i++) {
++		if (!en75_rx_ent_alloc(q, &q->entry[i], GFP_KERNEL))
++			return -ENOMEM;
++		en75_rx_desc_arm(q, i);
+ 	}
+-
+-	cpu_i = (cpu_i - 1) % ndesc;
+-
+-	q->cpu_i = cpu_i;
+-	en75_wreg(cpu_i, &q->qchain_regs->rx_cpui);
++	return 0;
+ }
+ 
+ /* The CHECKSUM_UNNECESSARY rule of the vendor eth_rx, bit for bit (eth.ko 0x11a4..0x11dc, 0x1410..0x1420): IP4 or IP6 set, L4VLD set, L4F and IP4F clear, source port not 0 or 5 (the CPU ports). Whether the GDM sets L4VLD on frames whose TCP/UDP checksum it cannot have checked (another IP protocol, an IPv4 fragment) is not verified; debugfs rx_csum counts such frames among those marked. Without stag_en the GDM does not report IP4/IP6 for frames behind the MediaTek tag (seen on GS2107), so none is marked. */
+@@ -221,42 +233,53 @@ static bool en75_erx_l4_csum_ok(struct qdma_desc_erx *erx)
+ 	       (w & (ERX_IP4F | ERX_L4VLD | ERX_L4F)) == ERX_L4VLD;
+ }
+ 
++/*
++ * 处理第 cpu_i 项收到的帧，并当场给这一项换好缓冲（交还硬件由 en75_qdma_rx_process 统一写 rx_cpui）。
++ * 照原厂 qdma_bm_receive_packets：先拿新缓冲，拿不到就丢这一帧、把原缓冲挂回去，记 rxAllocFailDropErrs（GPL
++ * qdma_bmgr.i:61237-61242，“Revert received packet as new skb”）；带 drop 位的帧原厂同样丢掉并复用原缓冲
++ * （:61226-61234）。长度为 0（原厂记 rxDscpIncorrect 后就停止处理，:61217-61221）、超出缓冲、NLS 的帧原厂没有
++ * 对应的复用，这里一样丢掉并复用原缓冲。这样一项处理完总是带着缓冲交还，不会出现“处理过、却没换上缓冲”的项。
++ */
+ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+ 				     enum dma_data_direction dir)
+ {
+ 	struct en75_q_rx_ent *e = &q->entry[cpu_i];
++	void *buf = e->buf;
++	dma_addr_t dma_addr = e->dma_addr;
++	u16 dma_len = e->dma_len;
++	struct en75_q_rx_ent fresh;
+ 	struct sk_buff *skb;
+-	struct page *page;
+ 	struct desc desc;
+-	u16 dma_len = e->dma_len;
+ 	u8 sport;
+ 	int len;
+ 
+ 	memcpy(&desc, &q->desc[cpu_i], sizeof(desc));
+ 
+-	dma_sync_single_for_cpu(q->qdma->dev, e->dma_addr,
++	dma_sync_single_for_cpu(q->qdma->dev, dma_addr,
+ 				dma_len + EN75_RX_HW_OFFSET, dir);
+-	
+-	/* Not needed but a couple of WARN_ON_ONCE() check this later */
+-	e->dma_addr = 0;
+-
+-	/* Make debug more readable */
+-	WRITE_ONCE(q->desc[cpu_i].pkt_addr, 0);
+ 
+ 	/* 原厂 qdma_bmgr.c 收包时见到 drop_pkt 就记 rxDscpIncorrect、丢掉这一帧（GPL qdma_bmgr.i:61226-61234，打印“pkt size is overflow”） */
+ 	if (is_desc_info_dropped(&desc.info))
+-		goto return_page;
++		goto reuse;
+ 
+ 	len = get_desc_info_pkt_len(&desc.info);
+ 	if (!len || len > dma_len)
+-		goto return_page;
++		goto reuse;
+ 
+ 	if (WARN_ON_ONCE(is_desc_info_nls(&desc.info)))
+-		goto return_page;
+-
+-	skb = napi_build_skb(e->buf, q->buf_size);
+-	if (!skb)
+-		goto return_page;
++		goto reuse;
++
++	if (atomic_dec_if_positive(&en75_rx_alloc_fail) >= 0 ||
++	    !en75_rx_ent_alloc(q, &fresh, GFP_ATOMIC | __GFP_NOWARN))
++		goto reuse;
++	*e = fresh;
++
++	skb = napi_build_skb(buf, q->buf_size);
++	if (!skb) {
++		en75_rx_count_drop(q->qdma->eth, get_erx_sport(&desc.msg.erx));
++		page_pool_put_full_page(q->page_pool, virt_to_head_page(buf), false);
++		goto arm;
++	}
+ 
+ 	skb_reserve(skb, EN75_RX_HEADROOM);
+ 	__skb_put(skb, len);
+@@ -272,13 +295,15 @@ static void en75_qdma_rx_process_one(struct en75_q_rx *q, u32 cpu_i,
+ 		dev_kfree_skb(skb);
+ 	else
+ 		napi_gro_receive(&q->napi, skb);
++	goto arm;
+ 
+-	return;
+-
+-return_page:
++reuse:
+ 	en75_rx_count_drop(q->qdma->eth, get_erx_sport(&desc.msg.erx));
+-	page = virt_to_head_page(e->buf);
+-	page_pool_put_full_page(q->page_pool, page, false);
++	/* 原缓冲不经 page_pool 回收直接挂回，交给设备之前的同步要自己做（经回收的缓冲由 PP_FLAG_DMA_SYNC_DEV 同步） */
++	dma_sync_single_for_device(q->qdma->dev, dma_addr,
++				   dma_len + EN75_RX_HW_OFFSET, dir);
++arm:
++	en75_rx_desc_arm(q, cpu_i);
+ }
+ 
+ static int en75_qdma_rx_process(struct en75_q_rx *q, int budget)
+@@ -296,10 +321,13 @@ static int en75_qdma_rx_process(struct en75_q_rx *q, int budget)
+ 
+ 	for (done = 0; done < budget && cpu_i != hardware_i; done++) {
+ 		en75_qdma_rx_process_one(q, cpu_i, dir);
++		q->cpu_i = cpu_i;
+ 		cpu_i = (cpu_i + 1) % ndesc;
+ 	}
+ 
+-	en75_fill_rx_queue(q, cpu_i);
++	/* 处理过的项都已当场换好缓冲，一次交还给硬件（writel 自带写屏障，描述符先于门铃可见） */
++	if (done)
++		en75_wreg((u32)q->cpu_i, &q->qchain_regs->rx_cpui);
+ 
+ 	return done;
+ }
+@@ -854,6 +882,7 @@ static int en75_init_rx_queue(struct en75_q_rx *q,
+ 		.napi = &q->napi,
+ 	};
+ 	int threshold = clamp(ndesc >> 3, 1, 32);
++	int err;
+ 	struct qregs_rxring_size rrs;
+ 	struct qregs_rxring_low rrl;
+ 	dma_addr_t dma_addr;
+@@ -889,11 +918,12 @@ static int en75_init_rx_queue(struct en75_q_rx *q,
+ 
+ 	en75_wreg(dma_addr, &q->qchain_regs->rxbase);
+ 	
+-	/* en75_fill_rx_queue fills everything from current cpu index + 1 up to
+-	 * but excluding end_i, so to fill every entry we run it with 0 to do
+-	 * 1,2,3,[...],n, then we run it with 1 to do 0. */
+-	en75_fill_rx_queue(q, 0);
+-	en75_fill_rx_queue(q, 1);
++	/* 每一项都挂上缓冲；cpu_i 停在 0，即硬件可用 1..n-1，与下面 hwi = 1 配合 */
++	err = en75_fill_rx_queue(q);
++	if (err)
++		return err;
++	q->cpu_i = 0;
++	en75_wreg(0U, &q->qchain_regs->rx_cpui);
+ 
+ 	/* The RX hardware side considers that hwi == cpui means the queue is
+ 	 * full, not empty. Since cpui starts at 0, we initialize hwi to 1. */
+@@ -1261,15 +1291,17 @@ static void en75_qdma_destroy_rxq_locked(struct en75_q_rx *q)
+ 
+ 	for (i = 0; i < q->ndesc; i++) {
+ 		struct en75_q_rx_ent *e = &q->entry[i];
+-		struct page *page = virt_to_head_page(e->buf);
+ 
+-		if (WARN_ON_ONCE(!e->dma_addr))
++		/* 只有建环填到一半失败时才有没挂缓冲的项 */
++		if (!e->buf)
+ 			continue;
+ 
+ 		dma_sync_single_for_cpu(q->qdma->dev, e->dma_addr,
+ 					e->dma_len + EN75_RX_HW_OFFSET,
+ 					page_pool_get_dma_dir(q->page_pool));
+-		page_pool_put_full_page(q->page_pool, page, false);
++		page_pool_put_full_page(q->page_pool, virt_to_head_page(e->buf), false);
++		e->buf = NULL;
++		e->dma_addr = 0;
+ 	}
+ 
+ 	page_pool_destroy(q->page_pool);
+@@ -1293,8 +1325,11 @@ static int en75_qdma_destroy_locked(struct en75_qdma *qdma)
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+ 		struct en75_q_rx *q = &qdma->q_rx[i];
++
+ 		en75_qdma_destroy_rxq_locked(q);
+-		netif_napi_del(&q->napi);
++		/* 建环中途失败时后面的环还没登记 NAPI（napi.dev 为空，netif_napi_del() 会先锁 napi->dev） */
++		if (q->napi.dev)
++			netif_napi_del(&q->napi);
+ 	}
+ 
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++) {
