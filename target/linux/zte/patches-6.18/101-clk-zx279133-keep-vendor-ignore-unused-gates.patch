@@ -1,0 +1,111 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] clk: zx279133: 照原厂表保留没有驱动认领的 TOPCRM 门控
+
+给原厂运行时设备树 zx-clock,ignore-unused 标 1 的 TOPCRM 门控补 CLK_IGNORE_UNUSED：pvt_pclk（0x30 bit12），lsp1_25m、lsp1_32k、lsp1_pclk、spifc_wclk（0x38 bit21、22、23、16），pon_serdes_pclk、uni_serdes_pclk、uni_serdes_50m（0x44 bit0、8、9），pon_idm_aclk、pon_tm_aclk、pon_pclk（0x48 bit0、1、2）。原厂标 0 的 USB 三路（0x3c）与 tempsensor_wclk（0x40）不动；原厂 0x48 的表只给了 11 路里的前 4 项，表外的 pon_smac_wclk、pon_woe1_wclk、pon_mac_wclk 不动。
+
+从原厂系统 kexec 进来时这些门控开着、没有驱动认领，clk_disable_unused 会在启动后关掉它们：lsp1_25m 是核电压 PWM（pwm_wclk）的父时钟，关掉它核电压就冻在当时的占空比；PON/SerDes 门控下原厂 NP 的 DMA 可能还在跑。
+
+--- a/drivers/clk/clk-zx279133.c
++++ b/drivers/clk/clk-zx279133.c
+@@ -210,6 +210,10 @@
+ 	{ }
+ };
+ 
++/*
++ * 哪些 TOPCRM 门控标 CLK_IGNORE_UNUSED（clk_disable_unused 不关没人用的）照原厂运行时设备树 top_clk_gate0..6 的 zx-clock,ignore-unused 表：0x30 的 pvt_pclk，0x38 的 lsp0、lsp1 各路与 spifc_wclk，0x44 的 pon_serdes_pclk 与 uni_serdes 两路，0x48 的 pon_idm_aclk、pon_tm_aclk、pon_pclk 标；0x3c 的 USB 三路、0x40 的 tempsensor_wclk 原厂是 0，不标。原厂 0x48 的表只给了前 4 项（共 11 路时钟），pon_smac_wclk、pon_woe1_wclk、pon_mac_wclk 不在表内，按未列出不标。
++ * 从原厂系统 kexec 进来时这些门控开着却没有驱动认领：lsp1_25m 是核电压 PWM（pwm_wclk）的父时钟，关掉它核电压就冻在当时的占空比；PON/SerDes 门控下原厂 NP 的 DMA 可能还在跑。
++ */
+ static const struct zx279133_topcrm_gate_desc topcrm_gates[] = {
+ 	[ZX279133_TOPCRM_CLK_LSP0_100M] = {
+ 		.name = "lsp0_100m",
+@@ -234,21 +238,21 @@
+ 	},
+ 	[ZX279133_TOPCRM_CLK_LSP1_32K] = {
+ 		.name = "lsp1_32k",
+-		.flags = 0,
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_GATE_CTRL,
+ 		.bit_idx = 22,
+ 		.parent = ZX279133_PARENT_CLK32K,
+ 	},
+ 	[ZX279133_TOPCRM_CLK_LSP1_PCLK] = {
+ 		.name = "lsp1_pclk",
+-		.flags = 0,
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_GATE_CTRL,
+ 		.bit_idx = 23,
+ 		.parent = ZX279133_PARENT_SYS_PCLK,
+ 	},
+ 	[ZX279133_TOPCRM_CLK_LSP1_25M] = {
+ 		.name = "lsp1_25m",
+-		.flags = 0,
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_GATE_CTRL,
+ 		.bit_idx = 21,
+ 		.parent = ZX279133_PARENT_CLK25M,
+@@ -261,7 +265,7 @@
+ 	},
+ 	[ZX279133_TOPCRM_CLK_SPIFC_WCLK] = {
+ 		.name = "spifc_wclk",
+-		.flags = 0,
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_SPIFC_GATE_CTRL,
+ 		.bit_idx = ZX279133_TOPCRM_SPIFC_GATE_BIT,
+ 		.parent = ZX279133_PARENT_CLK100M,
+@@ -289,25 +293,28 @@
+ 	},
+ 	[ZX279133_TOPCRM_CLK_PVT_PCLK] = {
+ 		.name = "pvt_pclk",
+-		.flags = 0,
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_PVT_PCLK_GATE_CTRL,
+ 		.bit_idx = ZX279133_TOPCRM_PVT_PCLK_GATE,
+ 		.parent = ZX279133_PARENT_CLK172M,
+ 	},
+ 	[ZX279133_TOPCRM_CLK_PON_IDM_ACLK] = {
+ 		.name = "pon_idm_aclk",
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_PON_GATE_CTRL,
+ 		.bit_idx = 0,
+ 		.parent = ZX279133_PARENT_SYS_ACLK,
+ 	},
+ 	[ZX279133_TOPCRM_CLK_PON_TM_ACLK] = {
+ 		.name = "pon_tm_aclk",
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_PON_GATE_CTRL,
+ 		.bit_idx = 1,
+ 		.parent = ZX279133_PARENT_SYS_ACLK,
+ 	},
+ 	[ZX279133_TOPCRM_CLK_PON_PCLK] = {
+ 		.name = "pon_pclk",
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_PON_GATE_CTRL,
+ 		.bit_idx = 2,
+ 		.parent = ZX279133_PARENT_SYS_PCLK,
+@@ -689,7 +696,7 @@
+ 
+ 	hw = devm_clk_hw_register_gate_parent_hw(dev, "uni_serdes_pclk",
+ 						 priv->parents[ZX279133_PARENT_SYS_PCLK],
+-						 0,
++						 CLK_IGNORE_UNUSED,
+ 						 base + ZX279133_TOPCRM_UNI_SERDES_GATE_CTRL,
+ 						 8, 0, &priv->lock);
+ 	if (IS_ERR(hw))
+@@ -699,7 +706,7 @@
+ 
+ 	hw = devm_clk_hw_register_gate_parent_hw(dev, "uni_serdes_50m",
+ 						 priv->parents[ZX279133_PARENT_CLK50M],
+-						 0,
++						 CLK_IGNORE_UNUSED,
+ 						 base + ZX279133_TOPCRM_UNI_SERDES_GATE_CTRL,
+ 						 9, 0, &priv->lock);
+ 	if (IS_ERR(hw))
+@@ -709,7 +716,7 @@
+ 
+ 	hw = devm_clk_hw_register_gate_parent_hw(dev, "pon_serdes_pclk",
+ 						 priv->parents[ZX279133_PARENT_SYS_PCLK],
+-						 0,
++						 CLK_IGNORE_UNUSED,
+ 						 base + ZX279133_TOPCRM_UNI_SERDES_GATE_CTRL,
+ 						 0, 0, &priv->lock);
+ 	if (IS_ERR(hw))
