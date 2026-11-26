@@ -1,0 +1,3 @@
+# 用户级 attributes 可能把 .dts/.dtsi 判成 binary（econet 子树同款覆盖）：这里显式清掉 binary/diff/merge 的 unset，DTS 改动以文本 diff 进出、能逐行评审。
+*.dts -binary diff merge text eol=lf
+*.dtsi -binary diff merge text eol=lf
