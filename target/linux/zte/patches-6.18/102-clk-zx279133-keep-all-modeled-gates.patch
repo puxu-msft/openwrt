@@ -1,0 +1,94 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] clk: zx279133: 建了模的门控一律保留，依据改为原厂内核的实测标志
+
+101 照原厂运行时设备树的 zx-clock,ignore-unused 表给部分 TOPCRM 门控补了 CLK_IGNORE_UNUSED，那张表与原厂内核实际的标志不一致：2026-11-27 经原厂运行内核的 debugfs 读 /sys/kernel/debug/clk/<名>/clk_flags，原厂 105 路时钟都标了 CLK_IGNORE_UNUSED 或 CLK_IS_CRITICAL，本驱动建了模的 38 路门控全在其中，表外的 pon_smac_clk、pon_woe1_wclk、pon_mac_clk 也是，enable、prepare 计数都是 0（原厂驱动不经时钟框架开关它们）。本补丁给剩下 11 路补上：tempsensor_wclk、usb_pclk、usb_cci_aclk、usb_aclk、pon_smac_wclk、pon_mac_wclk、pon_woe1_wclk、efuse_pclk、efuse_wclk、sfc_pclk、sfc_wclk，并改写 101 加的注释。
+
+--- a/drivers/clk/clk-zx279133.c
++++ b/drivers/clk/clk-zx279133.c
+@@ -72,7 +72,7 @@
+ #define ZX279133_TOPCRM_SPIFC_GATE_CTRL	0x38
+ #define ZX279133_TOPCRM_SPIFC_GATE_BIT	16
+ #define ZX279133_TOPCRM_USB_GATE_CTRL	0x3c
+-#define ZX279133_TOPCRM_USB_GATE_FLAGS	0
++#define ZX279133_TOPCRM_USB_GATE_FLAGS	CLK_IGNORE_UNUSED
+ #define ZX279133_LSP_SPIFC_CLK_CTRL	0x2c
+ #define ZX279133_LSP_SPIFC_PCLK_GATE	0
+ #define ZX279133_LSP_SPIFC_WCLK_GATE	1
+@@ -211,7 +211,7 @@
+ };
+ 
+ /*
+- * 哪些 TOPCRM 门控标 CLK_IGNORE_UNUSED（clk_disable_unused 不关没人用的）照原厂运行时设备树 top_clk_gate0..6 的 zx-clock,ignore-unused 表：0x30 的 pvt_pclk，0x38 的 lsp0、lsp1 各路与 spifc_wclk，0x44 的 pon_serdes_pclk 与 uni_serdes 两路，0x48 的 pon_idm_aclk、pon_tm_aclk、pon_pclk 标；0x3c 的 USB 三路、0x40 的 tempsensor_wclk 原厂是 0，不标。原厂 0x48 的表只给了前 4 项（共 11 路时钟），pon_smac_wclk、pon_woe1_wclk、pon_mac_wclk 不在表内，按未列出不标。
++ * 本驱动建了模的门控（TOPCRM 与下面 LSP0、LSP1 两组）一律标 CLK_IGNORE_UNUSED，clk_disable_unused 不关没人用的：依据是原厂运行内核的实测（2026-11-27 经 debugfs 读 /sys/kernel/debug/clk/<名>/clk_flags），原厂内核 105 路时钟都标了 CLK_IGNORE_UNUSED 或 CLK_IS_CRITICAL，本驱动建了模的门控全在其中；原厂驱动也不经时钟框架开关它们（enable、prepare 计数都是 0），靠的是固件留下的门控状态。原厂运行时设备树里 zx-clock,ignore-unused 那张表与内核实际的标志不一致，不作依据。
+  * 从原厂系统 kexec 进来时这些门控开着却没有驱动认领：lsp1_25m 是核电压 PWM（pwm_wclk）的父时钟，关掉它核电压就冻在当时的占空比；PON/SerDes 门控下原厂 NP 的 DMA 可能还在跑。
+  */
+ static const struct zx279133_topcrm_gate_desc topcrm_gates[] = {
+@@ -259,7 +259,7 @@
+ 	},
+ 	[ZX279133_TOPCRM_CLK_TEMPSENSOR_WCLK] = {
+ 		.name = "tempsensor_wclk",
+-		.flags = 0,
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_PVT_GATE_CTRL,
+ 		.bit_idx = 0,
+ 	},
+@@ -321,12 +321,14 @@
+ 	},
+ 	[ZX279133_TOPCRM_CLK_PON_SMAC_WCLK] = {
+ 		.name = "pon_smac_wclk",
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_PON_GATE_CTRL,
+ 		.bit_idx = 7,
+ 		.parent = ZX279133_PARENT_CLK125M,
+ 	},
+ 	[ZX279133_TOPCRM_CLK_PON_MAC_WCLK] = {
+ 		.name = "pon_mac_wclk",
++		.flags = CLK_IGNORE_UNUSED,
+ 		.reg_offset = ZX279133_TOPCRM_PON_GATE_CTRL,
+ 		.bit_idx = 12,
+ 		.parent = ZX279133_PARENT_CLK250M,
+@@ -727,7 +729,7 @@
+ 	/* NPPT uses the vendor-named PON WOE1 working-clock path. */
+ 	hw = devm_clk_hw_register_gate_parent_hw(dev, "pon_woe1_wclk",
+ 						 priv->parents[ZX279133_PARENT_PON_NPPT_WCLK_MUX],
+-						 0,
++						 CLK_IGNORE_UNUSED,
+ 						 base + ZX279133_TOPCRM_PON_GATE_CTRL,
+ 						 10, 0, &priv->lock);
+ 	if (IS_ERR(hw))
+@@ -1057,7 +1059,7 @@
+ 
+ 	reg = base + ZX279133_EFUSE_CLK_CTRL;
+ 	hw = devm_clk_hw_register_gate_parent_data(dev, "efuse_pclk",
+-						   &lsp1_pclk_parent, 0, reg,
++						   &lsp1_pclk_parent, CLK_IGNORE_UNUSED, reg,
+ 						   ZX279133_EFUSE_PCLK_GATE, 0,
+ 						   &priv->lock);
+ 	if (IS_ERR(hw))
+@@ -1066,7 +1068,7 @@
+ 	priv->data.hws[ZX279133_LSP1_CLK_EFUSE_PCLK] = hw;
+ 
+ 	hw = devm_clk_hw_register_gate_parent_data(dev, "efuse_wclk",
+-						   &lsp1_wclk25m_parent, 0, reg,
++						   &lsp1_wclk25m_parent, CLK_IGNORE_UNUSED, reg,
+ 						   ZX279133_EFUSE_WCLK_GATE, 0,
+ 						   &priv->lock);
+ 	if (IS_ERR(hw))
+@@ -1224,7 +1226,7 @@
+ 	priv->spifc_reg = reg;
+ 
+ 	hw = devm_clk_hw_register_gate_parent_data(dev, "sfc_pclk",
+-						   &uart0_pclk_parent, 0, reg,
++						   &uart0_pclk_parent, CLK_IGNORE_UNUSED, reg,
+ 						   ZX279133_LSP_SPIFC_PCLK_GATE,
+ 						   0, &priv->lock);
+ 	if (IS_ERR(hw))
+@@ -1247,7 +1249,7 @@
+ 						  &priv->spifc_wclk_divider.hw,
+ 						  &clk_divider_ops,
+ 						  &priv->spifc_wclk_gate.hw,
+-						  &clk_gate_ops, 0);
++						  &clk_gate_ops, CLK_IGNORE_UNUSED);
+ 	if (IS_ERR(hw))
+ 		return dev_err_probe(dev, PTR_ERR(hw),
+ 				     "failed to register SPI-FC WCLK\n");
