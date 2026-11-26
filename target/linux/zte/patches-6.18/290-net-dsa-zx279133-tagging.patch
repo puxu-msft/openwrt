@@ -1,0 +1,190 @@
+From: cnjn <1779895255@qq.com>
+Subject: [PATCH] net: dsa: add ZX279133 transport-VID tagging
+
+LAN conduit 与交换机 CPU 口之间按传输 VID（55 + DSA 口号）分口的 tagger；ZX279133 的 9132 驱动与 SR1010 的 RTL8372N 驱动共用。
+
+来源：https://github.com/cnjn/linux-mainline-zte-zxslc-sr1010 68acd82bb42f（Linux 6.18.38）..96e5a2413524 之间这些路径的差异，内容原样，按 OpenWrt 的 6.18.60 刷新了行号偏移。
+与来源的差别：
+- DSA_TAG_PROTO_ZX279133_RTL8372N_VALUE 取 36（OpenWrt 6.18 的通用补丁已把 30–34 给了 MXL862、YT92x；35 留给 coolsnowwolf/lede 里的 MT7628，与它的取值一致）；
+- include/net/dsa_zx279133_rtl8372n.h 取 https://github.com/woodnaonly/zx279133-ponwrt-build 7995c29197b8 的版本：USER_PORT_MAX 由 7 改 8，9132 的 2.5G 口是 DSA 8 号口（传输 VID 63）；
+- 不带 net/dsa/user.c 的自测字符串改动（只有实现 self_test 的交换机驱动用得到，9132 驱动没有）。
+
+--- a/include/net/dsa.h
++++ b/include/net/dsa.h
+@@ -60,6 +60,7 @@
+ #define DSA_TAG_PROTO_YT921X_VALUE		32
+ #define DSA_TAG_PROTO_YT922X_VALUE		33
+ #define DSA_TAG_PROTO_YT922X_4B_VALUE		34
++#define DSA_TAG_PROTO_ZX279133_RTL8372N_VALUE	36
+ 
+ enum dsa_tag_protocol {
+ 	DSA_TAG_PROTO_NONE		= DSA_TAG_PROTO_NONE_VALUE,
+@@ -97,6 +98,7 @@
+ 	DSA_TAG_PROTO_YT921X		= DSA_TAG_PROTO_YT921X_VALUE,
+ 	DSA_TAG_PROTO_YT922X		= DSA_TAG_PROTO_YT922X_VALUE,
+ 	DSA_TAG_PROTO_YT922X_4B		= DSA_TAG_PROTO_YT922X_4B_VALUE,
++	DSA_TAG_PROTO_ZX279133_RTL8372N = DSA_TAG_PROTO_ZX279133_RTL8372N_VALUE,
+ };
+ 
+ struct dsa_switch;
+--- /dev/null
++++ b/include/net/dsa_zx279133_rtl8372n.h
+@@ -0,0 +1,32 @@
++/* SPDX-License-Identifier: GPL-2.0-only */
++#ifndef _NET_DSA_ZX279133_RTL8372N_H
++#define _NET_DSA_ZX279133_RTL8372N_H
++
++/*
++ * The tree's copy of this header, with one number changed.
++ *
++ * The tagger (net/dsa/tag_zx279133_rtl8372n.c) accepts a frame's transport
++ * VID only if it lies between TRANSPORT_VID_BASE + USER_PORT_MIN and
++ * TRANSPORT_VID_BASE + USER_PORT_MAX, and the tree's own SR1010 has the four
++ * user ports 4..7 - so the tree's USER_PORT_MAX is 7 and the largest VID the
++ * tagger will look at is 62.
++ *
++ * The 9132 on SK-D840N has a fifth user port: the 2.5G jack is the 9132's
++ * fifth UNI port (the vendor's outerphy, PPU 5) and it is DSA port 8, so it
++ * carries the transport VID 55 + 8 = 63 (docs/92 §90).  A VID of 63 is
++ * outside the tree's range, so the tagger would refuse every frame that came
++ * in on the 2.5G jack and drop it: the frame would arrive with the right tag
++ * and leave with nothing.
++ *
++ * Raising USER_PORT_MAX to 8 is the whole of the change.  It widens the range
++ * the tagger accepts by exactly one VID, and the tagger's transmit side is
++ * already generic (it writes BASE + dp->index), so the port number itself is
++ * never spelled out.  On the SR1010 nothing changes: its ports are 4..7, so
++ * the tagger still finds no user port for a VID of 63 and drops such a frame
++ * exactly as it did before - and the tree's own four ports are untouched.
++ */
++#define ZX279133_RTL8372N_USER_PORT_MIN	4
++#define ZX279133_RTL8372N_USER_PORT_MAX	8
++#define ZX279133_RTL8372N_TRANSPORT_VID_BASE	55
++
++#endif /* _NET_DSA_ZX279133_RTL8372N_H */
+--- a/net/dsa/Kconfig
++++ b/net/dsa/Kconfig
+@@ -198,6 +198,14 @@
+ 	  Say Y or M if you want to enable support for tagging frames with a
+ 	  custom VLAN-based header.
+ 
++config NET_DSA_TAG_ZX279133_RTL8372N
++	tristate "Tag driver for ZX279133 connected RTL8372N switches"
++	help
++	  Say Y or M to use the RTL8372N 8-byte protocol-4 CPU tag between the
++	  ZX279133 LAN conduit and external CPU port 8. This tagger completes
++	  partial checksums in software because the ZX279133 TX parser cannot
++	  locate the network header behind EtherType 0x8899.
++
+ config NET_DSA_TAG_XRS700X
+ 	tristate "Tag driver for XRS700x switches"
+ 	help
+--- a/net/dsa/Makefile
++++ b/net/dsa/Makefile
+@@ -40,6 +40,7 @@
+ obj-$(CONFIG_NET_DSA_TAG_SJA1105) += tag_sja1105.o
+ obj-$(CONFIG_NET_DSA_TAG_TRAILER) += tag_trailer.o
+ obj-$(CONFIG_NET_DSA_TAG_VSC73XX_8021Q) += tag_vsc73xx_8021q.o
++obj-$(CONFIG_NET_DSA_TAG_ZX279133_RTL8372N) += tag_zx279133_rtl8372n.o
+ obj-$(CONFIG_NET_DSA_TAG_XRS700X) += tag_xrs700x.o
+ obj-$(CONFIG_NET_DSA_TAG_YT921X) += tag_yt921x.o
+ obj-$(CONFIG_NET_DSA_TAG_YT922X) += tag_yt922x.o
+--- /dev/null
++++ b/net/dsa/tag_zx279133_rtl8372n.c
+@@ -0,0 +1,96 @@
++// SPDX-License-Identifier: GPL-2.0-only
++/* Factory-style RTL8372N S-VLAN tag on the SR1010 external CPU port. */
++#include <linux/etherdevice.h>
++#include <linux/if_vlan.h>
++#include <net/dsa_zx279133_rtl8372n.h>
++
++#include "tag.h"
++
++#define ZX279133_RTL8372N_TAG_NAME	"zx279133-rtl8372n"
++
++static struct sk_buff *
++zx279133_rtl8372n_xmit(struct sk_buff *skb, struct net_device *netdev)
++{
++	struct dsa_port *dp = dsa_user_to_port(netdev);
++	__be16 tag[VLAN_HLEN / sizeof(__be16)] = {
++		htons(ETH_P_8021Q),
++		htons(ZX279133_RTL8372N_TRANSPORT_VID_BASE + dp->index),
++	};
++
++	/* The switch removes the service tag before transmission, so pad the
++	 * original Ethernet frame rather than relying on conduit-side padding.
++	 */
++	if (unlikely(eth_skb_pad(skb)))
++		return NULL;
++
++	skb_push(skb, VLAN_HLEN);
++	dsa_alloc_etype_header(skb, VLAN_HLEN);
++	memcpy(dsa_etype_header_pos_tx(skb), tag, sizeof(tag));
++
++	return skb;
++}
++
++static struct sk_buff *
++zx279133_rtl8372n_rcv(struct sk_buff *skb, struct net_device *netdev)
++{
++	__be16 tag[VLAN_HLEN / sizeof(__be16)];
++	bool inline_tag = false;
++	__be16 vlan_proto;
++	u16 tci;
++	u16 vid;
++	u8 port;
++
++	if (skb_vlan_tag_present(skb)) {
++		vlan_proto = skb->vlan_proto;
++		tci = skb_vlan_tag_get(skb);
++	} else {
++		if (unlikely(!pskb_may_pull(skb, VLAN_HLEN)))
++			return NULL;
++		memcpy(tag, dsa_etype_header_pos_rx(skb), sizeof(tag));
++		vlan_proto = tag[0];
++		tci = ntohs(tag[1]);
++		inline_tag = true;
++	}
++	if (unlikely(!eth_type_vlan(vlan_proto)))
++		return NULL;
++
++	vid = tci & VLAN_VID_MASK;
++	if (unlikely(vid < ZX279133_RTL8372N_TRANSPORT_VID_BASE +
++			   ZX279133_RTL8372N_USER_PORT_MIN ||
++		     vid > ZX279133_RTL8372N_TRANSPORT_VID_BASE +
++			   ZX279133_RTL8372N_USER_PORT_MAX))
++		return NULL;
++	port = vid - ZX279133_RTL8372N_TRANSPORT_VID_BASE;
++
++	skb->dev = dsa_conduit_find_user(netdev, 0, port);
++	if (!skb->dev)
++		return NULL;
++	/* DSA user ports expose one RX queue, independently of conduit workers. */
++	skb_record_rx_queue(skb, 0);
++
++	if (inline_tag) {
++		skb_pull_rcsum(skb, VLAN_HLEN);
++		dsa_strip_etype_header(skb, VLAN_HLEN);
++	} else {
++		__vlan_hwaccel_clear_tag(skb);
++	}
++	dsa_default_offload_fwd_mark(skb);
++
++	return skb;
++}
++
++static const struct dsa_device_ops zx279133_rtl8372n_netdev_ops = {
++	.name			= ZX279133_RTL8372N_TAG_NAME,
++	.proto			= DSA_TAG_PROTO_ZX279133_RTL8372N,
++	.xmit			= zx279133_rtl8372n_xmit,
++	.rcv			= zx279133_rtl8372n_rcv,
++	.needed_headroom	= VLAN_HLEN,
++	.promisc_on_conduit	= true,
++};
++
++MODULE_ALIAS_DSA_TAG_DRIVER(DSA_TAG_PROTO_ZX279133_RTL8372N,
++			    ZX279133_RTL8372N_TAG_NAME);
++module_dsa_tag_driver(zx279133_rtl8372n_netdev_ops);
++
++MODULE_LICENSE("GPL");
++MODULE_DESCRIPTION("DSA S-VLAN tagger for ZX279133 connected RTL8372N");
