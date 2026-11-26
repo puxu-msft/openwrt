@@ -7,14 +7,15 @@ board_config_update
 
 case "$(board_name)" in
 zte,f7615mv3)
-	# LAN 桥：面板四个口（lan1 = 2.5G 口，lan2..4 = 千兆口），加上 9132 的 0 号口 lan0（面板不接）与 CPU 口的 conduit lan-cpu0。
-	# lan-cpu0 必须在桥里：发给本机的帧经 9132 的 CPU 口进 conduit，桥里没有它，帧到了 conduit 就丢（SK-D840N 实测，woodnaonly 的 board.d/02_network 与 init.d/sk-bridge）。
+	# LAN 桥：面板四个口（lan1 = 2.5G 口，lan2..4 = 千兆口）加上 9132 的 0 号口 lan0（面板不接）。
+	# CPU 口的 conduit lan-cpu0 不进桥：6.18 的 dsa_bridge_prechangelower_sanity_check() 拒绝 DSA conduit 与 DSA 口同桥（"Cannot do software bridging with a DSA conduit"），它若先入桥，后面的 lanN 全被拒；收侧由 tagger 把帧分到各 lanN，DSA 口打开时内核自己把 conduit 拉起（net/dsa/user.c 的 dsa_user_open）。woodnaonly 的 docs/26、docs/64 记的也是“主口不在桥里是对的、内核拒加”。
 	# 只列此刻在的口：9132 驱动没起来时退到 conduit 本身，再不行退到 NPPT 的 eth0（PON 侧），总有一个口带着地址。
 	# 地址 192.168.1.1/24 与原厂 LAN 相同，主机经原厂用的那段直连可达；DHCP 与路由通告由 uci-defaults 的 90_f7615mv3-lan-services 关掉。
 	ports=""
-	for d in lan1 lan2 lan3 lan4 lan0 lan-cpu0; do
+	for d in lan1 lan2 lan3 lan4 lan0; do
 		[ -e "/sys/class/net/$d" ] && ports="$ports${ports:+ }$d"
 	done
+	[ -n "$ports" ] || { [ -e /sys/class/net/lan-cpu0 ] && ports=lan-cpu0; }
 	[ -n "$ports" ] || ports=eth0
 	ucidef_set_interface "lan" device "$ports" protocol "static" \
 		ipaddr "192.168.1.1" netmask "255.255.255.0"

@@ -3,7 +3,7 @@ Subject: [PATCH] net: ethernet: zte: zx279133: 修掉 -Werror 拦下的几处
 
 OpenWrt 的内核配置开着 CONFIG_WERROR，390、395 原样编译有下面几处错误（woodnaonly 的构建不开 -Werror，只是告警）：
 
-- zx279133-main.c 的三张寄存器表把偏移存在 u16 里，RED 的寄存器在 NPPT 的 0x20004–0x2008c，存进去只剩低 16 位：zx279133_red_vendor_fixup() 本意是把 RED 改回原厂板子的值，实际写到了 NPPT 0x0004–0x008c（nppt_greg 一段），RED 本身没改到；诊断转储读的也是错的地址。woodnaonly 的 docs/66 记过“驱动写了原厂的值、板子读回却是别的”，就是这个截断。改成 u32，写到本意的 RED 寄存器。
+- zx279133-main.c 的三张寄存器表（zx279133_red_vendor_fixup() 的 RED 表、zx279133_tm_vendor_fixup() 的 QMG/SMCT 表、zx279133_diag_dump() 的诊断表）把偏移存在 u16 里：RED 在 NPPT 的 0x20004–0x20368、QMG 在 0x24014–0x24060，存进去只剩低 16 位，本意是把 RED 与 QMG 改回原厂板子的值，实际写到了 NPPT 0x0004–0x0368（nppt_greg）与 0x4014–0x4060（SIPC），RED 与 QMG 本身没改到（SMCT 在 0xc000 一带，不受影响）；诊断转储读的也是错的地址。woodnaonly 的 docs/66 记过“驱动写了原厂的值、板子读回却是别的”，就是这个截断。改成 u32，写到本意的 RED 与 QMG 寄存器。
 - zx279133-main.c 的 err_clk_disable 标签没有 goto 用到，删掉标签（下面的语句照旧顺序执行）。
 - zx279133-tm.c 以 %#x 打印 phys_addr_t，改 %pa。
 - zx279133-np.c 的调试控制台写入函数在栈上放 4 KiB 的命令缓冲，超过内核的栈帧上限 2048：缓冲改由 memdup_user_nul() 放到堆上，命令解析挪进 zx279133_9132_cmd()，长度上限仍是 4095；另一处 GENMASK 的结果按 %u 打印，加 u32 转换。

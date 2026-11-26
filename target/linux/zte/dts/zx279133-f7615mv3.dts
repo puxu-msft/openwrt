@@ -119,7 +119,7 @@
  * 拓扑与端口号照创维 SK-D840N 的板级文件（woodnaonly/zx279133-ponwrt-build kernel-overlays/arch/arm64/boot/dts/zte/zx279133-sk-d840n.dts，同 SoC、同样 3 个千兆口 + 1 个 2.5G 口），本机原厂启动日志与之一致的地方：
  *   - 原厂四个 LAN 网口 eth0=uni4、eth1..3=uni1..3（facts:2357–2360），交换机 `unicnt 4, wancnt 1, all ports 5, portmask 0x9e`（facts:2624，bit 0 不在，9132 的 0 号口不接面板）；
  *   - 限速表里 port 4 为 2.5 Gbps、port 1..3 为 1 Gbps（facts:2679–2686）：千兆口是 uni1..3，2.5G 口是 uni4（外置 Realtek 8226B，原厂 `xmac0 type rlt8226`，facts:2398）；
- *   - SK-D840N 的 U-Boot 同样只报 mac 1/2/4 的链路、mac 0 恒 down（其 docs/07 补九十六），与本机 `mac 1..3 link down`、`mac 4 phy status changed`（facts:2408–2410、2702）同一套编号。
+ *   - SK-D840N 的 U-Boot 同样只报 mac 1/2/4 的链路、mac 0 恒 down（其 docs/07 补七十），与本机 `mac 1..3 link down`、`mac 4 phy status changed`（facts:2408–2410、2702）同一套编号。
  * 面板丝印与 lanN 的对应未与原厂核对：按原厂 ethN 与面板 LAN(N+1) 的惯例推断 lan1 = 2.5G 口、lan2..4 = 千兆口（iTV、千兆口3、千兆口4 的次序待插线核对）。
  */
 &mdio0 {
@@ -147,13 +147,13 @@
 };
 
 &nppt {
-	/* PON 侧 MAC（XMAC1 + PON SerDes + XPCS1）跑 SGMII，取值照 SK-D840N：uni SerDes 驱动只收 USXGMII/10GBASE-R，PON SerDes 收 SGMII/2.5GBASE-X；本机原厂把 PON SerDes 配成 XG-PON（facts `mode_xgpon_nsyn_cfg`），这里不接 PON，未与原厂核对 */
+	/* PON 侧 MAC（XMAC1 + PON SerDes + XPCS1）跑 SGMII，取值照 SK-D840N：Uni SerDes 与 XPCS0 归 9132 交换驱动（它的 CPU 口车道），NPPT 用 PON SerDes（驱动收 SGMII/2.5GBASE-X）；本机原厂把 PON SerDes 配成 XG-PON（facts `mode_xgpon_nsyn_cfg`），这里不接 PON，未与原厂核对 */
 	phy-mode = "sgmii";
 	memory-region = <&bmu_reserved>, <&se_hash_reserved>, <&idm_reserved>;
 	memory-region-names = "bmu", "se-hash", "idm";
 	/*
 	 * MAC 地址（临时规避，见 docs/TASKS.md「临时规避：LAN MAC 写死在设备树」）：原厂的 8 个 MAC 在 parameter tags 分区（mtd3，JFFS2）里的文件 paramtag 中，TAGH0201 格式、tag 0x0100..0x0107 各 6 字节，依次是 80:88:00:c0:73:22..29，LAN 侧用第一个（facts:2688 的 `set dmac [0]`）；本内核不开 SPI-NAND，读不到，先写一个本地管理地址：原厂第一个 MAC 的首字节置 U/L 位（0x80 → 0x82）。
-	 * NPPT 把这个地址写进 9132 的 SPA 作 CPU 收帧的目的 MAC（zx279133-np.c 的 zx279133_program_spa_cpu_mac），conduit 与 DSA 口沿用同一个，所以两处一致。
+	 * NPPT 把这个地址写进 9132 的 SPA 作 CPU 收帧的目的 MAC（zx279133-np.c 的 zx279133_program_spa_cpu_mac）；conduit 注册时复制 NPPT 的地址（zx279133-netdev.c 的 eth_hw_addr_set(ndev, eth->ndev->dev_addr)，conduit 节点只在有 nvmem-cells 时才自己读），DSA 口与 br-lan 建立时再沿用 conduit 的。
 	 */
 	local-mac-address = [82 88 00 c0 73 22];
 	/* 9132 的内部 GE PHY 在 MDIO0 的 0x0a..0x0d，外置 2.5G PHY 在 MDIO1：原厂运行时设备树两个 MDIO 节点的 uni-phy = <0x0a 0x0b 0x0c 0x0d 0x05 0x1c 0x02>（runtime-dts:1291、1302），与 SK-D840N 相同 */
@@ -166,24 +166,23 @@
 		full-duplex;
 	};
 
-	/* 9132 CPU 口上的 conduit；驱动从本节点读 MAC（of_get_ethdev_address(dev->of_node)），写在父节点上读不到 */
+	/* 9132 CPU 口上的 conduit（DSA 的 CPU 侧 netdev lan-cpu0），MAC 随 NPPT */
 	lan_cpu: ethernet-lan-cpu {
 		compatible = "zte,zx279133-lan-conduit";
-		local-mac-address = [82 88 00 c0 73 22];
 	};
 
 	switch {
 		compatible = "zte,zx279133-switch";
 
 		/*
-		 * DSA 口号 = 9132 PPU 口号 + 3，传输 VID = 55 + DSA 口号（tagger 与 NPPT 驱动的同一套编号）。四个内部 PHY 口没有 PHY 驱动可绑（ID 0x84b9:0x5032 无匹配），照 SK-D840N 用 fixed-link：软件看到的链路恒为 1G 全双工，实际链路由 9132 自己读 PHY 决定。
+		 * DSA 口号 = 9132 的 PPU 口号 + 3 = 原厂交换口号（facts 的 uniN、mac N）+ 4，传输 VID = 55 + DSA 口号（tagger 与 NPPT 驱动的同一套编号）。四个内部 PHY 口没有 PHY 驱动可绑（ID 0x84b9:0x5032 无匹配），照 SK-D840N 用 fixed-link：软件看到的链路恒为 1G 全双工，实际链路由 9132 自己读 PHY 决定。
 		 * lan1 的外置 PHY 不在本树声明（SK-D840N 实测：phylib 一绑上 realtek 驱动就改写它的 SerDes 选项），驱动按固定地址 5 直接读写；本机原厂日志 `xmac_phy_id[0] 1`（facts:2398）与 SK-D840N 的地址 5 是否同义未核对，2.5G 口按未验证处理。
 		 */
 		ports {
 			#address-cells = <1>;
 			#size-cells = <0>;
 
-			/* 9132 的 0 号口（PHY 0x0a）：本机面板不接（portmask 0x9e 不含 bit 0），照 SK-D840N 留作内部口、并进 LAN 桥 */
+			/* 原厂交换口 0（PPU 口 1，PHY 0x0a）：本机面板不接（portmask 0x9e 不含 bit 0），照 SK-D840N 留作内部口、并进 LAN 桥 */
 			port@4 {
 				reg = <4>;
 				label = "lan0";
@@ -228,7 +227,7 @@
 				};
 			};
 
-			/* 2.5G 口：9132 的第五个用户口（原厂的 outerphy、uni4），2500BASE-X 到外置 PHY；速率与链路由驱动从 PHY 的 1f.0xa434 读出后覆盖这里的上限 */
+			/* 2.5G 口：9132 的第五个用户口（原厂的 outerphy、uni4，PPU 口 5），2500BASE-X 到外置 PHY；速率与链路由驱动从 PHY 的 1f.0xa434 读出后覆盖这里的上限 */
 			port@8 {
 				reg = <8>;
 				label = "lan1";
