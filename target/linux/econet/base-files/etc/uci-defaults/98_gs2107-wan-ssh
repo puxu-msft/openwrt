@@ -1,0 +1,19 @@
+. /lib/functions.sh
+
+# WAN 侧放行 SSH 入站（IPv4 与 IPv6）作为出厂配置（用户 2026-11-27 定）：GS2107 常驻家庭网，主机经无线到它的 WAN 侧管理、并以它为跳板进 LAN 段的盒子；长按复位恢复出厂或不保留配置的升级之后，没有这条规则主机就连不上它。
+# 认证照 94_gs2107-ssh-key-only 只认公钥（镜像自带的 /etc/dropbear/authorized_keys）。WAN 侧的 IPv4 在家庭路由器 NAT 之后、只有家庭网内可达；IPv6 全局地址能否从公网连到 22 取决于家庭路由器是否放行入站。
+# 段名、规则与 gs2107 的 tools/openwrt/gs2107-provision.sh 第 5e 步相同（那一步给已部署的设备用）；不带版本标记，每次出现都运行（firstboot、保留配置的 sysupgrade 之后），重建同名段，结果相同。
+case "$(board_name)" in
+chinamobile,gs2107)
+	uci -q delete firewall.gs2107_wan_ssh
+	uci set firewall.gs2107_wan_ssh=rule
+	uci set firewall.gs2107_wan_ssh.name='Allow-SSH-WAN'
+	uci set firewall.gs2107_wan_ssh.src='wan'
+	uci set firewall.gs2107_wan_ssh.proto='tcp'
+	uci set firewall.gs2107_wan_ssh.dest_port='22'
+	uci set firewall.gs2107_wan_ssh.target='ACCEPT'
+	uci commit firewall
+	;;
+esac
+
+exit 0
