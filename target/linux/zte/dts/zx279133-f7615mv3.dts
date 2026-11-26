@@ -54,6 +54,18 @@
 			reg = <0x0 0x9b200000 0x0 0x1c00000>;
 			no-map;
 		};
+
+		/*
+		 * 崩溃现场（pstore/ramoops）：oops、panic 与锁死检测触发的 panic 写进前 512 KiB 的 4 条记录，控制台输出写进后 512 KiB，交接后挂死、被看门狗复位回原厂系统后，在原厂系统里用 U 盘上的 ramoops-read.sh 只读读出（或下次我们的内核起来时由 /sys/fs/pstore 读出）。
+		 * 放在 0x84400000：在本内核的 memory 节点里、离 kexec 的各段（0x80c00000 起到 0x82010000）够远；原厂这一侧，U-Boot 把内核与设备树放在开头 64 MiB 以内（原厂设备树落在 0x83ff3000，iomem 的 reserved），自身在内存顶端（bootargs 的 patch=9ff70000），原厂 5.4 内核的 memblock 从顶往下分（0x97dff000–0x983fffff），页分配器先给高地址，这一段在原厂开机后最晚被用到。热复位后是否原样保留、原厂开机后多久被覆盖都未实测，读出的签名会说明。
+		 */
+		ramoops@84400000 {
+			compatible = "ramoops";
+			reg = <0x0 0x84400000 0x0 0x100000>;
+			record-size = <0x20000>;
+			console-size = <0x80000>;
+			ecc-size = <16>;
+		};
 	};
 };
 
