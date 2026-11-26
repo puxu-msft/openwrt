@@ -114,6 +114,33 @@
 	 *    任何 GPIO；没有可写的硬件映射，暂不建节点。
 	 *  - 无线：驱动注册 /sys/class/leds/mt76-phy0|phy1，默认触发器 phy0tpt/phy1tpt。2.4G（MT7603E）由 mt76 写芯片 LED 控制器的 pin 0；5G（MT7663E）接在芯片的 LED1，由固件经 MCU 命令 EXT_CMD_ID_LED 驱动（mt76 补丁，见 slot0 的 led 节点）。
 	 */
+	/*
+	 * 按键：复位键 GPIO0、WPS 键 GPIO30，低有效。原厂 led.conf 第 56–58 行把这两脚设成 mode 5（LED_MODE_INPUT），
+	 * tcledctrl 的 buttonDetectTimer 以 DATA 位为 0 计按下；松开时两脚都读 1（GS2107 docs/35 N18）。复位键走
+	 * OpenWrt 标准的 /etc/rc.button/reset：松开时按住不到 1 s 重启，满 5 s 恢复出厂。GPIO30 不能出中断
+	 * （pinctrl 只有 GPIO0–15 能），用轮询；它同时是 LAN0_LED0 的复用脚，tcboot 没置复用位，作 GPIO 用。
+	 */
+	keys {
+		compatible = "gpio-keys";
+
+		reset {
+			label = "reset";
+			gpios = <&pinctrl 0 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_RESTART>;
+		};
+	};
+
+	keys-polled {
+		compatible = "gpio-keys-polled";
+		poll-interval = <20>;
+
+		wps {
+			label = "wps";
+			gpios = <&pinctrl 30 GPIO_ACTIVE_LOW>;
+			linux,code = <KEY_WPS_BUTTON>;
+		};
+	};
+
 	leds {
 		compatible = "gpio-leds";
 
