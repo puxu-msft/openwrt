@@ -156,9 +156,16 @@
 	 * NPPT 把这个地址写进 9132 的 SPA 作 CPU 收帧的目的 MAC（zx279133-np.c 的 zx279133_program_spa_cpu_mac）；conduit 注册时复制 NPPT 的地址（zx279133-netdev.c 的 eth_hw_addr_set(ndev, eth->ndev->dev_addr)，conduit 节点只在有 nvmem-cells 时才自己读），DSA 口与 br-lan 建立时再沿用 conduit 的。
 	 */
 	local-mac-address = [82 88 00 c0 73 22];
-	/* 9132 的内部 GE PHY 在 MDIO0 的 0x0a..0x0d，外置 2.5G PHY 在 MDIO1：原厂运行时设备树两个 MDIO 节点的 uni-phy = <0x0a 0x0b 0x0c 0x0d 0x05 0x1c 0x02>（runtime-dts:1291、1302），与 SK-D840N 相同 */
+	/*
+	 * 9132 的内部 GE PHY 在 MDIO0 的 0x0a..0x0d（原厂运行时设备树两个 MDIO 节点的 uni-phy，runtime-dts:1291、1302；实机读到 ID 84b9:5032）。
+	 * 外置 2.5G PHY（RTL8226 一族）也在 MDIO0、地址 1，与 SK-D840N（MDIO1、地址 5）不同：
+	 *   - 总线：原厂 bspdriver.ko 的 mdio_setup() 按 get_10g_mdio_sel() 选 10G PHY 的 MDIO 函数，为 0 时用 zx_mdio_0_*，本机打印 `mdio_sel==========0`（facts:2295），MDIO id 0 就是 0x14f01000（facts:1983）；SK-D840N 的原厂设备树有 pon_plat/mdio_8226_id = <1>，本机原厂设备树的 pon_plat 没有这一项。
+	 *   - 地址：原厂 `xmac0 type rlt8226 ,xmac_phy_id[0]  1`（facts:2398）；plat_132.ko 的 phy_rlt8226_set_enable() 以 xmac_phy_id[xmac] 作 PHY 地址，rlt8226b.ko 初始化时用的 PHY 地址（模块 .data+4）也是 1。
+	 * 第一次实机（2026-11-27 03:43）按 MDIO1 地址 5 访问，全读成 0x0000；驱动（补丁 397）probe 时会把两条 MDIO 的 0..31 都扫一遍写进 dmesg，以实测为准。
+	 */
 	zx279133,uni-phy-bus = <&mdio0>;
-	zx279133,outer-phy-bus = <&mdio1>;
+	zx279133,outer-phy-bus = <&mdio0>;
+	zx279133,outer-phy-addr = <1>;
 	status = "okay";
 
 	fixed-link {
@@ -176,7 +183,7 @@
 
 		/*
 		 * DSA 口号 = 9132 的 PPU 口号 + 3 = 原厂交换口号（facts 的 uniN、mac N）+ 4，传输 VID = 55 + DSA 口号（tagger 与 NPPT 驱动的同一套编号）。四个内部 PHY 口没有 PHY 驱动可绑（ID 0x84b9:0x5032 无匹配），照 SK-D840N 用 fixed-link：软件看到的链路恒为 1G 全双工，实际链路由 9132 自己读 PHY 决定。
-		 * lan1 的外置 PHY 不在本树声明（SK-D840N 实测：phylib 一绑上 realtek 驱动就改写它的 SerDes 选项），驱动按固定地址 5 直接读写；本机原厂日志 `xmac_phy_id[0] 1`（facts:2398）与 SK-D840N 的地址 5 是否同义未核对，2.5G 口按未验证处理。
+		 * lan1 的外置 PHY 不在本树声明（SK-D840N 实测：phylib 一绑上 realtek 驱动就改写它的 SerDes 选项），驱动按上面的 zx279133,outer-phy-bus 与 zx279133,outer-phy-addr 直接读写。
 		 */
 		ports {
 			#address-cells = <1>;

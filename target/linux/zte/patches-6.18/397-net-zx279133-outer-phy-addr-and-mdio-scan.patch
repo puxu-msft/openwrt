@@ -1,0 +1,338 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] net: ethernet: zte: zx279133: 外置 2.5G PHY 的 MDIO 地址由板级设备树给，probe 时扫 MDIO 并照原厂解除低功耗
+
+9132 驱动访问 2.5G 口外置 PHY（RTL8226 一族）时地址写死 5、总线取 zx279133,outer-phy-bus，这是 SK-D840N 的接法（MDIO1 上的地址 5）。中兴 F7615MV3 第一次实机（2026-11-27 03:43）这颗 PHY 的寄存器全读成 0x0000、自协商不完成。
+
+- 地址改由 NPPT 节点的 zx279133,outer-phy-addr 给（0..31），没给时仍是 5；LAN1 灯的读写回调只在 skyworth,sk-d840n 上启用，照旧用 5。
+- probe 时在访问外置 PHY 之前，把每个启用的 zte,zx279133-mdio 控制器上 0..31 的地址各读一遍：Clause 22 的 reg 2/3、Clause 45 devad 1 与 devad 7 的 reg 2/3，一个地址一行（`mdio scan <总线> addr NN: c22 …; c45 d1 …; c45 d7 …`），每组标“0000”“ffff”“ID xxxx:xxxx”或错误码，只读。
+- 随后照原厂做法解除外置 PHY 的低功耗：原厂 rlt8226b.ko 的 init_module 在复位脉冲与初始化之后把 PMA/PMD control 1（devad 1 reg 0）的 bit 11 置 1，plat_132.ko 的 phy_rlt8226_set_enable() 开口时读回、清 bit 11 再写，关口时置回（原厂交接前的 ifconfig eth0 down 就会置）。这里读 Clause 22 的 BMCR 与 PMA control 1，bit 11 置着就清掉，前后值写进 dmesg。复位线走原厂 bspdriver.ko 的板级表（bsp_xgphy_reset），不在设备树里，原厂初始化后保持解除，这里不碰。
+
+其余行为不变。
+
+--- a/drivers/net/ethernet/zte/zx279133-switch.c
++++ b/drivers/net/ethernet/zte/zx279133-switch.c
+@@ -393,8 +393,13 @@
+  * The external PHY: the RTL8226 on the 2.5G jack, at address 5 on the SoC's
+  * MDIO controller #1.  It is not on the 9132's own bus, so it has no address
+  * in the 0x0a..0x0d run above.
++ *
++ * 5 是 SK-D840N 的地址，作缺省；板子不同时由板级设备树在 NPPT 节点上给 zx279133,outer-phy-addr
++ * （与 zx279133,outer-phy-bus 一起），驱动用 priv->outer_addr。F7615MV3 的原厂是 MDIO0 上的地址 1。
+  */
+ #define ZX279133_SWITCH_OUTERPHY_ADDR	5
++/* PMA/PMD control 1（Clause 45 devad 1 reg 0）的低功耗位：原厂 plat_132.ko 的 phy_rlt8226_set_enable() 关口时置、开口时清 */
++#define ZX279133_SWITCH_OUTERPHY_PMA_LOWPOWER	BIT(11)
+ /* The auto-negotiation block of a Clause 45 PHY, and its status register. */
+ #define ZX279133_SWITCH_OUTERPHY_AN_DEVAD	7
+ #define ZX279133_SWITCH_OUTERPHY_AN_STATUS	1
+@@ -537,8 +542,13 @@
+ 	 * is the SoC's MDIO controller #1.  It is a different bus from the
+ 	 * 9132's own four internal PHYs, and the 2.5G jack's link state has
+ 	 * to be read there.
++	 *
++	 * 上面说的是 SK-D840N；总线由板级设备树的 zx279133,outer-phy-bus 给，F7615MV3 的原厂把它放在
++	 * MDIO 控制器 #0（与 9132 的内部 PHY 同一条）。
+ 	 */
+ 	struct mii_bus *outer_mdio;
++	/* 外置 PHY 在 outer_mdio 上的地址（zx279133,outer-phy-addr，缺省 ZX279133_SWITCH_OUTERPHY_ADDR） */
++	int outer_addr;
+ 	struct zx279133_lan1_led lan1_led;
+ 	/*
+ 	 * The last raw value of the outerphy's auto-negotiation status, so the
+@@ -2282,12 +2292,12 @@
+ 	int bmcr, anctrl, dig;
+ 
+ 	if (bus) {
+-		an = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++		an = mdiobus_c45_read(bus, priv->outer_addr,
+ 				       ZX279133_SWITCH_OUTERPHY_AN_DEVAD,
+ 				       ZX279133_SWITCH_OUTERPHY_AN_STATUS);
+-		f758d = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++		f758d = mdiobus_c45_read(bus, priv->outer_addr,
+ 					  0x1e, 0x758d);
+-		f7580 = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++		f7580 = mdiobus_c45_read(bus, priv->outer_addr,
+ 					  0x1e, 0x7580);
+ 	}
+ 
+@@ -2354,7 +2364,7 @@
+ 		return -ENODEV;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(zx279133_switch_outerphy_serdes_1g); i++) {
+-		int val = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++		int val = mdiobus_c45_read(bus, priv->outer_addr,
+ 					   ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 					   zx279133_switch_outerphy_serdes_1g[i][0]);
+ 		if (val < 0)
+@@ -2398,7 +2408,7 @@
+ 		return -ENODEV;
+ 
+ 	for (i = 0; i < ARRAY_SIZE(zx279133_switch_outerphy_serdes_1g); i++) {
+-		int val = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++		int val = mdiobus_c45_read(bus, priv->outer_addr,
+ 					   ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 					   zx279133_switch_outerphy_serdes_1g[i][0]);
+ 		before[i] = val < 0 ? 0xffffffff : (u32)val;
+@@ -2406,10 +2416,10 @@
+ 			changed = true;
+ 	}
+ 
+-	class = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++	class = mdiobus_c45_read(bus, priv->outer_addr,
+ 				 ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 				 ZX279133_SWITCH_OUTERPHY_SERDES_MODE);
+-	carry = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++	carry = mdiobus_c45_read(bus, priv->outer_addr,
+ 				 ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 				 ZX279133_SWITCH_OUTERPHY_SERDES_LINK);
+ 	needs_latch = class < 0 || carry < 0 ||
+@@ -2437,7 +2447,7 @@
+ 
+ 	if (changed || force) {
+ 		for (i = 0; i < ARRAY_SIZE(zx279133_switch_outerphy_serdes_1g); i++) {
+-			int val = mdiobus_c45_write(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++			int val = mdiobus_c45_write(bus, priv->outer_addr,
+ 						    ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 						    zx279133_switch_outerphy_serdes_1g[i][0],
+ 						    zx279133_switch_outerphy_serdes_1g[i][1]);
+@@ -2451,7 +2461,7 @@
+ 		 * word is read back.
+ 		 */
+ 		for (i = 0; i < ARRAY_SIZE(zx279133_switch_outerphy_serdes_1g); i++) {
+-			int val = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++			int val = mdiobus_c45_read(bus, priv->outer_addr,
+ 						   ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 						   zx279133_switch_outerphy_serdes_1g[i][0]);
+ 			after[i] = val < 0 ? 0xffffffff : (u32)val;
+@@ -2464,7 +2474,7 @@
+ 	}
+ 
+ 	if (needs_latch) {
+-		int val = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++		int val = mdiobus_c45_read(bus, priv->outer_addr,
+ 					   ZX279133_SWITCH_OUTERPHY_AN_DEVAD,
+ 					   ZX279133_SWITCH_OUTERPHY_AN_CTRL);
+ 		bool restarted = false;
+@@ -2533,7 +2543,7 @@
+ 					 carry < 0 ? 0xffff : carry);
+ 			}
+ 		} else if (val >= 0) {
+-			int w = mdiobus_c45_write(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++			int w = mdiobus_c45_write(bus, priv->outer_addr,
+ 						  ZX279133_SWITCH_OUTERPHY_AN_DEVAD,
+ 						  ZX279133_SWITCH_OUTERPHY_AN_CTRL,
+ 						  val | ZX279133_SWITCH_OUTERPHY_AN_RESTART);
+@@ -2598,7 +2608,7 @@
+ 
+ 			for (i = 0; i < 40; i++) {
+ 				int an = mdiobus_c45_read(bus,
+-							   ZX279133_SWITCH_OUTERPHY_ADDR,
++							   priv->outer_addr,
+ 							   ZX279133_SWITCH_OUTERPHY_AN_DEVAD,
+ 							   ZX279133_SWITCH_OUTERPHY_AN_STATUS);
+ 
+@@ -2640,7 +2650,7 @@
+ 	 * 0x0008 → 0x0009 → 0x002d and so could only ever answer "no".
+ 	 */
+ 	for (i = 0; i < 40; i++) {
+-		int val = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++		int val = mdiobus_c45_read(bus, priv->outer_addr,
+ 					   ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 					   ZX279133_SWITCH_OUTERPHY_SERDES_LINK);
+ 		if (val >= 0) {
+@@ -2651,7 +2661,7 @@
+ 		msleep(50);
+ 	}
+ 
+-	mode = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++	mode = mdiobus_c45_read(bus, priv->outer_addr,
+ 				ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 				ZX279133_SWITCH_OUTERPHY_SERDES_MODE);
+ 
+@@ -2698,7 +2708,7 @@
+ 
+ 	if (!bus)
+ 		return true;
+-	mode = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++	mode = mdiobus_c45_read(bus, priv->outer_addr,
+ 				ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 				ZX279133_SWITCH_OUTERPHY_SERDES_MODE);
+ 	if (mode >= 0 &&
+@@ -2719,14 +2729,14 @@
+ 	/* Is there a partner at the far end?  Without one there is nothing
+ 	 * to put back and nothing to complain about.
+ 	 */
+-	an = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++	an = mdiobus_c45_read(bus, priv->outer_addr,
+ 			       ZX279133_SWITCH_OUTERPHY_AN_DEVAD,
+ 			       ZX279133_SWITCH_OUTERPHY_AN_STATUS);
+ 	if (an < 0 || !(an & ZX279133_SWITCH_OUTERPHY_AN_PARTNER))
+ 		return true;
+ 
+ 	/* The class the chip ended up in. */
+-	mode = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++	mode = mdiobus_c45_read(bus, priv->outer_addr,
+ 				 ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 				 ZX279133_SWITCH_OUTERPHY_SERDES_MODE);
+ 	if (mode >= 0 &&
+@@ -2735,7 +2745,7 @@
+ 		return false;
+ 
+ 	/* And the lane's own word. */
+-	link = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++	link = mdiobus_c45_read(bus, priv->outer_addr,
+ 				 ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 				 ZX279133_SWITCH_OUTERPHY_SERDES_LINK);
+ 	if (link < 0 || (link & ZX279133_SWITCH_OUTERPHY_SERDES_LINK_BIT))
+@@ -2754,7 +2764,7 @@
+ 		return -1;
+ 
+ 	val = mdiobus_c45_read(bus,
+-			       ZX279133_SWITCH_OUTERPHY_ADDR,
++			       priv->outer_addr,
+ 			       ZX279133_SWITCH_OUTERPHY_AN_DEVAD,
+ 			       ZX279133_SWITCH_OUTERPHY_AN_STATUS);
+ 	if (val < 0)
+@@ -2943,7 +2953,7 @@
+ 
+ 	for (i = 0; i < ARRAY_SIZE(regs); i++) {
+ 		int val = mdiobus_c45_read(priv->outer_mdio,
+-					   ZX279133_SWITCH_OUTERPHY_ADDR,
++					   priv->outer_addr,
+ 					   regs[i].devad, regs[i].reg);
+ 
+ 		dev_info(priv->dev, "the 2.5G jack's PHY: %s (devad %#02x reg %#04x) = 0x%04x\n",
+@@ -3008,7 +3018,7 @@
+ 	bool link = false;
+ 
+ 	if (bus)
+-		raw = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++		raw = mdiobus_c45_read(bus, priv->outer_addr,
+ 				       ZX279133_SWITCH_OUTERPHY_PHYSR_DEVAD,
+ 				       ZX279133_SWITCH_OUTERPHY_PHYSR);
+ 	if (raw >= 0 &&
+@@ -3787,7 +3797,7 @@
+ 
+ 	if (!bus)
+ 		return -ENODEV;
+-	mode = mdiobus_c45_read(bus, ZX279133_SWITCH_OUTERPHY_ADDR,
++	mode = mdiobus_c45_read(bus, priv->outer_addr,
+ 				ZX279133_SWITCH_OUTERPHY_SERDES_DEVAD,
+ 				ZX279133_SWITCH_OUTERPHY_SERDES_MODE);
+ 	if (mode < 0)
+@@ -3935,6 +3945,91 @@
+ 	return ret;
+ }
+ 
++/*
++ * 一次性诊断：把 ZX279133 两个 MDIO 控制器上 0..31 的每个地址都读一遍，一个地址一行写进 dmesg——
++ * Clause 22 的 reg 2/3（PHY ID），Clause 45 devad 1（PMA/PMD）与 devad 7（AN）的 reg 2/3，各标成
++ * “0000”“ffff”“ID”或读错的错误码。只读，用来把“地址不对”“总线不对”“PHY 不应答/数据线被拉低”分开：
++ * 没有器件时一条上拉正常的 MDIO 读到 0xffff，整条总线都读成 0x0000 说明数据线没接到控制器（引脚复用）或被拉低。
++ */
++static const char *zx279133_switch_mdio_kind(int hi, int lo, char *buf, size_t len)
++{
++	if (hi < 0 || lo < 0)
++		snprintf(buf, len, "err %d", hi < 0 ? hi : lo);
++	else if (!hi && !lo)
++		snprintf(buf, len, "0000");
++	else if (hi == 0xffff && lo == 0xffff)
++		snprintf(buf, len, "ffff");
++	else
++		snprintf(buf, len, "ID %04x:%04x", hi, lo);
++	return buf;
++}
++
++static void zx279133_switch_mdio_scan_bus(struct zx279133_switch *priv,
++					  struct device_node *np)
++{
++	struct mii_bus *bus = of_mdio_find_bus(np);
++	char c22[24], d1[24], d7[24];
++	int addr;
++
++	if (!bus) {
++		dev_info(priv->dev, "mdio scan %pOF: bus not registered\n", np);
++		return;
++	}
++	for (addr = 0; addr < PHY_MAX_ADDR; addr++) {
++		zx279133_switch_mdio_kind(mdiobus_read(bus, addr, MII_PHYSID1),
++					  mdiobus_read(bus, addr, MII_PHYSID2),
++					  c22, sizeof(c22));
++		zx279133_switch_mdio_kind(mdiobus_c45_read(bus, addr, MDIO_MMD_PMAPMD, MDIO_DEVID1),
++					  mdiobus_c45_read(bus, addr, MDIO_MMD_PMAPMD, MDIO_DEVID2),
++					  d1, sizeof(d1));
++		zx279133_switch_mdio_kind(mdiobus_c45_read(bus, addr, MDIO_MMD_AN, MDIO_DEVID1),
++					  mdiobus_c45_read(bus, addr, MDIO_MMD_AN, MDIO_DEVID2),
++					  d7, sizeof(d7));
++		dev_info(priv->dev, "mdio scan %s addr %02x: c22 %s; c45 d1 %s; c45 d7 %s\n",
++			 bus->id, addr, c22, d1, d7);
++	}
++	put_device(&bus->dev);
++}
++
++static void zx279133_switch_mdio_scan(struct zx279133_switch *priv)
++{
++	struct device_node *np;
++
++	for_each_compatible_node(np, NULL, "zte,zx279133-mdio")
++		if (of_device_is_available(np))
++			zx279133_switch_mdio_scan_bus(priv, np);
++}
++
++/*
++ * 访问外置 PHY 之前照原厂解除低功耗：原厂 rlt8226b.ko 的 init_module 在复位脉冲（bspdriver 的
++ * bsp_xgphy_reset(1)、约 50 ms、再 bsp_xgphy_reset(0)、约 100 ms）与初始化之后，把 PMA/PMD control 1
++ * （devad 1 reg 0）的 bit 11 置 1 让 PHY 进低功耗；开口时 plat_132.ko 的 phy_rlt8226_set_enable(xmac, 1)
++ * 读回同一个寄存器、清 bit 11 再写回，关口（原厂 ifconfig eth0 down）时置回去。复位线走原厂的板级表、
++ * 不在设备树里，原厂初始化后一直是解除态，这里不碰。读到的 BMCR（Clause 22 reg 0）与 PMA control 1 写进 dmesg。
++ */
++static void zx279133_switch_outerphy_power_up(struct zx279133_switch *priv)
++{
++	struct mii_bus *bus = zx279133_switch_outer_mdio(priv);
++	int bmcr, pma, after;
++
++	if (!bus) {
++		dev_warn(priv->dev, "the 2.5G jack's PHY: its MDIO bus is not registered\n");
++		return;
++	}
++	bmcr = mdiobus_read(bus, priv->outer_addr, MII_BMCR);
++	pma = mdiobus_c45_read(bus, priv->outer_addr, MDIO_MMD_PMAPMD, MDIO_CTRL1);
++	after = pma;
++	if (pma >= 0 && (pma & ZX279133_SWITCH_OUTERPHY_PMA_LOWPOWER) && pma != 0xffff) {
++		mdiobus_c45_write(bus, priv->outer_addr, MDIO_MMD_PMAPMD, MDIO_CTRL1,
++				  pma & ~ZX279133_SWITCH_OUTERPHY_PMA_LOWPOWER);
++		after = mdiobus_c45_read(bus, priv->outer_addr, MDIO_MMD_PMAPMD, MDIO_CTRL1);
++	}
++	dev_info(priv->dev,
++		 "the 2.5G jack's PHY at %s addr %02x: BMCR (c22 reg 0) = %#06x, PMA control 1 (c45 1.0) = %#06x -> %#06x%s\n",
++		 bus->id, priv->outer_addr, bmcr, pma, after,
++		 after != pma ? " (low-power cleared, as the vendor's phy_rlt8226_set_enable does)" : "");
++}
++
+ static int zx279133_switch_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -3957,6 +4052,13 @@
+ 	priv->dev = dev;
+ 	dev_set_drvdata(dev, priv);
+ 	mutex_init(&priv->lane_lock);
++	priv->outer_addr = ZX279133_SWITCH_OUTERPHY_ADDR;
++	if (!of_property_read_u32(parent_np, "zx279133,outer-phy-addr", &status)) {
++		if (status >= PHY_MAX_ADDR)
++			return dev_err_probe(dev, -EINVAL,
++					     "zx279133,outer-phy-addr %u is not an MDIO address\n", status);
++		priv->outer_addr = status;
++	}
+ 	INIT_DELAYED_WORK(&priv->lane_work, zx279133_switch_lane_watch);
+ 	/*
+ 	 * The watcher reads the lane's PCS, so it has to be stopped before
+@@ -4061,6 +4163,9 @@
+ 		return dev_err_probe(dev, -ENETDOWN,
+ 				     "shared datapath is unavailable for LAN configuration\n");
+ 
++	zx279133_switch_mdio_scan(priv);
++	zx279133_switch_outerphy_power_up(priv);
++
+ 	/*
+ 	 * Follow the RTL8226 system side. 1e:7580 low 6 bits are 0x16 for
+ 	 * 2500BASE-X and 0x02 for SGMII. Do not force the 1G option class
