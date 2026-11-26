@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-only OR BSD-2-Clause
 /*
- * 中兴 ZXHN F7615MV3（中国移动定制光猫，SoC 中兴微 ZX279133）。
- * 板级事实取自本机原厂运行时设备树（/sys/firmware/fdt，2026-11-26 只读取证）。
+ * 中兴 ZXHN F7615MV3（中国移动定制光猫，SoC 中兴微 ZX279133）。板级事实取自本机原厂运行时设备树（/sys/firmware/fdt，2026-11-26 只读取证）。
  * 第一版从原厂系统 kexec 进来、只在内存里跑：开串口、USB、看门狗、GPIO，板载闪存不碰。
  */
 /dts-v1/;
@@ -24,13 +23,34 @@
 		stdout-path = "serial0:115200n8";
 	};
 
-	/*
-	 * DDR 512 MiB 从 0x80000000 起，这里只给到 0x97a00000：原厂内核运行期把 0x97a00000 以上几乎整段留给 NP、
-	 * Wi-Fi、加密引擎的缓冲（原厂 memblock 保留图），kexec 交接后原厂驱动的 DMA 可能还在往那里写。
-	 */
+	/* DDR 512 MiB 从 0x80000000 起，这里只给到 0x97a00000：原厂内核运行期把 0x97a00000 以上几乎整段留给 NP、Wi-Fi、加密引擎的缓冲（原厂 memblock 保留图），kexec 交接后原厂驱动的 DMA 可能还在往那里写。 */
 	memory@80000000 {
 		device_type = "memory";
 		reg = <0x0 0x80000000 0x0 0x17a00000>;
+	};
+};
+
+/*
+ * CPU 调频档位照原厂运行时设备树的 opp_table0：最高 1.3 GHz，1.1–1.3 GHz 标 turbo-mode，500 MHz 是挂起档；dtsi 多出的 1.4 GHz/881 mV 原厂没有，删掉。
+ * 688 MHz 一档沿用 dtsi 的 688128000（1376.256 MHz 二分频的实际频率），原厂表写的是标称值 688000000，电压同为 850 mV。
+ */
+&cpu_opp_table {
+	/delete-node/ opp-1400000000;
+
+	opp-500000000 {
+		opp-suspend;
+	};
+
+	opp-1100000000 {
+		turbo-mode;
+	};
+
+	opp-1200000000 {
+		turbo-mode;
+	};
+
+	opp-1300000000 {
+		turbo-mode;
 	};
 };
 
@@ -39,7 +59,7 @@
 	status = "okay";
 };
 
-/* 原厂两颗看门狗都开着（复位路由 0x10e10208 的 0x10、0x20 位），kexec 交接后照样在数，两颗都由本内核接管喂狗 */
+/* 原厂两颗看门狗都开着（复位路由 0x10e10208 的 0x10、0x20 位），kexec 交接后照样在数：两颗都启用，驱动 probe 起就由内核喂狗，用户态起来后 procd 只接管 watchdog0，watchdog1 一直由内核喂。 */
 &watchdog0 {
 	status = "okay";
 };
@@ -48,29 +68,16 @@
 	status = "okay";
 };
 
-/* 面板 USB 口在 0x15010000 这个控制器下（原厂总线 3-1） */
-&usb3 {
+/* 原厂两个 xHCI 都启用；面板 USB 口在 0x15010000 下（原厂总线 3-1），0x15008000 的口在板上接到哪里未知，一并打开。 */
+&usb0 {
 	status = "okay";
 };
 
-/* 原厂两个 xHCI 都启用、时钟相同，0x15008000 的口在板上接到哪里未知，一并打开 */
-&{/soc} {
-	usb3_0: usb3@15008000 {
-		compatible = "zte,zx279133-xhci";
-		reg = <0x0 0x15008000 0x0 0x4000>;
-		interrupts = <GIC_SPI 63 IRQ_TYPE_LEVEL_HIGH>;
-		clocks = <&topcrm ZX279133_TOPCRM_CLK_USB_ACLK>,
-			 <&topcrm ZX279133_TOPCRM_CLK_USB_PCLK>,
-			 <&topcrm ZX279133_TOPCRM_CLK_USB_CCI_ACLK>;
-		clock-names = "core", "reg", "cci";
-		dma-coherent;
-	};
+&usb1 {
+	status = "okay";
 };
 
-/*
- * SPI-NAND 控制器与闪存节点都保持关闭：U 盘测试期不碰板载闪存。dtsi 里的分区表是 SR1010 的，与本机实测分区无关，删掉免得误用；
- * 以后启用时按本机 /proc/mtd 实测的分区另写。
- */
+/* SPI-NAND 控制器与闪存节点都保持关闭：U 盘测试期不碰板载闪存。dtsi 里的分区表是 SR1010 的，与本机实测分区无关，删掉免得误用；以后启用时按本机 /proc/mtd 实测的分区另写。 */
 &spifc {
 	status = "disabled";
 
