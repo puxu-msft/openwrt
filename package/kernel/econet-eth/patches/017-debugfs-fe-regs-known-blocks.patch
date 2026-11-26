@@ -1,0 +1,75 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] econet-eth: debugfs fe_regs 只放行已知的寄存器区段
+
+现象：fe_regs 单次传输限 64 字节，挡住了 cat、grep 整读窗口，挡不住按 4 字节逐字读整窗。GS2107 上 2026-11-26 用 dd bs=4 count=4096 读 FE+0x0000..0x3fff，读到中途 SoC 不再应答，约 1 分钟后自行重启（pstore 控制台记录里没有 oops/panic）；2026-11-14 grep 整读窗口时同样挂住、约 100 s 后复位回来。读到哪个偏移挂住没有定位（docs/knowledge/linux/drivers.md#mmio-unknown-offsets-hang）。
+
+做法：fe_regs 只放行已知区段：FE 全局 0x0000..0x00ff、PSE 队列状态 0x110..0x11f、两个 CDMA/GDM（struct gdm）、PPE 0x0c00..0x0fff、PPE 计数 0x2000..0x20ff、两个 QDMA 0x4000..0x5fff、交换机 0x8000..（窗口覆盖它时）。区段外的偏移返回 -EPERM，并打一行限频的原因（说明可用模块参数放开）；要摸新的寄存器块时由模块参数 fe_regs_unlisted=1 显式放开。
+
+依据分两类：在 GS2107 上整段读过没出事的——captures/fe-regs-default-20261112.log 的只读转储（0x0000..0x00ff、0x0400..0x05ff、0x0c00..0x0fff、0x1400..0x15ff、0x2000..0x20ff），PSE 队列状态 0x110..0x11c 由 hw-qos 的 sampler/chwatch 每秒读过；只凭驱动按结构体访问、没有整段读过的——GDM 的 MIB 计数（+0x200..+0x2a7）、两个 QDMA 的 struct qregs、交换机块。
+
+验证：交叉编译（含 W=1，叠在主分支包补丁 001–016 上）0 告警。上机（GS2107，QoS 组的模块 product7，带同一份 fe_regs 代码）：读 0x500 照常返回 03f04444；读 0x1c00 返回 -EPERM，dmesg 一行“fe_regs +0x1c00 (4 bytes) is outside the known register blocks, refused…”；hw-qos 工具经 fe_regs 读的 QDMA 偏移照常。
+
+范围：econet-eth 的调试接口（所有芯片）；区段按 EN7528（GS2107）的实测与结构体定，EN751221 上没核对过。
+
+diff --git a/econet_eth_debug.c b/econet_eth_debug.c
+index 1caed49..42cedec 100644
+--- a/econet_eth_debug.c
++++ b/econet_eth_debug.c
+@@ -1,6 +1,7 @@
+ // SPDX-License-Identifier: GPL-2.0-only
+ #include <linux/debugfs.h>
+ #include <linux/seq_file.h>
++#include <linux/moduleparam.h>
+ 
+ #include "econet_eth.h"
+ #include "econet_ppe.h"
+@@ -584,9 +585,36 @@ static int en75_init_qdma(struct en75_qdma_debug *qdma_debug)
+ 
+ /*
+  * fe_regs: raw access to the frame engine register window, for bringing up blocks the driver does not drive yet (the PPE). The file offset is the register offset; every transfer is whole, aligned 32-bit words in CPU byte order. Reads have the side effects of the registers read (clear-on-read counters).
+- * A transfer covers at most EN75_FE_REGS_MAX_XFER bytes: some offsets in the window stall the bus when read and hang the SoC without a watchdog reset (a whole-window read with grep did on GS2107, 2026-11-14), so a cat or grep, which asks for a page or more, gets -EINVAL instead of walking the window; read registers with dd bs=4 skip=<offset/4> count=<n>.
++ * A transfer covers at most EN75_FE_REGS_MAX_XFER bytes: some offsets in the window stall the bus when read and hang the SoC until a watchdog resets it (a whole-window read with grep did on GS2107, 2026-11-14), so a cat or grep, which asks for a page or more, gets -EINVAL instead of walking the window; read registers with dd bs=4 skip=<offset/4> count=<n>.
++ * 只放行 en75_fe_regs_known[] 里的区段：上限挡不住逐字读整窗（GS2107 上 dd bs=4 count=4096 读 FE+0x0000..0x3fff 同样挂死，docs/knowledge/linux/drivers.md#mmio-unknown-offsets-hang），窗外的偏移返回 -EPERM 并打一行原因；确要读别处（摸新的寄存器块）时由模块参数 fe_regs_unlisted 显式放开。
+  */
+ #define EN75_FE_REGS_MAX_XFER	64
++
++/* fe_regs 放行的区段（相对 FE 基址，[start, end)）。依据分两类：在 GS2107 上整段读过没出事的（captures/fe-regs-default-20261112.log 的只读转储；PSE 队列状态 0x110..0x11c 由 hw-qos 的 sampler/chwatch 每秒读过，数据通路恢复每次也读）；只凭驱动按结构体访问、没有整段读过的（GDM 的 MIB 计数 +0x200..、两个 QDMA 的 struct qregs、交换机块）。没有列进来的不等于会挂，只是没读过；挂死的确切偏移没有定位。 */
++static const struct {
++	u32 start, end;
++} en75_fe_regs_known[] = {
++	{ 0x0000, 0x0100 },	/* FE 全局（转储过） */
++	{ 0x0110, 0x0120 },	/* PSE 队列状态 */
++	{ 0x0400, 0x0400 + sizeof(struct gdm) },	/* CDMA1/GDM1（struct gdm；0x400..0x5ff 转储过，其后的 MIB 计数只凭结构体） */
++	{ 0x0c00, 0x1000 },	/* PPE（转储过） */
++	{ 0x1400, 0x1400 + sizeof(struct gdm) },	/* CDMA2/GDM2（同 GDM1） */
++	{ 0x2000, 0x2100 },	/* PPE 计数（转储过） */
++	{ 0x4000, 0x6000 },	/* QDMA1、QDMA2（struct qregs，只凭结构体） */
++	{ 0x8000, 0x10000 },	/* 交换机（只凭驱动写它的那几项；窗口覆盖它时才有，即 has_switch_regs，GS2107 上没有） */
++};
++
++static bool fe_regs_unlisted;
++module_param(fe_regs_unlisted, bool, 0600);
++MODULE_PARM_DESC(fe_regs_unlisted, "debugfs fe_regs: also allow offsets outside the known register blocks (some unknown offsets hang the SoC bus)");
++
++static bool en75_fe_regs_known_range(loff_t pos, size_t len)
++{
++	for (int i = 0; i < ARRAY_SIZE(en75_fe_regs_known); i++)
++		if (pos >= en75_fe_regs_known[i].start && pos + len <= en75_fe_regs_known[i].end)
++			return true;
++	return false;
++}
+ static ssize_t en75_fe_regs_xfer(struct file *file, char __user *ubuf,
+ 				 const char __user *wbuf, size_t len, loff_t *ppos)
+ {
+@@ -601,6 +629,11 @@ static ssize_t en75_fe_regs_xfer(struct file *file, char __user *ubuf,
+ 	if (pos >= debug->config.fe_regs_len)
+ 		return 0;
+ 	len = min_t(size_t, len, debug->config.fe_regs_len - pos);
++	if (!READ_ONCE(fe_regs_unlisted) && !en75_fe_regs_known_range(pos, len)) {
++		pr_warn_ratelimited("econet_eth: fe_regs +0x%llx (%zu bytes) is outside the known register blocks, refused: unknown offsets can hang the bus; set the module parameter fe_regs_unlisted=1 to allow\n",
++				    pos, len);
++		return -EPERM;
++	}
+ 
+ 	for (done = 0; done < len; done += 4) {
+ 		void __iomem *reg = debug->config.fe_regs + pos + done;
