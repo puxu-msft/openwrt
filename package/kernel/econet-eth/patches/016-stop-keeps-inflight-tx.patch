@@ -1,0 +1,302 @@
+From: GS2107 <gs2107@local>
+Subject: [PATCH] econet-eth: 停口照原厂不丢在途的发送帧，模块卸载时先照原厂复位 QDMA 再释放
+
+现象（hw-qos 第二轮评审 P2）：en75_qdma_unuse() 只等 tx_hwi 追上 tx_cpui（硬件把描述符取走）至多 10 ms，就把发送环上每一项解除映射、释放 skb、下标清 0。取走而没发完的帧还在 QDMA 的队列里；不置 GLB_CFG bit23 时硬件不会丢掉它们（hw-qos 实测，GS2107 captures/hwqos-RV-20261126-0657/rhw-a.txt：只做 FE_RST_GLO 时 QDMA 缓存字节与令牌不变，置 bit23 与 LMGR 再初始化后才清零，复位时挂着的项之后不再完成）。于是停口后硬件可能还读已释放的缓冲，下次开口后还可能对复用的环项写完成。hw_qos 下通道积压或卡住时这是常态。开口时无条件 netdev_tx_reset_queue() 与这次的改法不兼容：保留下来的在途项开口后完成时，会多于重置后的记账，触发 dql_completed() 的 BUG_ON。
+
+原厂（GS2107 build/research/gphy-cal/vendor-re.md §10.5）：eth.ko 的 ndo_stop（.text+0x364）只停队列、停 NAPI、撤口 6 的强制建链，不碰 QDMA，环与在途描述符跨 ifdown/ifup 原样保留；只有数据通路恢复才整体丢弃在途描述符，而且先置 FE_RST_GLO 与 GLB_CFG bit23（qdma_reset，qdma_lan.ko 0xa018-0xa048）。
+
+改法：
+- 停口时睡着等在途项全部完成（read_poll_timeout，至多 10 ms；原来只等取走）；还有在途项就整个发送环原样保留（缓冲、skb、下标、BQL 都不动），打一行留下的项数，下次开口后由完成 NAPI 照常收尾；全部完成了才清空环（en75_tx_rings_drop()，与 QoS 组 023 同名同签名）。在途数按 ndesc − nfree 算，不扫环、不取锁。
+- 模块卸载（en75_qdma_destroy_locked()）时还有在途项：先照原厂置 GLB_CFG bit23、LMGR_INIT_CFG bit31、等 1 ms，再等 LMGR 初始化完成（en75_qdma_soft_reset()），然后释放；硬件不再引用它们，也不再写迟到的完成。复位清掉 QDMA 的缓存计数与令牌，队列表（LOCAL_QUEUE_INFO）不清，由硬件在该队列下次被用到时重置（同上实测）。
+- 开口不再重置 BQL：停口不丢在途帧，记账跨停口一直对。
+- 停口时发送环空了才关 DSA 标签解析：留到下次开口的帧还要按标签解析（开口时先设解析、再开 DMA）。
+- 销毁一进来就置 destroying：卸载时 en75_remove() 先销毁 QDMA、后注销口，这中间口被拉起来时 en75_qdma_use() 返回 -ENODEV，不再对已删除的 NAPI napi_enable()（基线就有）。
+
+边界：停口不再是发送卡住时的恢复手段。硬件永不完成的项（目前只在 hw_qos 下见过，那里有 QoS 组的数据通路恢复）、以及完成路径里带 WARN 跳过而泄漏的项，会跨停口一直留着，发送队列开口后仍停着，只有卸载模块或数据通路恢复能清；保留期间这些 skb 继续持有 socket 与 conntrack 的引用。停口期间解绑 DSA 交换机时，保留下来的带标签帧会在不解析的情况下发出。
+
+范围：芯片家族层（econet-eth 各芯片共用的停口与卸载路径；bit23 的效果在 EN7528 上实测，EN751221 未验证，原厂 qdma_reset 是同一份代码）。依据：原厂反汇编（上面的地址）与 hw-qos 的实测。已验证设备：GS2107（模块热换，devices/openwrt/gs2107/captures/eth015-016-20261126/）：通道 0 经寄存器限到约 1.1 Mbit/s、本机成串发 UDP 造积压，eth0 down 留下 2 个在途项（BQL 2892 = 2 帧，停口 2 s 不变），开口后 BQL 归 0、发送照常、无 WARN；空环时 down/up 同样正常；停口留下 3 个在途项时卸载，打出 “reset, dropped 3 TX entries still in flight”，换回开机模块后主机 4 s 可达、无 WARN；复位后通道 0 队列 0 的队列表仍记 3 项，开机模块用过一次后变成合法空队列。独立评审用用户态模型推了 BQL 的 7 个场景，新做法都不会多完成。
+
+diff --git a/econet_eth.h b/econet_eth.h
+index 77a50bb..c98cdcd 100644
+--- a/econet_eth.h
++++ b/econet_eth.h
+@@ -229,6 +229,8 @@ struct en75_qdma *en75_qdma_new(struct en75_eth *eth,
+ 
+ int en75_qdma_use(struct en75_qdma *qdma);
+ int en75_qdma_unuse(struct en75_qdma *qdma);
++/* 发送环上没有在途项（停口后用它决定能不能关标签解析） */
++bool en75_qdma_tx_idle(struct en75_qdma *qdma);
+ int en75_qdma_destroy(struct en75_qdma *qdma);
+ int en75_qdma_xmit(struct en75_qdma *qdma, struct sk_buff *skb,
+ 		   union desc_msg *msg, int qid, struct netdev_queue *txq);
+diff --git a/econet_port.c b/econet_port.c
+index 2c93d73..ab760db 100644
+--- a/econet_port.c
++++ b/econet_port.c
+@@ -177,8 +177,7 @@ static int en75_dev_open(struct net_device *dev)
+ 	struct en75_gdm_port *port = netdev_priv(dev);
+ 	struct gdm_len_th rlt;
+ 
+-	/* Packets still on the ring at the last stop were freed without a completion; start BQL from zero or the queue can stay stopped. */
+-	netdev_tx_reset_queue(netdev_get_tx_queue(dev, 0));
++	/* BQL 不在这里重置：停口不丢在途帧（en75_qdma_unuse() 留着它们，开口后照常完成并记完成），记账跨停口一直是对的；在这里清零反而会让开口后到的完成多于记过的量（dql_completed() 的 BUG_ON） */
+ 	netif_tx_start_all_queues(dev);
+ 
+ 	/* At boot DSA attaches first; when the driver is reloaded and the switch bound afterwards, the conduit opens without DSA and en75_features_check() sets the bit later. */
+@@ -202,8 +201,9 @@ static int en75_dev_stop(struct net_device *dev)
+ 
+ 	netif_tx_disable(dev);
+ 	ret = en75_qdma_unuse(port->qdma);
+-	/* only once the TX DMA is stopped and the ring reset: no offloaded frame is left to parse */
+-	en75_set_dsa_tag_parse(port, false);
++	/* 只在发送环空了之后关：留到下次开口的在途帧还要按标签解析（开口时先设解析、再开 DMA） */
++	if (en75_qdma_tx_idle(port->qdma))
++		en75_set_dsa_tag_parse(port, false);
+ 
+ 	return ret;
+ }
+@@ -307,7 +307,7 @@ static netdev_tx_t en75_dev_xmit(struct sk_buff *skb, struct net_device *dev)
+ 		/* 只有 netpoll 会遇到：没拿到环锁，交回这个 skb 由 netpoll 重试或排队，不停队列 */
+ 		return NETDEV_TX_BUSY;
+ 	if (ret == -EBUSY) {
+-		/* Ring full, nothing queued: the stack requeues this skb, so it must not be freed. Not expected, since the queue is stopped as soon as the ring has no room left. */
++		/* 环满、没有排进去：协议栈会重新排这个 skb，不能释放。环一没空位就停队列，正常不会来；停口时留下的在途项占满了环、开口后它们还没完成时会走到这里 */
+ 		en75_stop_queue_if_full(port, txq);
+ 		return NETDEV_TX_BUSY;
+ 	}
+diff --git a/econet_qdma.c b/econet_qdma.c
+index 25e7d00..2ed762c 100644
+--- a/econet_qdma.c
++++ b/econet_qdma.c
+@@ -625,7 +625,7 @@ static u32 en75_tx_done_process(struct en75_tx_doneq *done_q, u32 limit,
+ 		e = &q->entry[index];
+ 		skb = e->skb;
+ 
+-		/* A record for an entry that is already free (one left over from before a stop): consume it, keep the free list intact. */
++		/* 完成记录指向的项已经空闲：收掉记录、空闲链不动（防御；停口不再释放在途项，正常不会出现） */
+ 		if (WARN_ON_ONCE(!e->dma_addr))
+ 			continue;
+ 
+@@ -1282,6 +1282,93 @@ static int en75_init(struct device *dev,
+ 
+ /* End init functions */
+ 
++/* GLB_CFG（+0x04）bit23：原厂 qdma_reset 在重新初始化之前置位（设备 qdma_lan.ko 0xa018..0xa048），名字没留下；上游 airoha 把 EN7581 QDMA 的同一位叫 GLOBAL_CFG_RESET_MASK。置位后硬件自清（hw-qos 实测，GS2107 captures/hwqos-RV-20261126-0657/rhw-a.txt：复位后读回 GLB_CFG 0x940800f0）。 */
++#define EN75_QCFG_RESET		BIT(23)
++
++/* 发送环上还没完成的项数。nfree 只在发送（减去用掉的项）、每完成一项（加 1）、清环（复位）时变，放锁时都等于空闲项数，这里不取锁读它；没建完的环（建环中途失败）跳过。 */
++static unsigned int en75_tx_inflight(struct en75_qdma *qdma)
++{
++	unsigned int n = 0;
++	int i;
++
++	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
++		struct en75_q_tx *q = &qdma->q_tx[i];
++
++		if (!q->ndesc || !q->entry || !q->desc)
++			continue;
++		n += q->ndesc - READ_ONCE(q->nfree);
++	}
++	return n;
++}
++
++bool en75_qdma_tx_idle(struct en75_qdma *qdma)
++{
++	return !en75_tx_inflight(qdma);
++}
++
++/*
++ * 照原厂 qdma_reset（qdma_lan.ko 0xa018-0xa048，GPL qdma_bmgr.i:64843-64844）：GLB_CFG 置 bit23、LMGR_INIT_CFG
++ * 置 bit31、等 1 ms；再像开机一样等 LMGR 初始化完成（bit31 自清）。置完之后硬件丢掉已取走的在途描述符、不再写
++ * 迟到的完成，QDMA 的缓存字节与令牌清零；队列表（LOCAL_QUEUE_INFO、LOCAL_DMA_INDEX）不清，由硬件在该队列下次被
++ * 用到时重置（hw-qos 实测，GS2107 captures/hwqos-RV-20261126-0657/rhw-a.txt）。SCU 的 FE/QDMA 复位线与 LMGR 初始化
++ * 单独做都丢不掉在途描述符。DMA 须已关；原厂在这之前关中断，这里调用时 NAPI 已停，不必关。
++ */
++static void en75_qdma_soft_reset(struct en75_qdma *qdma)
++{
++	struct qregs_qcfg qcfg;
++	struct qregs_hwf_cfg1 cfg1;
++
++	qcfg = en75_rreg(&qdma->regs->qdma_cfg);
++	qcfg.bitfield_0 |= EN75_QCFG_RESET;
++	en75_wreg(qcfg, &qdma->regs->qdma_cfg);
++	cfg1 = en75_rreg(&qdma->regs->hwf_cfg1);
++	set_qregs_hwf_cfg1_start(&cfg1, true);
++	en75_wreg(cfg1, &qdma->regs->hwf_cfg1);
++	fsleep(USEC_PER_MSEC);
++	if (read_poll_timeout(en75_rreg, cfg1, !is_qregs_hwf_cfg1_start(&cfg1),
++			      USEC_PER_MSEC, 30 * USEC_PER_MSEC, false,
++			      &qdma->regs->hwf_cfg1))
++		dev_warn(qdma->dev, "QDMA%d: LMGR init after reset did not finish\n",
++			 qdma->id);
++}
++
++/* 释放发送环上全部还没完成的帧，环恢复成空的、两个下标写 0；返回释放的帧数，@count 时另记进发包设备的 tx_dropped。DMA 已停、TX 完成 NAPI 已停时调用；硬件还可能引用在途项时，调用方先 en75_qdma_soft_reset()。BQL 由调用方处理。 */
++static unsigned int en75_tx_rings_drop(struct en75_qdma *qdma, bool count)
++{
++	unsigned int dropped = 0;
++	int i, j;
++
++	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
++		struct en75_q_tx *q = &qdma->q_tx[i];
++
++		if (!q->ndesc || !q->entry)
++			continue;
++
++		guard(spinlock_bh)(&q->lock_bh);
++		for (j = 0; j < q->ndesc; j++) {
++			struct en75_q_tx_ent *e = &q->entry[j];
++
++			if (e->dma_addr) {
++				en75_tx_unmap(qdma, e);
++				if (e->skb) {
++					dropped++;
++					if (count)
++						DEV_STATS_INC(e->skb->dev, tx_dropped);
++				}
++				dev_kfree_skb_any(e->skb);
++			}
++			memset(e, 0, sizeof(*e));
++			e->freelist_next = (j < q->ndesc - 1) ? j + 1 : 0xffff;
++		}
++		q->freelist_head = 0;
++		q->freelist_tail = q->ndesc - 1;
++		WRITE_ONCE(q->nfree, q->ndesc);
++		en75_wreg(0U, &q->qchain_regs->tx_cpui);
++		en75_wreg(0U, &q->qchain_regs->tx_hwi);
++	}
++	return dropped;
++}
++
+ static void en75_qdma_destroy_rxq_locked(struct en75_q_rx *q)
+ {
+ 	int i;
+@@ -1310,12 +1397,13 @@ static void en75_qdma_destroy_rxq_locked(struct en75_q_rx *q)
+ 
+ static int en75_qdma_destroy_locked(struct en75_qdma *qdma)
+ {
++	unsigned int n;
+ 	int i;
+ 
+-	if (qdma->users) {
+-		qdma->destroying = true;
++	/* 没有使用者时也先置上：卸载时 en75_remove() 先销毁 QDMA、后注销口，这中间口被拉起来，en75_qdma_use() 要拒绝 */
++	qdma->destroying = true;
++	if (qdma->users)
+ 		return 0;
+-	}
+ 
+ 	scoped_guard(mutex, &en75_qdmas_lock) {
+ 		for (i = 0; i < ARRAY_SIZE(en75_qdmas); i++)
+@@ -1323,6 +1411,15 @@ static int en75_qdma_destroy_locked(struct en75_qdma *qdma)
+ 				en75_qdmas[i] = NULL;
+ 	}
+ 
++	/* 停口时留下的在途帧（en75_qdma_unuse()）到这里必须释放：先照原厂复位，让硬件不再引用它们、也不再写迟到的完成，再释放 */
++	n = en75_tx_inflight(qdma);
++	if (n) {
++		en75_qdma_soft_reset(qdma);
++		en75_tx_rings_drop(qdma, false);
++		dev_info(qdma->dev, "QDMA%d: reset, dropped %u TX entries still in flight\n",
++			 qdma->id, n);
++	}
++
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_rx); i++) {
+ 		struct en75_q_rx *q = &qdma->q_rx[i];
+ 
+@@ -1360,8 +1457,8 @@ int en75_qdma_use(struct en75_qdma *qdma)
+ 
+ 	guard(mutex)(&qdma->lock);
+ 
+-	if (WARN_ON_ONCE(qdma->destroying))
+-		return -EINVAL;
++	if (qdma->destroying)
++		return -ENODEV;
+ 
+ 	if (qdma->users++ > 0)
+ 		return 0;
+@@ -1399,27 +1496,17 @@ int en75_qdma_use(struct en75_qdma *qdma)
+ int en75_qdma_unuse(struct en75_qdma *qdma)
+ {
+ 	struct qregs_qcfg qcfg;
+-	int i, j;
++	unsigned int kept;
++	int i;
+ 
+ 	guard(mutex)(&qdma->lock);
+ 
+ 	if (--qdma->users > 0)
+ 		return 0;
+ 
+-	/* Let the hardware finish the packets already on the TX rings (it advances tx_hwi up to tx_cpui), so they are reported as completed instead of being left half sent; bounded at 10 ms. */
+-	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
+-		struct en75_q_tx *q = &qdma->q_tx[i];
+-		int t;
+-
+-		if (!q->ndesc)
+-			continue;
+-		for (t = 0; t < 1000; t++) {
+-			if (en75_rreg(&q->qchain_regs->tx_hwi) ==
+-			    en75_rreg(&q->qchain_regs->tx_cpui))
+-				break;
+-			udelay(10);
+-		}
+-	}
++	/* 等环上的帧发完、由 TX 完成 NAPI 收掉，至多 10 ms；睡着等，NAPI 线程可以在这个 CPU 上跑 */
++	read_poll_timeout(en75_tx_inflight, kept, !kept, 50, 10 * USEC_PER_MSEC,
++			  false, qdma);
+ 
+ 	qcfg = en75_rreg(&qdma->regs->qdma_cfg);
+ 	set_qregs_qcfg_rx_dma_en(&qcfg, false);
+@@ -1435,7 +1522,7 @@ int en75_qdma_unuse(struct en75_qdma *qdma)
+ 		hrtimer_cancel(&qdma->q_tx_done[i].kick);
+ 	}
+ 
+-	/* Consume every completion record now: a record left in the done queue would be processed after the next open against an entry freed below, or reused by then. */
++	/* 把完成队列里的记录现在全部收掉：已完成的项随之释放，下面按剩下的在途数决定保留还是清环 */
+ 	local_bh_disable();
+ 	for (i = 0; i < ARRAY_SIZE(qdma->q_tx_done); i++)
+ 		if (qdma->q_tx_done[i].size)
+@@ -1443,30 +1530,18 @@ int en75_qdma_unuse(struct en75_qdma *qdma)
+ 					     qdma->q_tx_done[i].size, 0);
+ 	local_bh_enable();
+ 
+-	/* Free what the hardware never sent and start the rings from an empty state, so the next DMA enable does not send descriptors that point at freed buffers. */
+-	for (i = 0; i < ARRAY_SIZE(qdma->q_tx); i++) {
+-		struct en75_q_tx *q = &qdma->q_tx[i];
+-
+-		if (!q->ndesc)
+-			continue;
+-
+-		guard(spinlock_bh)(&q->lock_bh);
+-		for (j = 0; j < q->ndesc; j++) {
+-			struct en75_q_tx_ent *e = &q->entry[j];
+-
+-			if (e->dma_addr) {
+-				en75_tx_unmap(qdma, e);
+-				dev_kfree_skb_any(e->skb);
+-			}
+-			memset(e, 0, sizeof(*e));
+-			e->freelist_next = (j < q->ndesc - 1) ? j + 1 : 0xffff;
+-		}
+-		q->freelist_head = 0;
+-		q->freelist_tail = q->ndesc - 1;
+-		WRITE_ONCE(q->nfree, q->ndesc);
+-		en75_wreg(0U, &q->qchain_regs->tx_cpui);
+-		en75_wreg(0U, &q->qchain_regs->tx_hwi);
+-	}
++	/*
++	 * 原厂停口不碰 QDMA（eth.ko ndo_stop .text+0x364 只停队列、停 NAPI、撤口 6 的强制建链，GS2107
++	 * build/research/gphy-cal/vendor-re.md §10.5）：硬件取走而没发完的帧不复位就丢不掉，释放了它的缓冲，硬件之后还会
++	 * 读它、或在下次开口后对复用的环项写完成。所以还有在途项时发送环原样保留（缓冲、skb、下标与 BQL 都不动），下次开口
++	 * 后由完成 NAPI 照常收尾；全部完成了才把环清成空的。模块卸载时留下的在途项在 en75_qdma_destroy_locked() 里先复位再释放。
++	 */
++	kept = en75_tx_inflight(qdma);
++	if (!kept)
++		en75_tx_rings_drop(qdma, false);
++	else if (!qdma->destroying)
++		dev_info(qdma->dev, "QDMA%d: %u TX entries still in flight at stop, kept for the next open\n",
++			 qdma->id, kept);
+ 
+ 	if (qdma->destroying)
+ 		return en75_qdma_destroy_locked(qdma);
