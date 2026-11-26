@@ -10,6 +10,7 @@ chinamobile,gs2107)
 	uci set system.@system[0].hostname='gs2107-recovery'
 
 	# SSH：自救时不依赖任何钥匙（2026-11-22 用户定）。默认实例 main 口令（root 口令由 92_gs2107-root-password 按构建时的凭据设置）与钥匙都接受，不绑定接口、监听 0.0.0.0:22，LAN 与 WAN 都能连；fw4 另放行 WAN tcp/22。主系统的只认公钥（94_gs2107-ssh-key-only）在自救模式下跳过。
+	# 钥匙就是镜像里的 /etc/dropbear/authorized_keys：gs2107 的 build.sh 从凭据真源（var/credentials/gs2107/ssh.json）渲染进 files/ 覆盖层，主系统、恢复出厂之后与自救系统共用这一份。
 	uci set dropbear.main.PasswordAuth='on'
 	uci set dropbear.main.RootPasswordAuth='on'
 
@@ -20,20 +21,10 @@ chinamobile,gs2107)
 	uci set firewall.gs2107_recovery_ssh.dest_port='22'
 	uci set firewall.gs2107_recovery_ssh.target='ACCEPT'
 
-	# 主机的钥匙并入 root 的 authorized_keys（OpenWrt dropbear 读 /etc/dropbear/authorized_keys），供主机工具免交互登录；镜像里已有的行保留；dropbear 要求文件权限 600。
-	keys=/etc/dropbear/authorized_keys
-	mkdir -p /etc/dropbear
-	touch "$keys"
-	while read -r key; do
-		[ -n "$key" ] || continue
-		grep -qxF "$key" "$keys" || printf '%s\n' "$key" >> "$keys"
-	done < /lib/gs2107/recovery-authorized_keys
-	chmod 600 "$keys"
-
 	uci commit system
 	uci commit dropbear
 	uci commit firewall
-	logger -t gs2107-recovery "recovery mode: hostname, SSH (password or key, LAN and WAN) and authorized_keys configured"
+	logger -t gs2107-recovery "recovery mode: hostname and SSH (password or key, LAN and WAN) configured"
 	;;
 esac
 
