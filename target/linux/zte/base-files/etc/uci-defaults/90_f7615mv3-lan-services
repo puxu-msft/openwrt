@@ -1,0 +1,17 @@
+#!/bin/sh
+# F7615MV3 的 LAN 接在已有 DHCP 与路由通告的实验网上（用户 2026-11-27 定：DHCP 服务默认关闭）：LAN 上不发 DHCPv4、DHCPv6 与 RA，不做 NDP 代理；静态地址与 SSH（dropbear 缺省监听全部接口）照旧。
+
+. /lib/functions.sh
+
+[ "$(board_name)" = "zte,f7615mv3" ] || exit 0
+
+uci -q batch <<UCI
+set dhcp.lan.ignore='1'
+set dhcp.lan.dhcpv4='disabled'
+set dhcp.lan.dhcpv6='disabled'
+set dhcp.lan.ra='disabled'
+set dhcp.lan.ndp='disabled'
+commit dhcp
+UCI
+
+exit 0

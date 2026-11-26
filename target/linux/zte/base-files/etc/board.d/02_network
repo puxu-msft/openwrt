@@ -1,0 +1,26 @@
+#!/bin/sh
+# 中兴微 ZX279133 各板的默认网口：首次生成 /etc/config/network 时由 board_detect 执行。
+
+. /lib/functions/uci-defaults.sh
+
+board_config_update
+
+case "$(board_name)" in
+zte,f7615mv3)
+	# LAN 桥：面板四个口（lan1 = 2.5G 口，lan2..4 = 千兆口），加上 9132 的 0 号口 lan0（面板不接）与 CPU 口的 conduit lan-cpu0。
+	# lan-cpu0 必须在桥里：发给本机的帧经 9132 的 CPU 口进 conduit，桥里没有它，帧到了 conduit 就丢（SK-D840N 实测，woodnaonly 的 board.d/02_network 与 init.d/sk-bridge）。
+	# 只列此刻在的口：9132 驱动没起来时退到 conduit 本身，再不行退到 NPPT 的 eth0（PON 侧），总有一个口带着地址。
+	# 地址 192.168.1.1/24 与原厂 LAN 相同，主机经原厂用的那段直连可达；DHCP 与路由通告由 uci-defaults 的 90_f7615mv3-lan-services 关掉。
+	ports=""
+	for d in lan1 lan2 lan3 lan4 lan0 lan-cpu0; do
+		[ -e "/sys/class/net/$d" ] && ports="$ports${ports:+ }$d"
+	done
+	[ -n "$ports" ] || ports=eth0
+	ucidef_set_interface "lan" device "$ports" protocol "static" \
+		ipaddr "192.168.1.1" netmask "255.255.255.0"
+	;;
+esac
+
+board_config_flush
+
+exit 0
