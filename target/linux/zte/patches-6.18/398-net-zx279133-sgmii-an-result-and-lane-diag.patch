@@ -1,0 +1,228 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] net: ethernet: zte: zx279133: 照原厂处理外置 PHY 车道的 SGMII 自协商结果，链路起来后打印两侧 SerDes 的锁定状态
+
+中兴 F7615MV3 第二轮实机（2026-11-27，构建树 12d366a6e0e）：2.5G 口外置 PHY（RTL8226 一族，MDIO0 地址 1）铜口 1G 起来、它的 SerDes 是 SGMII 类（1e.0x7580 = 0x9402）、车道字 1e.0x758d = 0x801e，SoC 侧 Uni SerDes 的 CDR 锁定（0xe4 = 0x1000706），但 NPPT 0x90 的 SGMII 状态字链路位一直是 0（0x2c03），lan1、lan-cpu0 只发不收。
+
+逐项对照原厂 plat_132.ko 在 1G（SGMII）下的序列：xmac_sgmii_conf(xmac, 1, 3, 1) 先 uni_serdes_init(xmac, 7)，再 xpcs_sgmii_mode_conf()（xpcs_prepare_for_switch_mode()、xpcs_1g_mode_conf(xmac, 3, 1, 2)：PCS 类型 1、XAUI 与两级 speed_sel、SR_MII_CTRL 1000/全双工、PCS 低功耗进出、AN_CTRL 的 PCS 模式 2）、xpcs_auto_negotiation_conf_in_sgmii_mode(xmac, 1)（关自协商、开 AN 中断、开 MAC_AUTO_SW、再开自协商）、xamc_init_conf_by_speed(xmac, 3)（TX_CTRL、RX_CTRL 0x3e8000c6、FRAME_CFG 0x80000001、MODE_CFG 2、MISC |= 0x200），最后 byPassEnableSet(xmac, 1)（PCS 0x8005 bit 4）——这些设置在 9132 驱动的 zx279133_switch_xpcs_sgmii()、zx279133_switch_xpcs_program_lane()、zx279133_switch_xmac_program()、zx279133_switch_xpcs_bypass() 里一一对得上（按调用与寄存器对照，XAUI 与 speed_sel 两个常量折叠函数的取值没有逐位核）；外置 PHY 侧原厂 phy_rlt8226_serdes_setting_flow() 只在 1e.0x697a 低 6 位非 0 时改选项，本机读到 0，原厂不动。对不上的一处在链路起来之后：原厂 phy_rlt8226_set_xmac_speed() 对 SGMII 类调 xmac_speed_process_in_sgmii_auto_mode()，读 XPCS 的 VR_MII_AN_INTR_STS（devad 0x1f reg 0x8002），CL37 自协商完成就清 bit 0，对端链路在时按 bits 3:2 设 XMAC 速率（1000/100/10 = 3/4/7，xmac_set_speed_sel() 只改 TX_CTRL 的 bits 31:29）；9132 驱动从不读也不清这个字。
+
+- 车道监视（lane watch）里照原厂做这一步：完成位置着就清，把结果（链路、速率、双工、原值）写进 dmesg，速率与 TX_CTRL 不同时改 TX_CTRL 的速率位。
+- 车道诊断：外置 PHY 铜口链路（1f.0xa434 bit 2）起来时立即、之后每 2 s 再两次、掉了一次，各打两行——外置 PHY 侧的 SerDes 类、车道字、三个选项字与铜口状态；SoC 侧 Uni SerDes 的 SC PLL、PLL 锁定、RX 失信号与 CDR 锁定（probe 时只读映射 Uni SerDes 的头 0x100 字节，不申请区域），XPCS0 的 SR_MII_CTRL、SR_MII_STS、AN_CTRL、AN_INTR_STS（只读）、DIG_CTRL1、PCS STS1 与 DIG_STS，NPPT 0x90（链路、速率、双工）与 0x84，XMAC0 的 TX_CTRL。
+
+其余行为不变。
+
+--- a/drivers/net/ethernet/zte/zx279133-switch.c
++++ b/drivers/net/ethernet/zte/zx279133-switch.c
+@@ -67,6 +67,7 @@
+ #include <linux/mutex.h>
+ #include <linux/netdevice.h>
+ #include <linux/of.h>
++#include <linux/of_address.h>
+ #include <linux/of_mdio.h>
+ #include <linux/of_net.h>
+ #include <linux/phy.h>
+@@ -205,6 +206,25 @@
+  */
+ #define ZX279133_XPCS_VR_MII_DIG_CTRL1	0x8000
+ #define ZX279133_XPCS_VR_MII_AN_CTRL	0x8001
++/*
++ * VR_MII_AN_INTR_STS（Clause 45 devad 0x1f reg 0x8002）：bit 0 是 CL37 自协商完成（软件清），bit 4 对端链路、bits 3:2 速率（0/1/2 = 10/100/1000）、bit 1 双工。
++ * 原厂 plat_132.ko 的 xpcs_get_speed_duplex_in_auto_en_sgmii_mode() 按这个格式读、读到完成就清 bit 0；在 xmac0_pcs_base + 0x7e0008，与本驱动的 MMIO 编址相同。
++ */
++#define ZX279133_XPCS_VR_MII_AN_INTR_STS	0x8002
++#define ZX279133_XPCS_CL37_ANCMPLT		BIT(0)
++#define ZX279133_XPCS_AN_STS_DUPLEX		BIT(1)
++#define ZX279133_XPCS_AN_STS_SPEED		GENMASK(3, 2)
++#define ZX279133_XPCS_AN_STS_LINK		BIT(4)
++#define ZX279133_XPCS_VR_XS_PCS_DIG_STS_REG	0x8010
++/* NPPT 全局的 XMAC0 SGMII 状态字：原厂 xmac_get_nppt_glb_xpcs_speed_duplex_in_sgmii_mode() 读 nppt + 0x90 + 4 * xmac，bits 2:0 速率、bit 3 双工、bit 4 链路 */
++#define ZX279133_NPPT_SGMII_SPEED		GENMASK(2, 0)
++#define ZX279133_NPPT_SGMII_DUPLEX		BIT(3)
++#define ZX279133_NPPT_SGMII_LINK		BIT(4)
++/* Uni SerDes 的锁定字（phy-zx279133-uni-serdes.c 同名常量）：0xcc SC PLL、0xd0 PLL（bit 0 锁定）、0xe4 RX（bit 0 失信号、bit 1 CDR 锁定） */
++#define ZX279133_UNI_DIAG_SC_PLL		0xcc
++#define ZX279133_UNI_DIAG_PLL		0xd0
++#define ZX279133_UNI_DIAG_RX		0xe4
++#define ZX279133_UNI_DIAG_SIZE		0x100
+ #define ZX279133_XPCS_VR_XS_PCS_DIG_CTRL1 0x8000
+ #define ZX279133_XPCS_VR_XS_PCS_XAUI_CTRL 0x8004
+ #define ZX279133_XPCS_VR_XS_PCS_DIG_STS	0x8010
+@@ -646,6 +666,11 @@
+ 	 */
+ 	unsigned long lane_heal_due;
+ 	unsigned long lane_log_due;
++	/* 车道诊断：Uni SerDes 寄存器的只读映射，外置 PHY 铜口链路的上一次读数，链路起来后还要再打几次 */
++	void __iomem *uni_diag;
++	bool diag_copper;
++	unsigned int diag_left;
++	unsigned long diag_due;
+ 	/*
+ 	 * The loader's own four words for this lane's PCS, saved when the
+ 	 * loader is the one that configured it (judgment TT).
+@@ -924,6 +949,139 @@
+  * The function itself is further down, with the rest of the outer PHY's code.
+  */
+ static void zx279133_switch_lane_state(struct zx279133_switch *priv);
++static struct mii_bus *zx279133_switch_outer_mdio(struct zx279133_switch *priv);
++
++/*
++ * 原厂 SGMII 自动模式下的链路处理，照 plat_132.ko 的 xmac_speed_process_in_sgmii_auto_mode() 与
++ * xpcs_get_speed_duplex_in_auto_en_sgmii_mode()：读 XPCS0 的 VR_MII_AN_INTR_STS，CL37 自协商完成（bit 0）
++ * 就清掉 bit 0；对端链路（bit 4）在时按 bits 3:2 的速率换算 XMAC 的速率码（xpcs_switch_vr_mii_an_intr_sts_speed()
++ * 与 xmac_switch_uni_speed_to_xmac_speed() 的跳转表：1000/100/10 Mbps = 3/4/7），只改 TX_CTRL 的 bits 31:29
++ * （xmac_set_speed_sel()）。原厂经 phy_rlt8226_set_xmac_speed() 在外置 PHY 是 SGMII 类（1e.0x7580 低位 0x02）时走这一步；
++ * 本驱动以前不读也不清这个字，kexec 前原厂留下的完成位一直挂着。
++ */
++static void zx279133_switch_sgmii_speed_process(struct zx279133_switch *priv)
++{
++	static const u32 xmac_speed[] = { 7, 4, 3 };
++	static const char *const mbps[] = { "10", "100", "1000" };
++	u32 code, tx, sel;
++	int sts;
++
++	if (!priv->xpcs_mdiodev ||
++	    priv->lane_class != ZX279133_SWITCH_OUTERPHY_SERDES_MODE_1G)
++		return;
++	sts = zx279133_switch_xpcs_read(priv, MDIO_MMD_VEND2,
++					ZX279133_XPCS_VR_MII_AN_INTR_STS);
++	if (sts < 0 || !(sts & ZX279133_XPCS_CL37_ANCMPLT))
++		return;
++	zx279133_switch_xpcs_modify(priv, MDIO_MMD_VEND2,
++				    ZX279133_XPCS_VR_MII_AN_INTR_STS,
++				    ZX279133_XPCS_CL37_ANCMPLT, 0);
++	sel = FIELD_GET(ZX279133_XPCS_AN_STS_SPEED, sts);
++	if (!(sts & ZX279133_XPCS_AN_STS_LINK) || sel >= ARRAY_SIZE(xmac_speed)) {
++		dev_info(priv->dev,
++			 "XPCS0 SGMII auto-negotiation complete, partner link %s (AN_INTR_STS 0x%04x, cleared)\n",
++			 sts & ZX279133_XPCS_AN_STS_LINK ? "up at a reserved speed" : "down", sts);
++		return;
++	}
++	code = xmac_speed[sel];
++	zx279133_switch_xmac_lock(priv);
++	tx = zx279133_switch_nppt_read(priv, ZX279133_XMAC0_BASE + ZX279133_XMAC_TX_CTRL);
++	if (FIELD_GET(ZX279133_XMAC_SPEED_MASK, tx) != code) {
++		tx = (tx & ~ZX279133_XMAC_SPEED_MASK) |
++		     FIELD_PREP(ZX279133_XMAC_SPEED_MASK, code);
++		zx279133_switch_nppt_write(priv, ZX279133_XMAC0_BASE + ZX279133_XMAC_TX_CTRL, tx);
++	}
++	zx279133_switch_xmac_unlock(priv);
++	dev_info(priv->dev,
++		 "XPCS0 SGMII auto-negotiation complete, link up at %s Mbps %s duplex (AN_INTR_STS 0x%04x, cleared); xmac 0 speed set %u (TX_CTRL 0x%08x)\n",
++		 mbps[sel], sts & ZX279133_XPCS_AN_STS_DUPLEX ? "full" : "half",
++		 sts, code, tx);
++}
++
++/*
++ * 车道诊断：两侧 SerDes 的同步与锁定，各一行。外置 PHY 侧：SerDes 类（1e.0x7580）、车道字（1e.0x758d 的 bit 2 是“车道有码”）、
++ * 三个选项字与铜口状态（1f.0xa434）；SoC 侧：Uni SerDes 的 PLL 与 CDR 锁定、失信号（只读映射），XPCS0 的 SR_MII_CTRL、
++ * SR_MII_STS、AN_CTRL、AN_INTR_STS（只读，不清）、DIG_CTRL1、PCS 的 STS1 与 DIG_STS，NPPT 0x90 的 SGMII 状态字与 0x84、XMAC0 的 TX_CTRL。
++ */
++static void zx279133_switch_lane_diag(struct zx279133_switch *priv, const char *why)
++{
++	static const u16 phy_regs[6][2] = {
++		{ 0x1e, 0x7580 }, { 0x1e, 0x758d }, { 0x1e, 0x75f3 },
++		{ 0x1e, 0x697a }, { 0x1e, 0x6a04 }, { 0x1f, 0xa434 },
++	};
++	struct mii_bus *bus = zx279133_switch_outer_mdio(priv);
++	int v[6] = { -1, -1, -1, -1, -1, -1 };
++	int x[7] = { -1, -1, -1, -1, -1, -1, -1 };
++	u32 sc = 0, pll = 0, rx = 0, sgmii, glb, tx;
++	unsigned int i;
++
++	for (i = 0; bus && i < ARRAY_SIZE(phy_regs); i++)
++		v[i] = mdiobus_c45_read(bus, priv->outer_addr, phy_regs[i][0],
++					phy_regs[i][1]);
++	dev_info(priv->dev,
++		 "lane diag (%s): PHY 1e.7580=0x%04x (class 0x%02x) 1e.758d=0x%04x (code %s) 1e.75f3=0x%04x 1e.697a=0x%04x 1e.6a04=0x%04x 1f.a434=0x%04x (copper %s)\n",
++		 why, v[0] & 0xffff, v[0] < 0 ? 0xff : v[0] & 0x3f, v[1] & 0xffff,
++		 v[1] < 0 ? "?" : (v[1] & BIT(2) ? "yes" : "no"), v[2] & 0xffff,
++		 v[3] & 0xffff, v[4] & 0xffff, v[5] & 0xffff,
++		 v[5] < 0 ? "?" : (v[5] & ZX279133_SWITCH_OUTERPHY_PHYSR_LINK ? "up" : "down"));
++
++	if (priv->uni_diag) {
++		sc = readl(priv->uni_diag + ZX279133_UNI_DIAG_SC_PLL);
++		pll = readl(priv->uni_diag + ZX279133_UNI_DIAG_PLL);
++		rx = readl(priv->uni_diag + ZX279133_UNI_DIAG_RX);
++	}
++	if (priv->xpcs_mdiodev) {
++		x[0] = zx279133_switch_xpcs_read(priv, MDIO_MMD_VEND2, MII_BMCR);
++		x[1] = zx279133_switch_xpcs_read(priv, MDIO_MMD_VEND2, MII_BMSR);
++		x[2] = zx279133_switch_xpcs_read(priv, MDIO_MMD_VEND2, ZX279133_XPCS_VR_MII_AN_CTRL);
++		x[3] = zx279133_switch_xpcs_read(priv, MDIO_MMD_VEND2, ZX279133_XPCS_VR_MII_AN_INTR_STS);
++		x[4] = zx279133_switch_xpcs_read(priv, MDIO_MMD_VEND2, ZX279133_XPCS_VR_MII_DIG_CTRL1);
++		x[5] = zx279133_switch_xpcs_read(priv, MDIO_MMD_PCS, MDIO_STAT1);
++		x[6] = zx279133_switch_xpcs_read(priv, MDIO_MMD_PCS, ZX279133_XPCS_VR_XS_PCS_DIG_STS_REG);
++	}
++	sgmii = zx279133_switch_nppt_read(priv, ZX279133_NPPT_XPCS0_STATUS);
++	glb = zx279133_switch_nppt_read(priv, ZX279133_NPPT_XMAC_LINK);
++	tx = zx279133_switch_nppt_read(priv, ZX279133_XMAC0_BASE + ZX279133_XMAC_TX_CTRL);
++	dev_info(priv->dev,
++		 "lane diag (%s): SoC uni-serdes sc_pll=0x%08x pll=0x%08x (lock %u) rx=0x%08x (los %u cdr %u)%s; XPCS0 SR_MII_CTRL=0x%04x SR_MII_STS=0x%04x AN_CTRL=0x%04x AN_INTR_STS=0x%04x (an-done %u link %u speed %u) DIG_CTRL1=0x%04x PCS STS1=0x%04x DIG_STS=0x%04x; NPPT 0x90=0x%08x (link %u speed %u duplex %u) 0x84=0x%08x; XMAC0 TX_CTRL=0x%08x\n",
++		 why, sc, pll, pll & BIT(0) ? 1 : 0, rx, rx & BIT(0) ? 1 : 0,
++		 rx & BIT(1) ? 1 : 0, priv->uni_diag ? "" : " (not mapped)",
++		 x[0] & 0xffff, x[1] & 0xffff, x[2] & 0xffff, x[3] & 0xffff,
++		 x[3] >= 0 && (x[3] & ZX279133_XPCS_CL37_ANCMPLT) ? 1 : 0,
++		 x[3] >= 0 && (x[3] & ZX279133_XPCS_AN_STS_LINK) ? 1 : 0,
++		 x[3] < 0 ? 0 : (u32)FIELD_GET(ZX279133_XPCS_AN_STS_SPEED, x[3]),
++		 x[4] & 0xffff, x[5] & 0xffff, x[6] & 0xffff, sgmii,
++		 sgmii & ZX279133_NPPT_SGMII_LINK ? 1 : 0,
++		 (u32)FIELD_GET(ZX279133_NPPT_SGMII_SPEED, sgmii),
++		 sgmii & ZX279133_NPPT_SGMII_DUPLEX ? 1 : 0, glb, tx);
++}
++
++/* 外置 PHY 铜口链路的跳变：起来时立即打一次车道诊断，之后每 2 s 再打一次、共两次；掉了也打一次 */
++static void zx279133_switch_lane_diag_watch(struct zx279133_switch *priv)
++{
++	struct mii_bus *bus = zx279133_switch_outer_mdio(priv);
++	int physr;
++	bool up;
++
++	if (!bus)
++		return;
++	physr = mdiobus_c45_read(bus, priv->outer_addr,
++				 ZX279133_SWITCH_OUTERPHY_PHYSR_DEVAD,
++				 ZX279133_SWITCH_OUTERPHY_PHYSR);
++	if (physr < 0)
++		return;
++	up = physr & ZX279133_SWITCH_OUTERPHY_PHYSR_LINK;
++	if (up != priv->diag_copper) {
++		priv->diag_copper = up;
++		zx279133_switch_lane_diag(priv, up ? "copper up" : "copper down");
++		priv->diag_left = up ? 2 : 0;
++		priv->diag_due = jiffies + msecs_to_jiffies(2000);
++	} else if (priv->diag_left && time_after_eq(jiffies, priv->diag_due)) {
++		priv->diag_left--;
++		priv->diag_due = jiffies + msecs_to_jiffies(2000);
++		zx279133_switch_lane_diag(priv, priv->diag_left ? "copper up +2 s" : "copper up +4 s");
++	}
++}
+ 
+ static void zx279133_switch_lane_watch(struct work_struct *work)
+ {
+@@ -972,6 +1130,8 @@
+ 	 * nothing at all.
+ 	 */
+ 	zx279133_switch_outerphy_link(priv);
++	zx279133_switch_sgmii_speed_process(priv);
++	zx279133_switch_lane_diag_watch(priv);
+ 
+ 	/*
+ 	 * The far end's SerDes class is the one thing on this lane that the
+@@ -4092,6 +4252,18 @@
+ 		dev_warn(dev,
+ 			 "the 9132's PHY bus is not registered; port link state will be unknown\n");
+ 
++	/* 车道诊断要读 Uni SerDes 的锁定字：只读映射它的头 0x100 字节（不申请区域，那是 PHY 驱动的） */
++	{
++		int idx = of_property_match_string(parent_np, "phy-names", "lan-serdes");
++		struct device_node *snp = idx < 0 ? NULL :
++			of_parse_phandle(parent_np, "phys", idx);
++		struct resource res;
++
++		if (snp && !of_address_to_resource(snp, 0, &res))
++			priv->uni_diag = devm_ioremap(dev, res.start, ZX279133_UNI_DIAG_SIZE);
++		of_node_put(snp);
++	}
++
+ 	ret = zx279133_lan_service_datapath_get(priv->service);
+ 	if (ret)
+ 		return dev_err_probe(dev, ret,
