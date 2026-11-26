@@ -15,6 +15,14 @@ define Device/Default
   ARTIFACT/board.dtb := append-dtb
 endef
 
+define Device/zte_f7615mv3
+  DEVICE_VENDOR := ZTE
+  DEVICE_MODEL := ZXHN F7615MV3
+  DEVICE_DTS := zx279133-f7615mv3
+  SUPPORTED_DEVICES := zte,f7615mv3
+endef
+TARGET_DEVICES += zte_f7615mv3
+
 # 框架只在设备有 IMAGES 时定义 <设备>-images，ARTIFACTS 的规则却依赖它；这里的设备不出 IMAGES，补一个空目标
 $(foreach device,$(TARGET_DEVICES),$(eval $(device)-images:))
 
