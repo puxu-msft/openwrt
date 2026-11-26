@@ -140,7 +140,10 @@ endif
 	yes 'n' | $(MAKE) -C $(PKG_BUILD_DIR) $(MAKE_FLAGS) oldconfig
 endef
 
+# busybox 的 make install 只往 CONFIG_PREFIX 里加小程序链接、不删；安装目录跨次保留时，配置里关掉的小程序链接会一直留着、随包进镜像，所以每次安装前先清空（同 lua、wireless-tools 的 Build/Compile）
 define Build/Compile
+	rm -rf $(PKG_INSTALL_DIR)
+	mkdir -p $(PKG_INSTALL_DIR)
 	$(call Build/Compile/Default, \
 		CONFIG_PREFIX="$(PKG_INSTALL_DIR)" \
 		all install \
