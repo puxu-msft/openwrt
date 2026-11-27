@@ -1,0 +1,293 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] net: ethernet: zte: zx279133: IDM 中断路由按板子给，各线屏蔽路由到本线的源
+
+IDM 源到中断线的路由（IDM+0x44..+0x50，每条线一个字，位 N 为源 N）原先写死成 woodnaonly 照创维 SK-D840N 原厂 4.19 抄的 0x071ffbfb/0x00200000/0x00400000/0x00800404，而线 0（"rx"）的处理函数只屏蔽源 0..3、12..15，线 3（"local-test"）的只屏蔽 4..11，与路由无关。中兴 F7615MV3 第十二轮实机（本地试验构建、SIPC 打开，zte-f7615mv3 的 captures/20261127-usbroot/ramoops-009）：这组路由把源 2 送到 local-test 线，那条线的处理函数不屏蔽它，电平中断每秒约 43 万次、两个 NAPI 一次没跑、喂狗线程饿死，约 10.7 s 被看门狗复位；第八、九轮同一模式。F7615MV3 原厂 5.4.196 的现场值是 0x0000fdff/0x00ff0000/0x07000000/0x00000200（只读 devmem，同目录 vendor-idm-regs.txt），收包中断全走线 0；本地试验 irq-route 换成这组值、线 0 屏蔽两组源之后，第十三轮风暴消失、收包到 Linux。
+
+- 路由由板级设备树的 zte,idm-irq-route（4 个字，依次是线 0..3）给，没有这个属性时用原来的 SK-D840N 值；长度不对时 probe 报错退出；驱动处理的源（0..15）没有全部落在申请的线 0、3 上时告警。
+- 线 0 与线 3 共用一个处理函数：屏蔽驱动处理的源里路由到本线的那些，调度与之相交的 NAPI 组（组 0 = ZX279133_IDM_LOCAL_MASK 走 napi，组 1 = ZX279133_IDM_DIRECT_RX_MASK 走 lan_napi；AF_XDP 模式只有 napi）；各 NAPI 做完只解开自己那组，与原来相同。路由到本线的已处理源为空时返回 IRQ_NONE。
+- zx279133_shared_rx_start() 先在 irq_lock 下屏蔽驱动不处理的源 16..26、再开两条中断线：IDM 配置把屏蔽字写成 0，缺省路由把 16..20、24..26 送到线 0，原先先开线后屏蔽，开线那一刻这些源一有电平就会让处理函数活锁。
+- ZX279133_IDM_UNHANDLED_MASK 上方的说明改写成中文并改正：0x071ffbfb 与 0x07ff0000 是 SK-D840N 的取值，不是各板通用的原厂值；同一机理对驱动处理的源同样成立。收包源两组与两条线、两颗 CPU 的关系（ZX279133_IDM_LOCAL_MASK 上方、probe 里设中断亲和处的说明）改为随路由而定：F7615MV3 的路由下线 3 只有源 9，收包实际都在线 0 那颗 CPU 上调度两个 NAPI。
+
+不写这个属性的板子（SK-D840N）路由不变，处理函数屏蔽的源改为按路由算：线 0 屏蔽 0xfbfb、调度两个 NAPI，线 3 屏蔽源 2 与 10、调度两个 NAPI。缺省路由下处理函数屏蔽与调度的这些变化，以及开线前先屏蔽 16..26 的次序，都没有在 SK-D840N 实机上验证过（只在 F7615MV3 上按它自己的路由验证）。
+
+--- a/drivers/net/ethernet/zte/zx279133.h
++++ b/drivers/net/ethernet/zte/zx279133.h
+@@ -844,39 +844,29 @@
+ #define ZX279133_IDM_INT_CPU		0x0044
+ #define ZX279133_IDM_RX_RELEASE		0x0088
+ #define ZX279133_IDM_BP_REFILL		0x0100
+-/* Route half of each interface's queues to each RX interrupt source. */
+-/* Worker 0 retains native WAN queue 8; worker 1 retains native LAN queue 0. */
++/*
++ * 驱动处理的 16 个收包源分两组，各由一个 NAPI 收：组 0（源 4..11，含原生 WAN 队列 8）归 eth->napi，组 1（源 0..3、12..15，含原生 LAN 队列 0）归 eth->lan_napi。两组各落在哪条中断线上、由哪颗 CPU 调度，随板级路由而定（ZX279133_IDM_IRQ_ROUTE_DEFAULT 上方的说明）：F7615MV3 的路由下线 3 只有源 9，收包实际都在线 0 那颗 CPU 上调度两个 NAPI。
++ */
+ #define ZX279133_IDM_LOCAL_MASK		(GENMASK(11, 8) | GENMASK(7, 4))
+ #define ZX279133_IDM_DIRECT_RX_MASK	(GENMASK(15, 0) & \
+ 					 ~ZX279133_IDM_LOCAL_MASK)
+ /*
+- * Only the sources this driver has a handler for may be unmasked.
+- *
+- * The IDM's interrupt mask register (IDM+0x40) has one bit per source, and a
+- * set bit means "masked".  The routing word (IDM+0x44) decides which source
+- * reaches which interrupt line, and the vendor's own value for it is
+- * 0x071ffbfb: it delivers sources 0,1,3,4,5,6,7,8,9,11,12,13,14,15 and also
+- * 16,17,18,19,20,24,25,26 to the same line.
+- *
+- * The driver handles the two sets above - sources 0..15 - and nothing else.
+- * Sources 16..26 must therefore stay masked, which is what the vendor does:
+- * the vendor's own mask is 0x07ff0000, i.e. sources 16..26 masked and
+- * sources 0..15 live, exactly the union of the two sets the driver owns.
+- *
+- * Unmasking them is not a small mistake.  A source that is asserted and
+- * masked by nobody stays asserted, the line is level triggered, and the
+- * handler re-enters forever: measured on the run-194 kit, the "rx" interrupt
+- * (19000000.ethernet, /proc/interrupts line 22) fired 266 742 353 times in
+- * half an hour while the driver's own rx_irq_count matched it to the last
+- * one.  The CPU never got out of the handler, so the NET_RX softirq never
+- * ran, so both NAPIs never polled a single descriptor
+- * (rx_napi_0_polls = 0, rx_napi_1_polls = 0) - and the frames that were
+- * sitting in the receive queues were never read.  Writing the vendor's
+- * 0x07ff0000 stopped the storm at once: the interrupt count froze, the NAPIs
+- * started polling, and the receive queues were drained.
++ * 只有驱动有处理函数的源才可以解开屏蔽。
++ * IDM 的中断屏蔽寄存器（IDM+0x40）每个源一位，置 1 为屏蔽；源到中断线的路由字（IDM+0x44 + 4 * 线号）决定哪个源送到哪条线，按板子给（ZX279133_IDM_IRQ_ROUTE_DEFAULT 上方的说明，设备树 zte,idm-irq-route）。
++ * 驱动只处理上面两组源（0..15），所以 16..26 不论路由到哪条线都要保持屏蔽（ZX279133_IDM_UNHANDLED_MASK；zx279133_shared_rx_start() 在开中断线之前就屏蔽它们）。
++ * 解开它们后果很重：电平触发的源没人屏蔽就一直有效，处理函数无限重入。woodnaonly 在创维 SK-D840N 上的 run-194 实测：半小时里 "rx" 中断（19000000.ethernet，/proc/interrupts 第 22 行）触发 266742353 次，与驱动自己的 rx_irq_count 一次不差；CPU 出不了处理函数，NET_RX 软中断跑不起来，两个 NAPI 一个描述符都没读（rx_napi_0_polls = 0、rx_napi_1_polls = 0），收包队列里的帧一直没人读；写入 SK-D840N 原厂的屏蔽字 0x07ff0000（源 16..26 屏蔽、0..15 不屏蔽）后风暴立刻停下，中断计数冻结，NAPI 开始轮询，收包队列排空。
++ * 同一个机理也适用于驱动处理的源：一条线的处理函数必须屏蔽路由到本线的全部已处理源，否则路由到这条线、却由别的线的处理函数屏蔽的源一来就电平重入。F7615MV3 第十二轮实机（zte-f7615mv3 的 captures/20261127-usbroot/README.md）照 SK-D840N 的路由把源 2 送到 local-test 线，那条线的处理函数当时只屏蔽 4..11，SIPC 打开后 local-test 线每秒约 43 万次中断、两个 NAPI 一次没跑、喂狗线程饿死，约 10.7 s 被看门狗复位。所以各线的处理函数按路由取自己要屏蔽的源（zx279133_idm_line_irq()）。
+  */
+ #define ZX279133_IDM_NAPI_MASK		GENMASK(15, 0)
+ #define ZX279133_IDM_UNHANDLED_MASK	GENMASK(26, 16)
++/*
++ * IDM 源到中断线的路由：IDM+0x44 + 4 * 线号，每条线一个字，位 N 为源 N。线 0 是 SPI1（中断名 "rx"），线 3 是 SPI4（"local-test"），驱动只申请这两条；线 1、2 依次是 SPI2（"idm"）、SPI3（"buffer-release"），不申请。
++ * 路由跟着板子的原厂固件走，由板级设备树的 zte,idm-irq-route（4 个字，依次是线 0..3）给。没有这个属性时用下面的缺省，即创维 SK-D840N 原厂 4.19 的取值：它的 np_133.ko 打印 "irq[0..3] sg_idm_irq_mask_conf(0x71ffbfb 0x200000 0x400000 0x800404)"，idm_int_mask_configure_init() 把这四个字原样写进 +0x44..+0x50。中兴 F7615MV3 原厂 5.4.196 的现场值是 0x0000fdff/0x00ff0000/0x07000000/0x00000200（只读 devmem，zte-f7615mv3 的 captures/20261127-usbroot/vendor-idm-regs.txt），收包中断全走线 0。
++ */
++#define ZX279133_IDM_IRQ_LINES		4
++#define ZX279133_IDM_LINE_RX		0
++#define ZX279133_IDM_LINE_LOCAL_TEST	3
++#define ZX279133_IDM_IRQ_ROUTE_DEFAULT	{ 0x071ffbfb, 0x00200000, 0x00400000, 0x00800404 }
+ #define ZX279133_IDM_RX_QUEUE		0
+ #define ZX279133_IDM_RX_QUEUES		24
+ #define ZX279133_IDM_CPU_RX_QUEUES	16
+@@ -1554,6 +1544,8 @@
+ 	bool tx_stopping;
+ 	bool ptp_agc_prepared;
+ 	int irqs[ZX279133_NUM_IRQS];
++	/* IDM 源到中断线的路由，板级（ZX279133_IDM_IRQ_ROUTE_DEFAULT 上方的说明） */
++	u32 idm_irq_route[ZX279133_IDM_IRQ_LINES];
+ };
+ 
+ static inline struct zx279133_netdev_stats *
+--- a/drivers/net/ethernet/zte/zx279133-idm.c
++++ b/drivers/net/ethernet/zte/zx279133-idm.c
+@@ -1593,40 +1593,52 @@
+ 	return zx279133_idm_rx_poll_group(eth, napi, 1, budget);
+ }
+ 
+-irqreturn_t zx279133_idm_rx_irq(int irq, void *data)
++/*
++ * 一条 IDM 中断线的处理：屏蔽驱动处理的源（0..15）里板级路由送到本线的那些，调度这些源所属的 NAPI 组（组 0 是 ZX279133_IDM_LOCAL_MASK、走 eth->napi，组 1 是 ZX279133_IDM_DIRECT_RX_MASK、走 eth->lan_napi；AF_XDP 模式下只有 eth->napi，它管全部 16 个源）。各 NAPI 做完只解开自己那组（zx279133_idm_rx_poll_group()）。
++ * 屏蔽的范围由路由定、不按线写死：电平中断的源只要路由到本线而本线不屏蔽它，就会无限重入（ZX279133_IDM_UNHANDLED_MASK 上方的说明）。
++ */
++static irqreturn_t zx279133_idm_line_irq(struct zx279133_eth *eth,
++					 unsigned int line)
+ {
+-	struct zx279133_eth *eth = data;
++	u32 sources = eth->idm_irq_route[line] & ZX279133_IDM_NAPI_MASK;
+ 	unsigned long flags;
+ 	bool running;
+ 
+-	atomic64_inc(&eth->rx_irq_count);
++	if (!sources)
++		return IRQ_NONE;
+ 	spin_lock_irqsave(&eth->irq_lock, flags);
+ 	running = eth->rx_running;
+-	zx279133_idm_set_masked(eth, ZX279133_IDM_DIRECT_RX_MASK, true);
++	zx279133_idm_set_masked(eth, sources, true);
+ 	spin_unlock_irqrestore(&eth->irq_lock, flags);
+ 
+-	if (running)
+-		napi_schedule_irqoff(eth->xsk_pool ? &eth->napi : &eth->lan_napi);
++	if (!running)
++		return IRQ_HANDLED;
++	if (eth->xsk_pool) {
++		napi_schedule_irqoff(&eth->napi);
++		return IRQ_HANDLED;
++	}
++	if (sources & ZX279133_IDM_LOCAL_MASK)
++		napi_schedule_irqoff(&eth->napi);
++	if (sources & ZX279133_IDM_DIRECT_RX_MASK)
++		napi_schedule_irqoff(&eth->lan_napi);
+ 
+ 	return IRQ_HANDLED;
+ }
+ 
+-irqreturn_t zx279133_idm_local_irq(int irq, void *data)
++irqreturn_t zx279133_idm_rx_irq(int irq, void *data)
+ {
+ 	struct zx279133_eth *eth = data;
+-	unsigned long flags;
+-	bool running;
+ 
+-	atomic64_inc(&eth->idm_local_irq_count);
+-	spin_lock_irqsave(&eth->irq_lock, flags);
+-	running = eth->rx_running;
+-	zx279133_idm_set_masked(eth, ZX279133_IDM_LOCAL_MASK, true);
+-	spin_unlock_irqrestore(&eth->irq_lock, flags);
++	atomic64_inc(&eth->rx_irq_count);
++	return zx279133_idm_line_irq(eth, ZX279133_IDM_LINE_RX);
++}
+ 
+-	if (running)
+-		napi_schedule_irqoff(&eth->napi);
++irqreturn_t zx279133_idm_local_irq(int irq, void *data)
++{
++	struct zx279133_eth *eth = data;
+ 
+-	return IRQ_HANDLED;
++	atomic64_inc(&eth->idm_local_irq_count);
++	return zx279133_idm_line_irq(eth, ZX279133_IDM_LINE_LOCAL_TEST);
+ }
+ 
+ static void zx279133_idm_rx_put_active_pages(struct zx279133_eth *eth)
+@@ -2022,21 +2034,10 @@
+ 	 */
+ 	writel(0, idm + 0x0040);
+ 	/*
+-	 * Source -> IRQ-line routing, copied word for word from this board's working
+-	 * vendor 4.19 boot: np_133.ko prints "irq[0..3] sg_idm_irq_mask_conf(0x71ffbfb
+-	 * 0x200000 0x400000 0x800404)" and its idm_int_mask_configure_init() stores
+-	 * exactly those four words to +0x44/+0x48/+0x4c/+0x50, one per line - so +0x44
+-	 * is the routing for SPI1, the "rx" IRQ requested in zx279133-main.c. Of the 22
+-	 * sources the vendor delivers there, the previous 0xf00f/0x00ff0000/0/0x0f00
+-	 * split stranded 4..7 and 24..26 on no line at all and sent 8,9,11 to
+-	 * local-test and 16..20 to the "idm" line, which is never requested. SPI2 and
+-	 * SPI3 stay masked at the distributor, so writing the vendor's words for those
+-	 * two lines cannot storm.
++	 * 源到中断线的路由，板子的原厂取值（eth->idm_irq_route，ZX279133_IDM_IRQ_ROUTE_DEFAULT 上方的说明）。SPI2 与 SPI3 不申请、在中断控制器上保持屏蔽，路由到这两条线的源不会造成风暴；驱动处理的源要全部落在线 0 与线 3 上，probe 时核对（zx279133_board_params_read()）。
+ 	 */
+-	writel(0x071ffbfb, idm + 0x0044);
+-	writel(0x00200000, idm + 0x0048);
+-	writel(0x00400000, idm + 0x004c);
+-	writel(0x00800404, idm + 0x0050);
++	for (i = 0; i < ZX279133_IDM_IRQ_LINES; i++)
++		writel(eth->idm_irq_route[i], idm + ZX279133_IDM_INT_CPU + 4 * i);
+ 	writel(0x00000800, idm + 0x006c);
+ 
+ 	/*
+--- a/drivers/net/ethernet/zte/zx279133-main.c
++++ b/drivers/net/ethernet/zte/zx279133-main.c
+@@ -826,6 +826,49 @@
+ 	schedule_delayed_work(&eth->pon_led_work, msecs_to_jiffies(200));
+ }
+ 
++/*
++ * 板级参数：同一颗 ZX279133 在不同板子上跑不同的原厂固件，有几处寄存器取值跟着板子的原厂固件走，由板级设备树给；没有这些属性时用驱动原有的取值（创维 SK-D840N 原厂的值），不写这些属性的板子写进寄存器的值不变。属性写了而长度不对时 probe 报错退出：多一个或少一个字都会让后面的字错位写进别的寄存器。
++ */
++static int zx279133_of_u32_words(struct device *dev, const char *prop,
++				 u32 *words, unsigned int n)
++{
++	int count;
++
++	if (!of_property_present(dev->of_node, prop))
++		return 0;
++	count = of_property_count_u32_elems(dev->of_node, prop);
++	if (count != n)
++		return dev_err_probe(dev, -EINVAL, "%s: want %u cells, got %d\n",
++				     prop, n, count);
++	return of_property_read_u32_array(dev->of_node, prop, words, n);
++}
++
++static int zx279133_board_params_read(struct zx279133_eth *eth)
++{
++	static const u32 route[ZX279133_IDM_IRQ_LINES] =
++		ZX279133_IDM_IRQ_ROUTE_DEFAULT;
++	u32 covered;
++	int ret;
++
++	memcpy(eth->idm_irq_route, route, sizeof(route));
++	ret = zx279133_of_u32_words(eth->dev, "zte,idm-irq-route",
++				    eth->idm_irq_route, ZX279133_IDM_IRQ_LINES);
++	if (ret)
++		return ret;
++	/*
++	 * 驱动处理的源要能叫醒自己的 NAPI：路由到不申请的线 1、2 上的源不出中断，它的队列只在同组别的源叫醒 NAPI 时顺带读到。
++	 */
++	covered = (eth->idm_irq_route[ZX279133_IDM_LINE_RX] |
++		   eth->idm_irq_route[ZX279133_IDM_LINE_LOCAL_TEST]) &
++		  ZX279133_IDM_NAPI_MASK;
++	if (covered != ZX279133_IDM_NAPI_MASK)
++		dev_warn(eth->dev,
++			 "zte,idm-irq-route sends receive sources %#x to no line this driver requests\n",
++			 (u32)ZX279133_IDM_NAPI_MASK & ~covered);
++
++	return 0;
++}
++
+ static int zx279133_eth_probe(struct platform_device *pdev)
+ {
+ 	struct device *dev = &pdev->dev;
+@@ -1069,6 +1112,9 @@
+ 					     "failed to get %s IRQ\n",
+ 					     zx279133_irq_names[i]);
+ 	}
++	ret = zx279133_board_params_read(eth);
++	if (ret)
++		return ret;
+ 
+ 	eth->serdes = devm_phy_get(dev, "serdes");
+ 	if (IS_ERR(eth->serdes))
+@@ -1292,11 +1338,7 @@
+ 		return ret;
+ 
+ 	/*
+-	 * Source 0 and source 2 (vendor "localtest") each serve half of WAN/LAN
+-	 * through separate NAPI instances. The NPPT aggregate source has no
+-	 * recovered acknowledge contract, source 1 belongs to the unused
+-	 * companion/Wi-Fi path, and source 3 belongs to the vendor buffer
+-	 * release callback, so those three DT IRQs remain masked/unrequested.
++	 * 申请 IDM 的线 0（"rx"）与线 3（"local-test"），各自按板级路由屏蔽送到本线的源、调度这些源所属的 NAPI（zx279133_idm_line_irq()）。NPPT 汇总中断没有已知的应答方式，线 1（"idm"）、线 2（"buffer-release"）是原厂伴随核/Wi-Fi 与缓冲释放回调用的，这三条不申请、保持屏蔽。
+ 	 */
+ 	ret = devm_request_irq(dev, eth->irqs[1], zx279133_idm_rx_irq,
+ 			       IRQF_NO_AUTOEN, dev_name(dev), eth);
+@@ -1309,8 +1351,8 @@
+ 		return dev_err_probe(dev, ret,
+ 				     "failed to request IDM local-test IRQ\n");
+ 
+-	/* Start the independent RX workers on separate online CPUs.
+-	 * These are initial affinities; userspace may override them later.
++	/*
++	 * 两条线的初始亲和：线 0（"rx"）放第一颗在线 CPU，线 3（"local-test"）放第二颗，用户态可以再改。两颗 CPU 上各调度几个 NAPI 随板级路由而定：缺省路由（SK-D840N）下两条线都带收包源；F7615MV3 的路由下线 3 只有源 9（原厂收包中断全在线 0），收包实际都由线 0 那颗 CPU 调度两个 NAPI。
+ 	 */
+ 	irq_set_affinity_and_hint(eth->irqs[1],
+ 				  cpumask_of(cpumask_local_spread(0, dev_to_node(dev))));
+--- a/drivers/net/ethernet/zte/zx279133-netdev.c
++++ b/drivers/net/ethernet/zte/zx279133-netdev.c
+@@ -194,24 +194,18 @@
+ 
+ static void zx279133_shared_rx_start(struct zx279133_eth *eth)
+ {
++	/*
++	 * 先屏蔽驱动不处理的源 16..26，再开中断线：IDM 配置把屏蔽字写成 0（全部源不屏蔽），而缺省路由（SK-D840N）把 16..20、24..26 送到线 0，先开线的话这些源一有电平，处理函数就无限重入、NET_RX 软中断跑不起来、两个 NAPI 一个描述符都读不到（ZX279133_IDM_UNHANDLED_MASK 上方的说明）。驱动处理的源 0..15 在开线之后解开屏蔽。
++	 */
+ 	spin_lock_irq(&eth->irq_lock);
+ 	WRITE_ONCE(eth->rx_running, true);
++	zx279133_idm_set_masked(eth, ZX279133_IDM_UNHANDLED_MASK, true);
+ 	spin_unlock_irq(&eth->irq_lock);
+ 	enable_irq(eth->irqs[1]);
+ 	eth->rx_irq_enabled = true;
+ 	enable_irq(eth->irqs[4]);
+ 	eth->idm_local_irq_enabled = true;
+ 	spin_lock_irq(&eth->irq_lock);
+-	/*
+-	 * The sources this driver has a handler for, and only those: the
+-	 * routing word also delivers sources 16..26 to the same interrupt
+-	 * line, and nothing in this driver acknowledges them.  An acknowledged
+-	 * source that nobody handles keeps the level-triggered line asserted
+-	 * and the handler re-enters forever, which starves the NET_RX softirq
+-	 * and stops both NAPIs from ever polling a descriptor.  See the note
+-	 * on ZX279133_IDM_UNHANDLED_MASK.
+-	 */
+-	zx279133_idm_set_masked(eth, ZX279133_IDM_UNHANDLED_MASK, true);
+ 	zx279133_idm_set_masked(eth, ZX279133_IDM_NAPI_MASK, false);
+ 	spin_unlock_irq(&eth->irq_lock);
+ }
