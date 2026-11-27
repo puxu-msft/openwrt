@@ -1,0 +1,103 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] net: ethernet: zte: zx279133: LAN 发包描述符第 6 字按板子给
+
+LAN 路径 IDM 发包描述符的字 6（从 0 数，字节偏移 0x18，即 metadata[4]，由 PPU 微码解释）原先写死成创维 SK-D840N 原厂 LAN 路径的 0x003e0000。中兴 F7615MV3 第十三轮实机（zte-f7615mv3 的 captures/20261127-usbroot/bootlog-029）：收包已通，发出的 24 帧被 IDM 取走后全部计进 RED 入口丢弃（字 0x08082）与 QMG 入队丢弃（字 0x09033 高半字），没进任何队列。F7615MV3 原厂 plat_132.ko 的 cpu_net_tx() 在 LAN 分支把字 4、5 清零、字 6 写 0x08000000（反汇编 0xc12c–0xc134）；本地试验 tx-word6 换成这个值后，第十四轮收发都通、主机 ssh 登录。
+
+- 字 6 由板级设备树的 zte,lan-tx-word6 给，没有这个属性时用原来的 0x003e0000；长度不对时 probe 报错退出。
+- 驱动里的名字统一按从 0 数的字号：宏 ZX279133_LAN_TX_WORD4 改名 ZX279133_LAN_TX_WORD6，成员 lan_tx_word4 改名 lan_tx_word6，调试控制台在运行时改它的命令 tx4 改名 tx6（不留旧名）；说明照新的事实改写。
+
+--- a/drivers/net/ethernet/zte/zx279133.h
++++ b/drivers/net/ethernet/zte/zx279133.h
+@@ -173,14 +173,10 @@
+ #define zx279133_tx_selector		0x0f
+ #define zx279133_tx_pon_control		0x08000000
+ /*
+- * The fourth metadata word of the IDM transmit descriptor on the LAN path.
+- *
+- * The vendor's own dump_desc_tx() calls this word the GEM port's LLID id
+- * plus its queue id.  The vendor writes 0x003e0000 on its LAN path and
+- * 0x1f568623 on its PON path; this driver wrote the PON value on both,
+- * which is a PON control word in a LAN descriptor.
++ * LAN 路径 IDM 发包描述符的字 6（从 0 数，字节偏移 0x18，即 metadata[4]），由 PPU 微码解释，取值跟着板子的原厂固件（微码）走，由板级设备树的 zte,lan-tx-word6 给；没有这个属性时用这里的缺省。
++ * 缺省 0x003e0000 是创维 SK-D840N 原厂 LAN 路径写的值（原厂 dump_desc_tx() 把这个字叫作 GEM 口的 LLID 号加队列号，PON 路径写 0x1f568623）。中兴 F7615MV3 原厂 plat_132.ko 的 cpu_net_tx() 在 LAN 分支写 0x08000000（0xc12c–0xc134：字 4、5 清零，字 6 写 0x08000000）；F7615MV3 第十三轮实机用 0x003e0000 时，发出的帧全部计进 RED 入口丢弃（字 0x08082）与 QMG 入队丢弃（字 0x09033 高半字），第十四轮换成 0x08000000 后收发都通（zte-f7615mv3 的 captures/20261127-usbroot/README.md）。
+  */
+-#define ZX279133_LAN_TX_WORD4		0x003e0000
++#define ZX279133_LAN_TX_WORD6		0x003e0000
+ #define zx279133_tx_word4_bit23		0
+ /*
+  * Keep IDM TX checksum generation disabled until its wire output is verified.
+@@ -1269,16 +1265,9 @@
+ 	 */
+ 	u8 lan_tx_port;
+ 	/*
+-	 * The fourth metadata word of the IDM TX descriptor, for the LAN path.
+-	 *
+-	 * The vendor's own dump_desc_tx() calls this word the GEM port's LLID
+-	 * id plus its queue id.  The vendor's LAN path writes 0x003e0000 there
+-	 * and its PON path writes 0x1f568623; this driver used to write
+-	 * zx279133_tx_pon_control (0x08000000) on both, which is a PON
+-	 * control word in a LAN descriptor.  The debugfs "tx4" command can
+-	 * still turn it while the question is open.
++	 * LAN 路径 IDM 发包描述符的字 6（从 0 数，字节偏移 0x18，即 metadata[4]）：板级，缺省与出处见 ZX279133_LAN_TX_WORD6；调试控制台的 "tx6" 命令可以在运行时改它。
+ 	 */
+-	u32 lan_tx_word4;
++	u32 lan_tx_word6;
+ 	/*
+ 	 * Whether the 9132's four UNI ports get their untag SVID (SPA
+ 	 * register 2, bits 18..29) set to the transport VID their DSA port
+--- a/drivers/net/ethernet/zte/zx279133-main.c
++++ b/drivers/net/ethernet/zte/zx279133-main.c
+@@ -866,6 +866,13 @@
+ 			 "zte,idm-irq-route sends receive sources %#x to no line this driver requests\n",
+ 			 (u32)ZX279133_IDM_NAPI_MASK & ~covered);
+ 
++	/* LAN 发包描述符的字 6（ZX279133_LAN_TX_WORD6 上方的说明） */
++	eth->lan_tx_word6 = ZX279133_LAN_TX_WORD6;
++	ret = zx279133_of_u32_words(eth->dev, "zte,lan-tx-word6",
++				    &eth->lan_tx_word6, 1);
++	if (ret)
++		return ret;
++
+ 	return 0;
+ }
+ 
+@@ -898,7 +905,6 @@
+ 	eth->dev = dev;
+ 	eth->ndev = ndev;
+ 	eth->lan_tx_port = ZX279133_LAN_TX_PORT;
+-	eth->lan_tx_word4 = ZX279133_LAN_TX_WORD4;
+ 	eth->lan_untag_svid = false;
+ 	ndev->tstats = devm_netdev_alloc_pcpu_stats(dev,
+ 						    struct pcpu_sw_netstats);
+--- a/drivers/net/ethernet/zte/zx279133-netdev.c
++++ b/drivers/net/ethernet/zte/zx279133-netdev.c
+@@ -661,7 +661,7 @@
+ 		desc->length_flags = cpu_to_le32(length_flags);
+ 		desc->metadata[0] = cpu_to_le32(metadata0);
+ 	}
+-	desc->metadata[4] = cpu_to_le32(ndev != hw_ndev ? eth->lan_tx_word4 :
++	desc->metadata[4] = cpu_to_le32(ndev != hw_ndev ? eth->lan_tx_word6 :
+ 					   zx279133_tx_pon_control);
+ 	slot->skb = skb;
+ 	slot->ndev = ndev;
+--- a/drivers/net/ethernet/zte/zx279133-np.c
++++ b/drivers/net/ethernet/zte/zx279133-np.c
+@@ -2381,14 +2381,15 @@
+ 		return count;
+ 	}
+ 
+-	if (!strcmp(tok, "tx4")) {
++	/* "tx6 <值>"：运行时改 LAN 发包描述符的字 6（eth->lan_tx_word6，ZX279133_LAN_TX_WORD6 上方的说明） */
++	if (!strcmp(tok, "tx6")) {
+ 		u32 word;
+ 
+ 		tok = zx279133_9132_next_token(&p);
+ 		if (!tok || kstrtou32(tok, 0, &word))
+ 			return -EINVAL;
+-		eth->lan_tx_word4 = word;
+-		pr_info("the LAN TX metadata word 4 is now %08x\n", word);
++		eth->lan_tx_word6 = word;
++		pr_info("the LAN TX descriptor word 6 is now %08x\n", word);
+ 		return count;
+ 	}
+ 

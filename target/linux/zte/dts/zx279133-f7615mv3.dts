@@ -183,6 +183,8 @@
 	 * zte,idm-irq-route：IDM 源到中断线的路由，依次是线 0（SPI1，"rx"）、线 1、线 2、线 3（SPI4，"local-test"）的字，位 N 为源 N；取本机原厂 5.4.196 的现场值（只读 devmem 0x19280044..0x19280050，captures/20261127-usbroot/vendor-idm-regs.txt）：收包源 0..8、10..15 走线 0，源 9 走线 3，原厂收包中断全在 SPI1。SK-D840N 的缺省 0x071ffbfb/0x00200000/0x00400000/0x00800404 把源 2 送到 local-test 线，第十二轮实机电平风暴、约 10.7 s 被看门狗复位（captures/20261127-usbroot/README.md）。
 	 */
 	zte,idm-irq-route = <0x0000fdff 0x00ff0000 0x07000000 0x00000200>;
+	/* zte,lan-tx-word6：LAN 发包描述符的字 6（从 0 数，字节偏移 0x18，即 metadata[4]，由 PPU 微码解释）；本机原厂 plat_132.ko 的 cpu_net_tx() 在 LAN 分支写 0x08000000（反汇编 0xc12c–0xc134：字 4、5 清零，字 6 写 0x08000000）。SK-D840N 的缺省 0x003e0000 让发出的帧全在 RED 入口被丢（第十三轮实机），换成本机值后第十四轮收发都通。 */
+	zte,lan-tx-word6 = <0x08000000>;
 	status = "okay";
 
 	fixed-link {
