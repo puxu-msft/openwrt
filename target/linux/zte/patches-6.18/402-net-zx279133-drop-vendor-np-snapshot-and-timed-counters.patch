@@ -1,0 +1,500 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] net: ethernet: zte: zx279133: 去掉原厂 NP 现场的读与写回，以及准备硬件后的定时计数打印
+
+撤掉 399 加的两样交接诊断，调试控制台的 cnt 照旧：
+
+- 原厂 NP 现场：第一次准备硬件时在 NPPT 复位之前读出原厂留下的 SPA 内存 0..16 的字 0..19 与 MF 扩展、端口类型、协议动作三张 ERAM 表，准备完后写回。中兴 F7615MV3 第五、六轮实机读出的 ERAM 表整表是同一个字型或全 0（NPPT/SE 初始化之前的 SMMU0 读拿不到表内容），写回会把这份无意义的字型写进三张表；SPA 字的读数（17 行 vendor SPA mem）已在多轮实机的控制台记录里存下（zte-f7615mv3 的 captures/20261127-usbroot/ 下 ramoops-001、-004、-005、-009 的 console.txt 与 bootlog-025、-029），不必每次交接都读。读、写回、只为它们服务的 zx279133_sdt_layout() 与写回之后补做的 zx279133_lan_vport_bringup()（zx279133_lan_port_bringup() 末尾本来就做）一并去掉。
+- 定时计数打印：准备完成时与之后 20/45/90/180 s 把各级硬件计数的变化量打进 dmesg，是上机查断点用的。调试控制台的 cnt 照旧按需打印当前非零的计数（不再带变化量）。
+
+zx279133_hwcnt_print() 与计数窗口表只剩调试控制台一个用处，放进 CONFIG_DEBUG_FS 的条件里，不开 debugfs 时不留下没人调用的函数。
+
+交接到 NPPT 复位之间不再读原厂 NP（少 340 次 SPA 间接读），dmesg 里没有这两组打印，其余行为不变。
+
+--- a/drivers/net/ethernet/zte/zx279133.h
++++ b/drivers/net/ethernet/zte/zx279133.h
+@@ -1253,8 +1253,6 @@
+ 	ZX279133_TX_CSUM_COUNT,
+ };
+ 
+-struct zx279133_vendor_snap;
+-
+ struct zx279133_eth {
+ 	struct device *dev;
+ 	struct net_device *ndev;
+@@ -1539,14 +1537,6 @@
+ 	 * table names none.
+ 	 */
+ 	u32 mcode_port_entry[64];
+-	/* The vendor's NP state, read before the first NPPT reset. */
+-	struct zx279133_vendor_snap *vendor_snap;
+-	bool vendor_snap_tried;
+-	/* Datapath counter snapshots: previous values and the timed shots. */
+-	u32 *hwcnt_prev;
+-	struct delayed_work hwcnt_work;
+-	unsigned int hwcnt_shot;
+-	unsigned long hwcnt_start;
+ 	bool spa_prepared;
+ 	bool nppu_early_prepared;
+ 	bool smct_prepared;
+@@ -1612,7 +1602,6 @@
+ void zx279133_red_ram_read(struct zx279133_eth *eth, u32 ram_id, u32 addr,
+ 			   u32 *data, unsigned int count);
+ int zx279133_np_prepare(struct zx279133_eth *eth);
+-void zx279133_vendor_snap_take(struct zx279133_eth *eth);
+ void zx279133_np_restore(struct zx279133_eth *eth);
+ void zx279133_route_set(struct zx279133_eth *eth, bool enabled);
+ int zx279133_vlan_runtime_prepare(struct zx279133_eth *eth);
+--- a/drivers/net/ethernet/zte/zx279133-main.c
++++ b/drivers/net/ethernet/zte/zx279133-main.c
+@@ -670,11 +670,6 @@
+ 	if (ret)
+ 		goto err_cci_restore;
+ 
+-	/*
+-	 * What the vendor's np.ko and switch.ko left in the NP before the
+-	 * kexec, read once, before zx279133_tm_prepare() resets the NPPT.
+-	 */
+-	zx279133_vendor_snap_take(eth);
+ 	ret = zx279133_tm_prepare(eth);
+ 	if (ret) {
+ 		/*
+--- a/drivers/net/ethernet/zte/zx279133-np.c
++++ b/drivers/net/ethernet/zte/zx279133-np.c
+@@ -560,7 +560,10 @@
+  */
+ /* Defined further down, used by the microcode loader and the debugfs console. */
+ static int zx279133_mcode_port_entry_set(struct zx279133_eth *eth, u32 port);
+-static void zx279133_hwcnt_print(struct zx279133_eth *eth, bool delta);
++#ifdef CONFIG_DEBUG_FS
++/* 只有调试控制台的 cnt 命令用它 */
++static void zx279133_hwcnt_print(struct zx279133_eth *eth);
++#endif
+ 
+ static int zx279133_eram_table_set_bits(struct zx279133_eth *eth, u32 sdt_id,
+ 					u32 index, u32 width, u32 value)
+@@ -2670,7 +2673,7 @@
+ 	if (!strcmp(tok, "cnt")) {
+ 		if (!READ_ONCE(eth->hardware_prepared))
+ 			return -ENODEV;
+-		zx279133_hwcnt_print(eth, false);
++		zx279133_hwcnt_print(eth);
+ 		return count;
+ 	}
+ 
+@@ -3758,9 +3761,8 @@
+  * (width * index & ~0x7f), and a table of the wrong width is read at the
+  * wrong place.  type 1 is ERAM, 3 is hash, 4 is statistics and 5 is an ERAM
+  * table with a parser SDT.  ERAM tables take blocks from the pool strictly in
+- * this order, so every table's base follows from the list
+- * (zx279133_sdt_layout()).  p3 selects the width of one entry out of {1, 32,
+- * 64, 128, 2, 4, 8, 16} bits.
++ * this order, so every table's base follows from the list.  p3 selects the
++ * width of one entry out of {1, 32, 64, 128, 2, 4, 8, 16} bits.
+  */
+ static const u32 zx279133_core_sdt_info[][4] = {
+ 	{ 0x00, 1, 0x3, 0x1000 },	{ 0x01, 1, 0x3, 0x1 },
+@@ -4016,34 +4018,6 @@
+ 			     "SE PLCR init done status %#x\n", status);
+ }
+ 
+-/*
+- * The ERAM bases the list gives, worked out without touching the hardware:
+- * the vendor's allocator hands out blocks from 0x3000 in list order (see
+- * zx279133_se_sdt_create() for why 0x3000).
+- */
+-static void zx279133_sdt_layout(void)
+-{
+-	u32 eram_base = 0x3000;
+-	unsigned int i;
+-
+-	for (i = 0; i < ARRAY_SIZE(zx279133_core_sdt_info); i++) {
+-		u32 sdt_no = zx279133_core_sdt_info[i][0];
+-		u32 type = zx279133_core_sdt_info[i][1];
+-		u32 a = zx279133_core_sdt_info[i][2];
+-		u32 b = zx279133_core_sdt_info[i][3];
+-		u32 bit_len;
+-
+-		if (type != 1 && type != 5)
+-			continue;
+-		bit_len = zx279133_se_sdt_bit_len[a & 7];
+-		if (sdt_no < ZX279133_SDT_ID_MAX) {
+-			zx279133_eram[sdt_no].base = eram_base;
+-			zx279133_eram[sdt_no].bit_len = bit_len;
+-		}
+-		eram_base += (bit_len * b + 127) >> 7;
+-	}
+-}
+-
+ static int zx279133_se_sdt_create(struct zx279133_eth *eth)
+ {
+ 	/*
+@@ -4854,214 +4828,7 @@
+ 	eth->sipc_final_prepared = false;
+ }
+ 
+-/*
+- * The vendor's NP state, read before this driver changes any of it.
+- *
+- * The board runs OpenWrt by kexec from its own vendor system, and at that
+- * moment the vendor's np.ko and switch.ko have programmed the NP for this
+- * board: the SPA memories (the per-port words the PPU starts every frame
+- * from) and the SE's ERAM tables.  Those are this board's own values, and
+- * for most of them nothing else says what they should be.  So the first
+- * prepare reads them before zx279133_tm_prepare() resets the NPPT, prints
+- * them, and zx279133_vendor_snap_replay() writes them back once this
+- * driver's own set-up is done.
+- *
+- * Read are SPA memories 0..16 (PON0, the four 1G MACs, XMAC0, XMAC1, RGMII1,
+- * the loop, XMAC_B, PON_PTL, PON1, the CPU trap, WIFI0) at addresses 0..19,
+- * the whole of np.ko's spa_port_attr_table, and the three ERAM tables this
+- * driver writes: the MF extension table (SDT 0x32, one entry per SPA
+- * memory), the port type table (SDT 0x06) and the protocol action table
+- * (SDT 0x04, 16 blocks per port).  The ERAM bases come from
+- * zx279133_core_sdt_info[], which is the vendor's list; if the vendor's
+- * tables are not where the list puts them, the printed blocks say so.
+- *
+- * A cold boot has no vendor state: no SPA memory then carries a valid
+- * start-PC entry, and nothing is written back.
+- */
+-#define ZX279133_SNAP_MEMS	17
+-#define ZX279133_SNAP_ADDRS	20
+-#define ZX279133_SNAP_PRINT_MAX	64
+-
+-static const struct {
+-	u32 sdt;
+-	u32 blocks;
+-	const char *name;
+-} zx279133_snap_tables[] = {
+-	{ ZX279133_MF_ERAM_SDT_ID, 64, "MF extension" },
+-	{ ZX279133_PORT_TYPE_ERAM_SDT_ID, 64, "port type" },
+-	{ ZX279133_PRO_ERAM_SDT_ID, 64 * ZX279133_PRO_BLOCKS_PER_PORT,
+-	  "protocol action" },
+-};
+-
+-struct zx279133_vendor_snap {
+-	bool spa_valid;
+-	u32 spa[ZX279133_SNAP_MEMS][ZX279133_SNAP_ADDRS];
+-	u32 *eram[ARRAY_SIZE(zx279133_snap_tables)];
+-};
+-
+-void zx279133_vendor_snap_take(struct zx279133_eth *eth)
+-{
+-	struct zx279133_vendor_snap *snap;
+-	unsigned int t, m, a, named = 0;
+-	bool spa_ok = true;
+-
+-	if (eth->vendor_snap_tried)
+-		return;
+-	eth->vendor_snap_tried = true;
+-	/* An NPPT held in reset has no state, and its SPA does not answer. */
+-	if (!(readl(eth->base + ZX279133_SYS_SOFT_RESET) &
+-	      ZX279133_SYS_SDET_RESET_N)) {
+-		dev_info(eth->dev,
+-			 "the NPPT is in reset before the first prepare: no vendor NP state to read\n");
+-		return;
+-	}
+-	snap = devm_kzalloc(eth->dev, sizeof(*snap), GFP_KERNEL);
+-	if (!snap)
+-		return;
+-	eth->vendor_snap = snap;
+-
+-	for (m = 0; m < ZX279133_SNAP_MEMS && spa_ok; m++)
+-		for (a = 0; a < ZX279133_SNAP_ADDRS; a++)
+-			if (zx279133_spa_indirect_read(eth, m, a,
+-						       &snap->spa[m][a])) {
+-				spa_ok = false;
+-				break;
+-			}
+-	for (m = 0; m < ZX279133_SNAP_MEMS; m++)
+-		if (snap->spa[m][0] & BIT(0))
+-			named++;
+-	snap->spa_valid = spa_ok && named;
+-	dev_info(eth->dev,
+-		 "vendor NP state before the NPPT reset: SPA reads %s, %u of %u memories carry a start-PC entry%s\n",
+-		 spa_ok ? "complete" : "FAILED", named, ZX279133_SNAP_MEMS,
+-		 snap->spa_valid ? "" : " - nothing will be written back");
+-	for (m = 0; m < ZX279133_SNAP_MEMS; m++)
+-		dev_info(eth->dev,
+-			 "vendor SPA mem %2u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
+-			 m, snap->spa[m][0], snap->spa[m][1], snap->spa[m][2],
+-			 snap->spa[m][3], snap->spa[m][4], snap->spa[m][5],
+-			 snap->spa[m][6], snap->spa[m][7], snap->spa[m][8],
+-			 snap->spa[m][9], snap->spa[m][10], snap->spa[m][11],
+-			 snap->spa[m][12], snap->spa[m][13], snap->spa[m][14],
+-			 snap->spa[m][15], snap->spa[m][16], snap->spa[m][17],
+-			 snap->spa[m][18], snap->spa[m][19]);
+-
+-	zx279133_sdt_layout();
+-	for (t = 0; t < ARRAY_SIZE(zx279133_snap_tables); t++) {
+-		u32 sdt = zx279133_snap_tables[t].sdt;
+-		u32 blocks = zx279133_snap_tables[t].blocks;
+-		u32 base = zx279133_eram_base_of(sdt);
+-		unsigned int b, nonzero = 0, printed = 0;
+-		u32 *buf;
+-
+-		buf = devm_kcalloc(eth->dev, blocks, 4 * sizeof(u32),
+-				   GFP_KERNEL);
+-		if (!buf || !base)
+-			continue;
+-		for (b = 0; b < blocks; b++) {
+-			u32 *w = buf + 4 * b;
+-
+-			if (zx279133_smmu0_read(eth, (base + b) << 7, w,
+-						ZX279133_SMMU0_WORDS,
+-						ZX279133_SMMU0_CMD_READ)) {
+-				dev_warn(eth->dev,
+-					 "vendor ERAM table %#x (%s): block %u read failed, not kept\n",
+-					 sdt, zx279133_snap_tables[t].name,
+-					 base + b);
+-				devm_kfree(eth->dev, buf);
+-				buf = NULL;
+-				break;
+-			}
+-			if (!(w[0] | w[1] | w[2] | w[3]))
+-				continue;
+-			nonzero++;
+-			if (printed++ < ZX279133_SNAP_PRINT_MAX)
+-				dev_info(eth->dev,
+-					 "vendor ERAM %#04x[%4u] (block %u): %08x %08x %08x %08x\n",
+-					 sdt, b, base + b, w[0], w[1], w[2],
+-					 w[3]);
+-		}
+-		if (!buf)
+-			continue;
+-		snap->eram[t] = buf;
+-		dev_info(eth->dev,
+-			 "vendor ERAM table %#x (%s) at block %u: %u of %u blocks non-zero\n",
+-			 sdt, zx279133_snap_tables[t].name, base, nonzero,
+-			 blocks);
+-	}
+-}
+-
+-static void zx279133_vendor_snap_replay(struct zx279133_eth *eth)
+-{
+-	struct zx279133_vendor_snap *snap = eth->vendor_snap;
+-	unsigned int t, m, a, b, failed = 0, named = 0, agree = 0;
+-
+-	if (!snap || !snap->spa_valid) {
+-		dev_warn(eth->dev,
+-			 "no vendor NP state was read before the NPPT reset: the SPA words and ERAM tables keep this driver's values, which are not checked against the vendor's\n");
+-		return;
+-	}
+-
+-	/*
+-	 * State left by anything else - a bootloader, another microcode -
+-	 * starts the ports at PCs this microcode does not have.  The vendor's
+-	 * own state starts them where the port-flow table says.
+-	 */
+-	for (m = 0; m < ZX279133_SNAP_MEMS; m++) {
+-		u32 entry = eth->mcode_port_entry[m];
+-
+-		if (!entry)
+-			continue;
+-		named++;
+-		if ((snap->spa[m][0] & ZX279133_SPA_ENTRY_MASK) == entry)
+-			agree++;
+-	}
+-	if (!named || agree * 2 < named) {
+-		dev_warn(eth->dev,
+-			 "the NP state read before the reset does not start the ports where this microcode does (%u of %u entries agree): not written back\n",
+-			 agree, named);
+-		return;
+-	}
+-
+-	for (m = 0; m < ZX279133_SNAP_MEMS; m++) {
+-		u32 entry = eth->mcode_port_entry[m];
+-
+-		for (a = 0; a < ZX279133_SNAP_ADDRS; a++) {
+-			u32 v = snap->spa[m][a];
+-
+-			/* Word 0's entry fields belong to the microcode. */
+-			if (a == 0 && entry &&
+-			    (v & ZX279133_SPA_ENTRY_MASK) != entry) {
+-				dev_warn(eth->dev,
+-					 "SPA memory %u: the vendor ran word 0 = %08x, the microcode's port-flow entry %06x is kept\n",
+-					 m, v, entry);
+-				v = (v & ~ZX279133_SPA_ENTRY_MASK) | entry;
+-			}
+-			if (zx279133_spa_indirect_write(eth, m, a, v))
+-				failed++;
+-		}
+-	}
+-
+-	for (t = 0; t < ARRAY_SIZE(zx279133_snap_tables); t++) {
+-		u32 base = zx279133_eram_base_of(zx279133_snap_tables[t].sdt);
+-
+-		if (!snap->eram[t] || !base)
+-			continue;
+-		for (b = 0; b < zx279133_snap_tables[t].blocks; b++)
+-			if (zx279133_smmu0_write(eth, (base + b) << 7,
+-						 snap->eram[t] + 4 * b,
+-						 ZX279133_SMMU0_WORDS,
+-						 ZX279133_SMMU0_CMD_WRITE))
+-				failed++;
+-	}
+-
+-	dev_info(eth->dev,
+-		 "vendor NP state written back: SPA memories 0..%u addresses 0..%u, ERAM tables %#x/%#x/%#x (%u writes failed)\n",
+-		 ZX279133_SNAP_MEMS - 1, ZX279133_SNAP_ADDRS - 1,
+-		 zx279133_snap_tables[0].sdt, zx279133_snap_tables[1].sdt,
+-		 zx279133_snap_tables[2].sdt, failed);
+-}
+-
++#ifdef CONFIG_DEBUG_FS
+ /*
+  * The datapath's own counters, stage by stage.
+  *
+@@ -5118,37 +4885,21 @@
+ 	{ "xmac0", 0x50814, 0x241 },
+ };
+ 
+-static unsigned int zx279133_hwcnt_words(void)
++/* One line per window, listing the words that are non-zero, as word=value. */
++static void zx279133_hwcnt_print(struct zx279133_eth *eth)
+ {
+-	unsigned int i, n = 0;
+-
+-	for (i = 0; i < ARRAY_SIZE(zx279133_hwcnt_wins); i++)
+-		n += zx279133_hwcnt_wins[i].count;
+-	return n;
+-}
+-
+-/*
+- * One line per window, listing the words that are non-zero (delta false) or
+- * that moved since the previous shot (delta true), as word=value(+change).
+- */
+-static void zx279133_hwcnt_print(struct zx279133_eth *eth, bool delta)
+-{
+-	u32 *prev = delta ? eth->hwcnt_prev : NULL;
+-	unsigned int i, k, idx = 0;
++	unsigned int i, k;
+ 	char line[256];
+ 
+ 	for (i = 0; i < ARRAY_SIZE(zx279133_hwcnt_wins); i++) {
+ 		size_t len = 0;
+ 		bool any = false;
+ 
+-		for (k = 0; k < zx279133_hwcnt_wins[i].count; k++, idx++) {
++		for (k = 0; k < zx279133_hwcnt_wins[i].count; k++) {
+ 			u32 word = zx279133_hwcnt_wins[i].word + k;
+ 			u32 v = readl(eth->base + 4 * word);
+-			u32 old = prev ? prev[idx] : 0;
+ 
+-			if (prev)
+-				prev[idx] = v;
+-			if (v == old)
++			if (!v)
+ 				continue;
+ 			if (len > sizeof(line) - 40) {
+ 				pr_info("zx279133 hwcnt %s:%s\n",
+@@ -5156,8 +4907,7 @@
+ 				len = 0;
+ 			}
+ 			len += scnprintf(line + len, sizeof(line) - len,
+-					 " %05x=%08x(%+lld)", word, v,
+-					 (s64)v - (s64)old);
++					 " %05x=%08x", word, v);
+ 			any = true;
+ 		}
+ 		if (any)
+@@ -5165,63 +4915,7 @@
+ 				zx279133_hwcnt_wins[i].name, line);
+ 	}
+ }
+-
+-/* The shots after the first: 20 s, 45 s, 90 s and 180 s after the prepare. */
+-static const unsigned int zx279133_hwcnt_at[] = { 20, 45, 90, 180 };
+-
+-static void zx279133_hwcnt_work(struct work_struct *work)
+-{
+-	struct zx279133_eth *eth = container_of(to_delayed_work(work),
+-						struct zx279133_eth,
+-						hwcnt_work);
+-	unsigned int shot = eth->hwcnt_shot++;
+-	unsigned long next;
+-
+-	/* The registers are not to be read with the NPPT's clocks off. */
+-	if (READ_ONCE(eth->hardware_prepared)) {
+-		pr_info("zx279133 hwcnt shot %u at +%us (changes since the previous shot)\n",
+-			shot + 1,
+-			jiffies_to_msecs(jiffies - eth->hwcnt_start) / 1000);
+-		zx279133_hwcnt_print(eth, true);
+-	}
+-	if (eth->hwcnt_shot >= ARRAY_SIZE(zx279133_hwcnt_at))
+-		return;
+-	next = eth->hwcnt_start +
+-	       secs_to_jiffies(zx279133_hwcnt_at[eth->hwcnt_shot]);
+-	schedule_delayed_work(&eth->hwcnt_work,
+-			      time_after(next, jiffies) ? next - jiffies : 0);
+-}
+-
+-static void zx279133_hwcnt_cancel(void *data)
+-{
+-	struct zx279133_eth *eth = data;
+-
+-	cancel_delayed_work_sync(&eth->hwcnt_work);
+-}
+-
+-static void zx279133_hwcnt_start(struct zx279133_eth *eth)
+-{
+-	if (!eth->hwcnt_prev) {
+-		eth->hwcnt_prev = devm_kcalloc(eth->dev, zx279133_hwcnt_words(),
+-					       sizeof(u32), GFP_KERNEL);
+-		if (!eth->hwcnt_prev)
+-			return;
+-		INIT_DELAYED_WORK(&eth->hwcnt_work, zx279133_hwcnt_work);
+-		if (devm_add_action_or_reset(eth->dev, zx279133_hwcnt_cancel,
+-					     eth)) {
+-			eth->hwcnt_prev = NULL;
+-			return;
+-		}
+-	}
+-	cancel_delayed_work_sync(&eth->hwcnt_work);
+-	memset(eth->hwcnt_prev, 0, zx279133_hwcnt_words() * sizeof(u32));
+-	eth->hwcnt_shot = 0;
+-	eth->hwcnt_start = jiffies;
+-	pr_info("zx279133 hwcnt shot 0 (non-zero counters after the prepare)\n");
+-	zx279133_hwcnt_print(eth, true);
+-	schedule_delayed_work(&eth->hwcnt_work,
+-			      secs_to_jiffies(zx279133_hwcnt_at[0]));
+-}
++#endif /* CONFIG_DEBUG_FS */
+ 
+ int zx279133_np_prepare(struct zx279133_eth *eth)
+ {
+@@ -5260,17 +4954,6 @@
+ 	if (ret)
+ 		goto err_route_off;
+ 	/*
+-	 * Everything the vendor's np.ko and switch.ko had programmed into the
+-	 * SPA memories and the ERAM tables before the kexec goes back in,
+-	 * over this driver's own values (zx279133_vendor_snap_replay()).
+-	 */
+-	zx279133_vendor_snap_replay(eth);
+-	if (eth->lan_wan_vports) {
+-		ret = zx279133_lan_vport_bringup(eth);
+-		if (ret)
+-			goto err_route_off;
+-	}
+-	/*
+ 	 * The port attributes are the switch side; the PHY is the line side.
+ 	 * A UNI port whose PHY is still powered down never links, so it is
+ 	 * enabled after the chip itself has been programmed.
+@@ -5282,7 +4965,6 @@
+ 	 * bootloader left before anything here changes it.
+ 	 */
+ 	zx279133_9132_port_enable_read(eth);
+-	zx279133_hwcnt_start(eth);
+ 
+ 	return 0;
+ 
+@@ -5302,9 +4984,6 @@
+ 
+ void zx279133_np_restore(struct zx279133_eth *eth)
+ {
+-	/* The counter shots read NPPT registers; the clocks go off next. */
+-	if (eth->hwcnt_prev)
+-		cancel_delayed_work_sync(&eth->hwcnt_work);
+ 	zx279133_sipc_final_restore(eth);
+ 	zx279133_sdet_restore(eth);
+ 	zx279133_nppu_late_restore(eth);

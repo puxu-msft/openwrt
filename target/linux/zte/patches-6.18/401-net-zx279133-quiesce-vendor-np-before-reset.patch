@@ -1,327 +1,26 @@
 From: xp <a.xp@live.com>
-Subject: [PATCH] net: ethernet: zte: zx279133: 复位 NPPT 前照原厂先停数据面，原厂 SPA 字只读不写回，外置 PHY 自协商等待逐秒打印
+Subject: [PATCH] net: ethernet: zte: zx279133: 复位 NPPT 前照原厂先停数据面
 
-中兴 F7615MV3 第五到第七轮实机（2026-11-27，构建树 4975e378c3c，ramoops 的控制台记录在 captures/20261127-usbroot/）：三轮都在交接后挂死，挂在哪一步随交接时原厂 NP 的状态变（第五轮放开收包之后、第六轮 NPPT 全局初始化超时与 ISU 忙、第七轮外置 PHY 自协商的 8 s 等待里），与 vendor_snap、lane_an 两个开关无关；第五轮读出的三张 ERAM 表整表是同一个字型、第六轮全是 0，399 的写回把这份无意义的字型写进了 MF 扩展表、端口类型表与协议动作表。
+中兴 F7615MV3 第五到第七轮实机（2026-11-27，构建树 4975e378c3c，ramoops 的控制台记录在 zte-f7615mv3 的 captures/20261127-usbroot/）：三轮都在 kexec 交接后挂死，挂在哪一步随交接时原厂 NP 的状态变（第五轮放开收包之后、第六轮 NPPT 全局初始化超时与 ISU 忙、第七轮外置 PHY 自协商的 8 s 等待里）。原厂 np.ko 没有停 NP 的路径（模块退出只调 tm_remove() 与注销调试节点），kexec 时 PPU、IDM 的 DMA 与收包都还在跑。
 
-- 原厂现场只读：去掉 ERAM 表的读与写回（NPPT/SE 初始化之前的 SMMU0 读拿不到表内容），SPA 内存 0..16 的字 0..19 只读出、打印，不再写回；zx279133.vendor_snap=0 关掉这次读。
-- 复位 NPPT 之前先停原厂留下的数据面（原厂 np.ko 没有停 NP 的路径，kexec 时 PPU、IDM 的 DMA 与收包都还在跑）：照原厂 tm_initial() 的第一步 spic_set_rx_en(0) 清 SIPC 收包使能（NPPT+0x4000 bit 0），等 10 ms（原厂 woe_demo_tx_idm_ser() 轮询环 FIFO 排空，CPU 环的对应字未核，以定时代替），再照 woe_demo_tx_idm_ser() 的 crm_idm_rst_en()/crm_idm_rst_disable() 把 CRM 字 NPPT+0x2c0010 的 bits 30:25 清零 10 ms 再置回；每步一行日志，开头打出 SIPC_CFG、0x2c0004、0x80 与 IDM 复位字；tm_initial() 里清 SMAC 配置两项的那一步对应哪一位未核，没做。NPPT 全局初始化超时的报错同时打出 0x80 的初始化完成字与 0x2c0004，成功时也打一行。
-- 外置 2.5G PHY 自协商的 8 s 等待（msleep(200) × 40，可睡眠、开着中断，不占自旋锁）每满 1 s 打一行“still waiting for auto-negotiation”，其后 SerDes 链路的 2 s 等待在 1 s 时打一行；死在等待里时控制台记录能看出是第几秒。
+- 复位 NPPT 之前先停原厂留下的数据面：照原厂 tm_initial() 的第一步 spic_set_rx_en(0) 清 SIPC 收包使能（NPPT+0x4000 bit 0），等 10 ms（原厂 woe_demo_tx_idm_ser() 在这一步轮询环 FIFO 排空，CPU 收发环对应的字未核，以定时代替），再照 woe_demo_tx_idm_ser() 的 crm_idm_rst_en()/crm_idm_rst_disable() 把 CRM 字 NPPT+0x2c0010 的 bits 30:25 清零 10 ms 再置回。tm_initial() 里清 SMAC 配置两项的那一步对应哪一位未核，没做。
+- NPPT 全局初始化超时的报错同时打出 0x80 的初始化完成字（与期望值）和 0x2c0004 的软复位字。
 
---- a/drivers/net/ethernet/zte/zx279133-np.c
-+++ b/drivers/net/ethernet/zte/zx279133-np.c
-@@ -34,12 +34,12 @@
- MODULE_PARM_DESC(rx_hash_ipv6, "Enable IPv6 tuple hashing with the calibrated RX hash programs");
- /*
-  * 二分用的开关（内核命令行 zx279133.vendor_snap=0、zx279133.hwcnt=0），缺省都开：
-- * vendor_snap 管第一次准备硬件时在 NPPT 复位前读原厂 NP 现场、之后每次准备时写回；
-+ * vendor_snap 管第一次准备硬件时在 NPPT 复位前只读打印原厂的 SPA 字；
-  * hwcnt 管准备完成时与之后 20/45/90/180 s 的各级计数打印（调试控制台的 cnt 不受它管）。
-  */
- static bool vendor_snap = true;
- module_param(vendor_snap, bool, 0444);
--MODULE_PARM_DESC(vendor_snap, "Read the vendor's NP state before the first NPPT reset and write it back after this driver's set-up");
-+MODULE_PARM_DESC(vendor_snap, "Read and print the vendor's SPA words before the first NPPT reset (read only)");
- static bool hwcnt = true;
- module_param(hwcnt, bool, 0444);
- MODULE_PARM_DESC(hwcnt, "Print the datapath counters after the prepare and 20/45/90/180 s later");
-@@ -3770,7 +3770,7 @@
-  * wrong place.  type 1 is ERAM, 3 is hash, 4 is statistics and 5 is an ERAM
-  * table with a parser SDT.  ERAM tables take blocks from the pool strictly in
-  * this order, so every table's base follows from the list
-- * (zx279133_sdt_layout()).  p3 selects the width of one entry out of {1, 32,
-+ *.  p3 selects the width of one entry out of {1, 32,
-  * 64, 128, 2, 4, 8, 16} bits.
-  */
- static const u32 zx279133_core_sdt_info[][4] = {
-@@ -4027,34 +4027,6 @@
- 			     "SE PLCR init done status %#x\n", status);
- }
- 
--/*
-- * The ERAM bases the list gives, worked out without touching the hardware:
-- * the vendor's allocator hands out blocks from 0x3000 in list order (see
-- * zx279133_se_sdt_create() for why 0x3000).
-- */
--static void zx279133_sdt_layout(void)
--{
--	u32 eram_base = 0x3000;
--	unsigned int i;
--
--	for (i = 0; i < ARRAY_SIZE(zx279133_core_sdt_info); i++) {
--		u32 sdt_no = zx279133_core_sdt_info[i][0];
--		u32 type = zx279133_core_sdt_info[i][1];
--		u32 a = zx279133_core_sdt_info[i][2];
--		u32 b = zx279133_core_sdt_info[i][3];
--		u32 bit_len;
--
--		if (type != 1 && type != 5)
--			continue;
--		bit_len = zx279133_se_sdt_bit_len[a & 7];
--		if (sdt_no < ZX279133_SDT_ID_MAX) {
--			zx279133_eram[sdt_no].base = eram_base;
--			zx279133_eram[sdt_no].bit_len = bit_len;
--		}
--		eram_base += (bit_len * b + 127) >> 7;
--	}
--}
--
- static int zx279133_se_sdt_create(struct zx279133_eth *eth)
- {
- 	/*
-@@ -4866,54 +4838,25 @@
- }
- 
- /*
-- * The vendor's NP state, read before this driver changes any of it.
-+ * 原厂留下的 SPA 字，只读出、打印，不写回。
-  *
-- * The board runs OpenWrt by kexec from its own vendor system, and at that
-- * moment the vendor's np.ko and switch.ko have programmed the NP for this
-- * board: the SPA memories (the per-port words the PPU starts every frame
-- * from) and the SE's ERAM tables.  Those are this board's own values, and
-- * for most of them nothing else says what they should be.  So the first
-- * prepare reads them before zx279133_tm_prepare() resets the NPPT, prints
-- * them, and zx279133_vendor_snap_replay() writes them back once this
-- * driver's own set-up is done.
-- *
-- * Read are SPA memories 0..16 (PON0, the four 1G MACs, XMAC0, XMAC1, RGMII1,
-- * the loop, XMAC_B, PON_PTL, PON1, the CPU trap, WIFI0) at addresses 0..19,
-- * the whole of np.ko's spa_port_attr_table, and the three ERAM tables this
-- * driver writes: the MF extension table (SDT 0x32, one entry per SPA
-- * memory), the port type table (SDT 0x06) and the protocol action table
-- * (SDT 0x04, 16 blocks per port).  The ERAM bases come from
-- * zx279133_core_sdt_info[], which is the vendor's list; if the vendor's
-- * tables are not where the list puts them, the printed blocks say so.
-- *
-- * A cold boot has no vendor state: no SPA memory then carries a valid
-- * start-PC entry, and nothing is written back.
-+ * 本机经 kexec 从原厂系统起来，那一刻原厂 np.ko 已按本机配好 SPA 内存（PPU 每帧起步的每口字）。第一次准备硬件时在
-+ * zx279133_tm_prepare() 复位 NPPT 之前读出 SPA 内存 0..16 的地址 0..19（np.ko spa_port_attr_table 的全部字）打进 dmesg，
-+ * 作为原厂运行时读数的出处。SE 的 ERAM 表不读：NPPT/SE 初始化之前的 SMMU0 读拿不到表内容（第五轮整表读成同一个字型、
-+ * 第六轮全是 0，docs/07 第⑤步），写回那份读数会把表写坏。
-  */
- #define ZX279133_SNAP_MEMS	17
- #define ZX279133_SNAP_ADDRS	20
--#define ZX279133_SNAP_PRINT_MAX	64
--
--static const struct {
--	u32 sdt;
--	u32 blocks;
--	const char *name;
--} zx279133_snap_tables[] = {
--	{ ZX279133_MF_ERAM_SDT_ID, 64, "MF extension" },
--	{ ZX279133_PORT_TYPE_ERAM_SDT_ID, 64, "port type" },
--	{ ZX279133_PRO_ERAM_SDT_ID, 64 * ZX279133_PRO_BLOCKS_PER_PORT,
--	  "protocol action" },
--};
- 
- struct zx279133_vendor_snap {
- 	bool spa_valid;
- 	u32 spa[ZX279133_SNAP_MEMS][ZX279133_SNAP_ADDRS];
--	u32 *eram[ARRAY_SIZE(zx279133_snap_tables)];
- };
- 
- void zx279133_vendor_snap_take(struct zx279133_eth *eth)
- {
- 	struct zx279133_vendor_snap *snap;
--	unsigned int t, m, a, named = 0;
-+	unsigned int m, a, named = 0;
- 	bool spa_ok = true;
- 
- 	if (eth->vendor_snap_tried)
-@@ -4950,9 +4893,9 @@
- 			named++;
- 	snap->spa_valid = spa_ok && named;
- 	dev_info(eth->dev,
--		 "vendor NP state before the NPPT reset: SPA reads %s, %u of %u memories carry a start-PC entry%s\n",
-+		 "vendor SPA words before the NPPT reset (read only): reads %s, %u of %u memories carry a start-PC entry%s\n",
- 		 spa_ok ? "complete" : "FAILED", named, ZX279133_SNAP_MEMS,
--		 snap->spa_valid ? "" : " - nothing will be written back");
-+		 snap->spa_valid ? "" : " - not the vendor's state");
- 	for (m = 0; m < ZX279133_SNAP_MEMS; m++)
- 		dev_info(eth->dev,
- 			 "vendor SPA mem %2u: %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x %08x\n",
-@@ -4963,123 +4906,6 @@
- 			 snap->spa[m][12], snap->spa[m][13], snap->spa[m][14],
- 			 snap->spa[m][15], snap->spa[m][16], snap->spa[m][17],
- 			 snap->spa[m][18], snap->spa[m][19]);
--
--	zx279133_sdt_layout();
--	for (t = 0; t < ARRAY_SIZE(zx279133_snap_tables); t++) {
--		u32 sdt = zx279133_snap_tables[t].sdt;
--		u32 blocks = zx279133_snap_tables[t].blocks;
--		u32 base = zx279133_eram_base_of(sdt);
--		unsigned int b, nonzero = 0, printed = 0;
--		u32 *buf;
--
--		buf = devm_kcalloc(eth->dev, blocks, 4 * sizeof(u32),
--				   GFP_KERNEL);
--		if (!buf || !base)
--			continue;
--		for (b = 0; b < blocks; b++) {
--			u32 *w = buf + 4 * b;
--
--			if (zx279133_smmu0_read(eth, (base + b) << 7, w,
--						ZX279133_SMMU0_WORDS,
--						ZX279133_SMMU0_CMD_READ)) {
--				dev_warn(eth->dev,
--					 "vendor ERAM table %#x (%s): block %u read failed, not kept\n",
--					 sdt, zx279133_snap_tables[t].name,
--					 base + b);
--				devm_kfree(eth->dev, buf);
--				buf = NULL;
--				break;
--			}
--			if (!(w[0] | w[1] | w[2] | w[3]))
--				continue;
--			nonzero++;
--			if (printed++ < ZX279133_SNAP_PRINT_MAX)
--				dev_info(eth->dev,
--					 "vendor ERAM %#04x[%4u] (block %u): %08x %08x %08x %08x\n",
--					 sdt, b, base + b, w[0], w[1], w[2],
--					 w[3]);
--		}
--		if (!buf)
--			continue;
--		snap->eram[t] = buf;
--		dev_info(eth->dev,
--			 "vendor ERAM table %#x (%s) at block %u: %u of %u blocks non-zero\n",
--			 sdt, zx279133_snap_tables[t].name, base, nonzero,
--			 blocks);
--	}
--}
--
--static void zx279133_vendor_snap_replay(struct zx279133_eth *eth)
--{
--	struct zx279133_vendor_snap *snap = eth->vendor_snap;
--	unsigned int t, m, a, b, failed = 0, named = 0, agree = 0;
--
--	if (!vendor_snap)
--		return;
--	if (!snap || !snap->spa_valid) {
--		dev_warn(eth->dev,
--			 "no vendor NP state was read before the NPPT reset: the SPA words and ERAM tables keep this driver's values, which are not checked against the vendor's\n");
--		return;
--	}
--
--	/*
--	 * State left by anything else - a bootloader, another microcode -
--	 * starts the ports at PCs this microcode does not have.  The vendor's
--	 * own state starts them where the port-flow table says.
--	 */
--	for (m = 0; m < ZX279133_SNAP_MEMS; m++) {
--		u32 entry = eth->mcode_port_entry[m];
--
--		if (!entry)
--			continue;
--		named++;
--		if ((snap->spa[m][0] & ZX279133_SPA_ENTRY_MASK) == entry)
--			agree++;
--	}
--	if (!named || agree * 2 < named) {
--		dev_warn(eth->dev,
--			 "the NP state read before the reset does not start the ports where this microcode does (%u of %u entries agree): not written back\n",
--			 agree, named);
--		return;
--	}
--
--	for (m = 0; m < ZX279133_SNAP_MEMS; m++) {
--		u32 entry = eth->mcode_port_entry[m];
--
--		for (a = 0; a < ZX279133_SNAP_ADDRS; a++) {
--			u32 v = snap->spa[m][a];
--
--			/* Word 0's entry fields belong to the microcode. */
--			if (a == 0 && entry &&
--			    (v & ZX279133_SPA_ENTRY_MASK) != entry) {
--				dev_warn(eth->dev,
--					 "SPA memory %u: the vendor ran word 0 = %08x, the microcode's port-flow entry %06x is kept\n",
--					 m, v, entry);
--				v = (v & ~ZX279133_SPA_ENTRY_MASK) | entry;
--			}
--			if (zx279133_spa_indirect_write(eth, m, a, v))
--				failed++;
--		}
--	}
--
--	for (t = 0; t < ARRAY_SIZE(zx279133_snap_tables); t++) {
--		u32 base = zx279133_eram_base_of(zx279133_snap_tables[t].sdt);
--
--		if (!snap->eram[t] || !base)
--			continue;
--		for (b = 0; b < zx279133_snap_tables[t].blocks; b++)
--			if (zx279133_smmu0_write(eth, (base + b) << 7,
--						 snap->eram[t] + 4 * b,
--						 ZX279133_SMMU0_WORDS,
--						 ZX279133_SMMU0_CMD_WRITE))
--				failed++;
--	}
--
--	dev_info(eth->dev,
--		 "vendor NP state written back: SPA memories 0..%u addresses 0..%u, ERAM tables %#x/%#x/%#x (%u writes failed)\n",
--		 ZX279133_SNAP_MEMS - 1, ZX279133_SNAP_ADDRS - 1,
--		 zx279133_snap_tables[0].sdt, zx279133_snap_tables[1].sdt,
--		 zx279133_snap_tables[2].sdt, failed);
- }
- 
- /*
-@@ -5282,17 +5108,6 @@
- 	if (ret)
- 		goto err_route_off;
- 	/*
--	 * Everything the vendor's np.ko and switch.ko had programmed into the
--	 * SPA memories and the ERAM tables before the kexec goes back in,
--	 * over this driver's own values (zx279133_vendor_snap_replay()).
--	 */
--	zx279133_vendor_snap_replay(eth);
--	if (eth->lan_wan_vports) {
--		ret = zx279133_lan_vport_bringup(eth);
--		if (ret)
--			goto err_route_off;
--	}
--	/*
- 	 * The port attributes are the switch side; the PHY is the line side.
- 	 * A UNI port whose PHY is still powered down never links, so it is
- 	 * enabled after the chip itself has been programmed.
---- a/drivers/net/ethernet/zte/zx279133-switch.c
-+++ b/drivers/net/ethernet/zte/zx279133-switch.c
-@@ -2792,6 +2792,11 @@
- 				}
- 				msleep(200);
- 				waited += 200;
-+				/* 每满 1 s 打一行：这段等待里整机没了声音时，控制台记录（pstore）停在第几秒 */
-+				if (!(waited % 1000))
-+					dev_info(priv->dev,
-+						 "the 2.5G jack's PHY: still waiting for auto-negotiation, %u s (status 0x%04x)\n",
-+						 waited / 1000, an < 0 ? 0xffff : an);
- 			}
- 			if (i == 40)
- 				dev_warn(priv->dev,
-@@ -2830,6 +2835,9 @@
- 				break;
- 		}
- 		msleep(50);
-+		if (i == 19)
-+			dev_info(priv->dev,
-+				 "the 2.5G jack's PHY: still waiting for the SerDes link, 1 s\n");
- 	}
- 
- 	mode = mdiobus_c45_read(bus, priv->outer_addr,
+第八至十三轮实机的控制台记录（zte-f7615mv3 的 captures/20261127-usbroot/ 下 ramoops-004、-005、-008、-009 的 console.txt 与 bootlog-025、-029）里，停数据面之后 NPPT 全局初始化每轮都完成；第十四轮网口收发通。
+
+试验里让 TX 超时只打印、不关硬件的 tx_recover 开关没有带进来：TX 超时恢复照原行为走 zx279133_tx_recovery_work() → zx279133_datapath_suspend() → zx279133_shared_idm_release(…, tx_quiesced=false)，打印 “TX did not quiesce; shutting down hardware before release”。第十轮实机（发包当时还不通，zte-f7615mv3 的 captures/20261127-usbroot/ramoops-008/console.txt 末行 23.27 s）这条路径挂死过整机，根因未定。按现状挂死后会被看门狗复位回原厂系统、可以远程再交接；改成只打印不关硬件则发包永久停住、看门狗照常喂、只能断电，更难恢复，所以不加规避，根因待查（登记在 zte-f7615mv3 的 docs/TASKS.md）。
+
 --- a/drivers/net/ethernet/zte/zx279133-tm.c
 +++ b/drivers/net/ethernet/zte/zx279133-tm.c
-@@ -7,9 +7,45 @@
+@@ -7,9 +7,32 @@
  
  #include "zx279133.h"
  
 +/*
-+ * kexec 交接时原厂的 NP 还在跑：原厂 np.ko 的模块退出只调 tm_remove() 与注销调试节点，没有停 NP 的路径，PPU、IDM 的 DMA
-+ * 与收包都留着。复位 NPPT 之前先照原厂的做法把数据面停下，每步一行日志（时间戳看是哪一步之后没了声音）：
-+ * 1. 照原厂 tm_initial() 的第一步 spic_set_rx_en(0)：SIPC 的收包使能清掉（NPPT+0x4000 bit 0，np.ko 寄存器表 sipc 第 0 项），
-+ *    不再有帧从 MAC 进 NP；
-+ * 2. 等 10 ms 让已进 NP 的帧走完：原厂 woe_demo_tx_idm_ser() 在这一步轮询环 FIFO 的剩余直到排空，那组寄存器是 WOE 频段的，
-+ *    CPU 收发环对应的字未与原厂核对，这里以定时代替；
-+ * 3. 照 woe_demo_tx_idm_ser() 的 crm_idm_rst_en()/crm_idm_rst_disable()：CRM 字 NPPT+0x2c0010 的 bits 30:25（每个频段两位，
-+ *    低有效；np.ko 寄存器表 crm 第 0 项）清零让 IDM 进复位，10 ms 后置回。
++ * kexec 交接时原厂的 NP 还在跑：原厂 np.ko 的模块退出只调 tm_remove() 与注销调试节点，没有停 NP 的路径，PPU、IDM 的 DMA 与收包都留着；不停就复位时，交接那一刻原厂 NP 的状态决定新内核挂在哪一步（F7615MV3 第五到第七轮实机分别挂在放开收包之后、NPPT 全局初始化超时与 ISU 忙、外置 PHY 自协商的等待里）。所以复位 NPPT 之前先照原厂的做法把数据面停下：
++ * 1. 照原厂 tm_initial() 的第一步 spic_set_rx_en(0)：SIPC 的收包使能清掉（NPPT+0x4000 bit 0，np.ko 寄存器表 sipc 第 0 项），不再有帧从 MAC 进 NP；
++ * 2. 等 10 ms 让已进 NP 的帧走完：原厂 woe_demo_tx_idm_ser() 在这一步轮询环 FIFO 的剩余直到排空，那组寄存器是 WOE 频段的，CPU 收发环对应的字未与原厂核对，这里以定时代替；
++ * 3. 照 woe_demo_tx_idm_ser() 的 crm_idm_rst_en()/crm_idm_rst_disable()：CRM 字 NPPT+0x2c0010 的 bits 30:25（每个频段两位，低有效；np.ko 寄存器表 crm 第 0 项）清零让 IDM 进复位，10 ms 后置回。
 + * tm_initial() 在第一步之后还经 smac_get_cfg()/smac_set_cfg() 清每个 SMAC 配置里的两项，对应哪一位未与原厂核对，这里没做。
 + */
 +#define ZX279133_CRM_IDM_RST		0x2c0010
@@ -330,23 +29,14 @@ Subject: [PATCH] net: ethernet: zte: zx279133: 复位 NPPT 前照原厂先停数
 +
 +static void zx279133_np_quiesce(struct zx279133_eth *eth)
 +{
-+	u32 sipc = readl(eth->base + ZX279133_SIPC_CFG);
 +	u32 crm = readl(eth->base + ZX279133_CRM_IDM_RST);
 +
-+	dev_info(eth->dev,
-+		 "quiesce: SIPC_CFG %#x, soft reset %#x, init done %#x, IDM reset word %#x\n",
-+		 sipc, readl(eth->base + ZX279133_SYS_SOFT_RESET),
-+		 readl(eth->base + ZX279133_GLOBAL_INIT_DONE), crm);
-+	writel(sipc & ~ZX279133_SIPC_RX_EN, eth->base + ZX279133_SIPC_CFG);
-+	dev_info(eth->dev, "quiesce: SIPC receive off\n");
++	writel(readl(eth->base + ZX279133_SIPC_CFG) & ~ZX279133_SIPC_RX_EN,
++	       eth->base + ZX279133_SIPC_CFG);
 +	usleep_range(10000, 11000);
 +	writel(crm & ~ZX279133_CRM_IDM_RST_N, eth->base + ZX279133_CRM_IDM_RST);
-+	dev_info(eth->dev, "quiesce: IDM held in reset (%#x)\n",
-+		 readl(eth->base + ZX279133_CRM_IDM_RST));
 +	usleep_range(10000, 11000);
 +	writel(crm | ZX279133_CRM_IDM_RST_N, eth->base + ZX279133_CRM_IDM_RST);
-+	dev_info(eth->dev, "quiesce: IDM released (%#x)\n",
-+		 readl(eth->base + ZX279133_CRM_IDM_RST));
 +}
 +
  static int zx279133_np_reset_prepare(struct zx279133_eth *eth)
@@ -356,7 +46,7 @@ Subject: [PATCH] net: ethernet: zte: zx279133: 复位 NPPT 前照原厂先停数
  	int ret;
  
  	/*
-@@ -36,6 +72,7 @@
+@@ -36,6 +59,7 @@
  		return 0;
  	}
  
@@ -364,7 +54,7 @@ Subject: [PATCH] net: ethernet: zte: zx279133: 复位 NPPT 前照原厂先停数
  	value = readl(eth->base + ZX279133_SYS_SOFT_RESET);
  	value &= ~ZX279133_SYS_SDET_RESET_N;
  	writel(value, eth->base + ZX279133_SYS_SOFT_RESET);
-@@ -55,8 +92,8 @@
+@@ -55,8 +79,8 @@
  	writel(ZX279133_SIPC_RX_GAP_VALUE, eth->base + ZX279133_SIPC_RX_GAP);
  
  	ret = readl_poll_timeout_atomic(eth->base + ZX279133_GLOBAL_INIT_DONE,
@@ -375,7 +65,7 @@ Subject: [PATCH] net: ethernet: zte: zx279133: 复位 NPPT 前照原厂先停数
  					ZX279133_GLOBAL_INIT_DONE_MASK,
  					100, 40000);
  	usleep_range(200, 250);
-@@ -65,8 +102,10 @@
+@@ -65,8 +89,8 @@
  	       eth->base + ZX279133_SYS_SOFT_RESET);
  	if (ret)
  		return dev_err_probe(eth->dev, ret,
@@ -383,8 +73,6 @@ Subject: [PATCH] net: ethernet: zte: zx279133: 复位 NPPT 前照原厂先停数
 -				     value);
 +				     "NPPT global initialization timed out: init done %#x (want %#x), soft reset %#x\n",
 +				     done, ZX279133_GLOBAL_INIT_DONE_MASK, value);
-+	dev_info(eth->dev, "NPPT reset and global initialization done (init done %#x, soft reset %#x)\n",
-+		 done, value);
  
  	return 0;
  }
