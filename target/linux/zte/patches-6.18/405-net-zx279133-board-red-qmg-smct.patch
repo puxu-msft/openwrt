@@ -1,0 +1,465 @@
+From: xp <a.xp@live.com>
+Subject: [PATCH] net: ethernet: zte: zx279133: RED、QMG、SMCT 的取值按板子给
+
+zx279133_red_vendor_fixup()、zx279133_tm_vendor_fixup() 写的 36 个字（RED 16 个、QMG 4 个、SMCT 8 个与 8 个入口门限）原先写死成 woodnaonly 照创维 SK-D840N 原厂读出的值。中兴 F7615MV3 原厂系统的现场读数（只读 devmem，zte-f7615mv3 的 captures/20261127-usbroot/vendor-np-regs.txt）与之逐字对照 35 个不同（例如 RED_CFG 本机原厂是 0x7e、SK-D840N 是 0x9e），八个入口门限也不全相同；第十一至十四轮实机（本地试验 tx-diag 起）都跑在本机这组值上，第十四轮收发通。
+
+- 三组字由板级设备树的 zte,red-words（16 个字）、zte,qmg-words（4 个字）、zte,smct-words（16 个字：SEL_CFG0、COS_TH0..3、MC_TH、NP1_TH、IDM_SSCH_TH、INPORT_TH0..7）给，各字的寄存器与次序在 zx279133-main.c 的 zx279133_red_words[]、zx279133_qmg_words[]、zx279133_smct_words[]，次序就是写入的次序；没有这些属性时用原来的 SK-D840N 值；长度不对时 probe 报错退出。
+- RED 的 restore 数组（red_saved、red_np1_saved）照旧取写入的值；CPU133_CFG、NP1 ISU 门限与 RED 队列缓冲表不在板级参数里。NP1 ISU 门限与 F7615MV3 原厂不同（原厂现场 0x20260..0x20274 是 0x00140100、0x20278 是 0x70006000），尚未对齐，说明里注明并指向 zte-f7615mv3 的 docs/TASKS.md。
+- 三个属性只写了其中一两个时打一行告警（不拦）：三组字要取自同一块板子的原厂固件，缺的那几组会用 SK-D840N 的缺省。
+- zx279133.h 里 woodnaonly 照 SK-D840N 原厂读出的 RED、QMG、SMCT 常量由 ZX279133_{RED,QMG,SMCT}_VENDOR_* 改名为 ZX279133_{RED,QMG,SMCT}_SK_D840N_*（现在它们就是 SK-D840N 的缺省值），引用一并改，不留旧名。
+- 用设备树属性、不在驱动里按 compatible 放板级表：与 IDM 路由、发包第 6 字同一个做法，共用驱动只带缺省，板子自己的取值都在板级设备树里；两块板子的 NPPT 节点在 SoC dtsi 里是同一个 compatible（zte,zx279133-nppt），按 compatible 选表就得匹配机器 compatible、在驱动里写死 F7615MV3 的值；原来的“偏移 + 值”表拆成偏移表加板级取值数组，写入次序与 restore 数组都不变。
+
+--- a/drivers/net/ethernet/zte/zx279133.h
++++ b/drivers/net/ethernet/zte/zx279133.h
+@@ -322,12 +322,14 @@
+  * The values are the vendor board's own, out of its console dump
+  * (staging/ctl/vendor-serial-mods/tm-qmg.txt, words 0x05, 0x06, 0x08 and
+  * 0x18, and tm-red.txt word 0x22 for the WOE watermark).
++ *
++ * 这里说的 "this board" 是创维 SK-D840N（woodnaonly 照它的原厂读数写的），这些值是缺省；别的板子的原厂取值由板级设备树的 zte,qmg-words 给（zx279133-main.c 的 zx279133_qmg_words[]）。
+  */
+-#define ZX279133_QMG_VENDOR_WATERMARK		0x0bb80fa0
+-#define ZX279133_QMG_VENDOR_DESC_OUT		0x80003000
+-#define ZX279133_QMG_VENDOR_WOE_OUT		0x80000000
+-#define ZX279133_QMG_VENDOR_DESC_IN		0x10001000
+-#define ZX279133_QMG_VENDOR_WOE_RED_WATERMARK	0x08bf07ff
++#define ZX279133_QMG_SK_D840N_WATERMARK		0x0bb80fa0
++#define ZX279133_QMG_SK_D840N_DESC_OUT		0x80003000
++#define ZX279133_QMG_SK_D840N_WOE_OUT		0x80000000
++#define ZX279133_QMG_SK_D840N_DESC_IN		0x10001000
++#define ZX279133_QMG_SK_D840N_WOE_RED_WATERMARK	0x08bf07ff
+ 
+ #define ZX279133_SOPC_CRC_PADDING	0x343c4
+ #define ZX279133_SOPC_FIFO_THRESHOLD	0x343d0
+@@ -469,45 +471,47 @@
+  * The share-max and watermark registers are the ones the vendor's board reads
+  * back; several of them carry bits the vendor never writes (they are the
+  * hardware's reset default), so the whole word is written.
++ *
++ * 这里说的 "this board" 是创维 SK-D840N（woodnaonly 照它的原厂读数写的），这些值是缺省；别的板子的原厂取值由板级设备树的 zte,red-words 给（zx279133-main.c 的 zx279133_red_words[]），例如中兴 F7615MV3 原厂的 RED_CFG 是 0x7e。队列缓冲表（ZX279133_RED_SK_D840N_IN_UNI 起的六个字）与 NP1 ISU 门限（ZX279133_RED_SK_D840N_NP1_ISU_TH）不在板级参数里，各板都用这里的值；其中 NP1 ISU 门限与 F7615MV3 原厂不同：原厂现场 0x20260..0x20274 是 0x00140100、0x20278 是 0x70006000（zte-f7615mv3 的 captures/20261127-usbroot/vendor-np-regs.txt），这里写 0x0005000f（0x20278 由 zx279133-tm.c 的 RED NP1 准备按字段写），尚未对齐，见 zte-f7615mv3 的 docs/TASKS.md。
+  */
+ #define ZX279133_RED_ALL_SHARE_MAX	0x20050
+-#define ZX279133_RED_VENDOR_CFG		0x0000009e
+-#define ZX279133_RED_VENDOR_CPU133_CFG	0x000a0001
+-#define ZX279133_RED_VENDOR_IN_SHARE_MAX	0x00000c00
+-#define ZX279133_RED_VENDOR_ALL_SHARE_MAX	0x00002600
+-#define ZX279133_RED_VENDOR_UP_IN_SHARE_MAX	0x10000900
+-#define ZX279133_RED_VENDOR_DOWN_IN_SHARE_MAX	0x04000500
+-#define ZX279133_RED_VENDOR_ALL_OUT_SHARE_MAX	0x00003000
+-#define ZX279133_RED_VENDOR_DOWN_OUT_MAX	0x06001000
+-#define ZX279133_RED_VENDOR_UP_OUT_MAX	0x14002000
+-#define ZX279133_RED_VENDOR_DESC_WATERMARK	0x3f9f3e9f
+-#define ZX279133_RED_VENDOR_IDM_DESC_WATERMARK	0x08bf07ff
+-#define ZX279133_RED_VENDOR_IDM_IN_SHARE_MAX	0x00000100
+-#define ZX279133_RED_VENDOR_WOE_IN_SHARE_MAX	0x01900000
+-#define ZX279133_RED_VENDOR_WOE_OUT_SHARE_MAX	0x025807ff
+-#define ZX279133_RED_VENDOR_NP1_Q0_TH	0x00100020
+-#define ZX279133_RED_VENDOR_NP1_Q1_TH	0x00100020
+-#define ZX279133_RED_VENDOR_NP1_DESC_WM	0x00000010
+-#define ZX279133_RED_VENDOR_NP1_ISU_TH	0x0005000f
++#define ZX279133_RED_SK_D840N_CFG		0x0000009e
++#define ZX279133_RED_SK_D840N_CPU133_CFG	0x000a0001
++#define ZX279133_RED_SK_D840N_IN_SHARE_MAX	0x00000c00
++#define ZX279133_RED_SK_D840N_ALL_SHARE_MAX	0x00002600
++#define ZX279133_RED_SK_D840N_UP_IN_SHARE_MAX	0x10000900
++#define ZX279133_RED_SK_D840N_DOWN_IN_SHARE_MAX	0x04000500
++#define ZX279133_RED_SK_D840N_ALL_OUT_SHARE_MAX	0x00003000
++#define ZX279133_RED_SK_D840N_DOWN_OUT_MAX	0x06001000
++#define ZX279133_RED_SK_D840N_UP_OUT_MAX	0x14002000
++#define ZX279133_RED_SK_D840N_DESC_WATERMARK	0x3f9f3e9f
++#define ZX279133_RED_SK_D840N_IDM_DESC_WATERMARK	0x08bf07ff
++#define ZX279133_RED_SK_D840N_IDM_IN_SHARE_MAX	0x00000100
++#define ZX279133_RED_SK_D840N_WOE_IN_SHARE_MAX	0x01900000
++#define ZX279133_RED_SK_D840N_WOE_OUT_SHARE_MAX	0x025807ff
++#define ZX279133_RED_SK_D840N_NP1_Q0_TH	0x00100020
++#define ZX279133_RED_SK_D840N_NP1_Q1_TH	0x00100020
++#define ZX279133_RED_SK_D840N_NP1_DESC_WM	0x00000010
++#define ZX279133_RED_SK_D840N_NP1_ISU_TH	0x0005000f
+ 
+ /*
+  * The vendor's queue-buffer words, in the form the indirect port takes:
+  * the IN buffer RAM (ram_id 2) is "guart | (max << 14)" and the OUT buffer RAM
+  * (ram_id 0) is "guart | (max << 12)".
+  */
+-#define ZX279133_RED_VENDOR_IN_UNI	0x01800020	/* 0x20 | (0x600 << 14) */
+-#define ZX279133_RED_VENDOR_IN_PORT	0x00c00020	/* 0x20 | (0x300 << 14) */
+-#define ZX279133_RED_VENDOR_IN_ONE	0x00400020	/* 0x20 | (0x100 << 14) */
+-#define ZX279133_RED_VENDOR_OUT_UNI	0x01000040	/* 0x40 | (0x1000 << 12) */
+-#define ZX279133_RED_VENDOR_OUT_PORT	0x00800040	/* 0x40 | (0x800 << 12) */
+-#define ZX279133_RED_VENDOR_OUT_ONE	0x00400020	/* 0x20 | (0x400 << 12) */
++#define ZX279133_RED_SK_D840N_IN_UNI	0x01800020	/* 0x20 | (0x600 << 14) */
++#define ZX279133_RED_SK_D840N_IN_PORT	0x00c00020	/* 0x20 | (0x300 << 14) */
++#define ZX279133_RED_SK_D840N_IN_ONE	0x00400020	/* 0x20 | (0x100 << 14) */
++#define ZX279133_RED_SK_D840N_OUT_UNI	0x01000040	/* 0x40 | (0x1000 << 12) */
++#define ZX279133_RED_SK_D840N_OUT_PORT	0x00800040	/* 0x40 | (0x800 << 12) */
++#define ZX279133_RED_SK_D840N_OUT_ONE	0x00400020	/* 0x20 | (0x400 << 12) */
+ 
+ /* The queue ranges the vendor programs. */
+-#define ZX279133_RED_VENDOR_UNI_LAST	0x13f
+-#define ZX279133_RED_VENDOR_PORT_LAST	0x17f
+-#define ZX279133_RED_VENDOR_ONE_QUEUE	0x180
+-#define ZX279133_RED_VENDOR_OUT_ONE_FIRST 0x187
+-#define ZX279133_RED_VENDOR_OUT_ONE_LAST 0x18c
++#define ZX279133_RED_SK_D840N_UNI_LAST	0x13f
++#define ZX279133_RED_SK_D840N_PORT_LAST	0x17f
++#define ZX279133_RED_SK_D840N_ONE_QUEUE	0x180
++#define ZX279133_RED_SK_D840N_OUT_ONE_FIRST 0x187
++#define ZX279133_RED_SK_D840N_OUT_ONE_LAST 0x18c
+ 
+ #define ZX279133_SSCH_CFG		0x2c000
+ #define ZX279133_SSCH_AGING_TIME		0x2c004
+@@ -602,16 +606,45 @@
+  *
+  * The values are the vendor board's own, out of its console dump
+  * (staging/ctl/vendor-serial-mods/nppu-smct.txt, words 0x00, 0x0a..0x18).
++ *
++ * 这里说的 "this board" 是创维 SK-D840N（woodnaonly 照它的原厂读数写的），这些值是缺省；别的板子的原厂取值由板级设备树的 zte,smct-words 给（zx279133-main.c 的 zx279133_smct_words[]），八个入口门限可以各不相同。
+  */
+-#define ZX279133_SMCT_VENDOR_SEL_CFG0		0x1e00
+-#define ZX279133_SMCT_VENDOR_COS_TH0		0x19001900
+-#define ZX279133_SMCT_VENDOR_COS_TH1		0x19001900
+-#define ZX279133_SMCT_VENDOR_COS_TH2		0x19001900
+-#define ZX279133_SMCT_VENDOR_COS_TH3		0x1b001fff
+-#define ZX279133_SMCT_VENDOR_MC_TH		0x1fff0d00
+-#define ZX279133_SMCT_VENDOR_INPORT_TH		0x1fff1fff
+-#define ZX279133_SMCT_VENDOR_NP1_TH		0x1d00
+-#define ZX279133_SMCT_VENDOR_IDM_SSCH_TH	0x1fff1fff
++#define ZX279133_SMCT_SK_D840N_SEL_CFG0		0x1e00
++#define ZX279133_SMCT_SK_D840N_COS_TH0		0x19001900
++#define ZX279133_SMCT_SK_D840N_COS_TH1		0x19001900
++#define ZX279133_SMCT_SK_D840N_COS_TH2		0x19001900
++#define ZX279133_SMCT_SK_D840N_COS_TH3		0x1b001fff
++#define ZX279133_SMCT_SK_D840N_MC_TH		0x1fff0d00
++#define ZX279133_SMCT_SK_D840N_INPORT_TH		0x1fff1fff
++#define ZX279133_SMCT_SK_D840N_NP1_TH		0x1d00
++#define ZX279133_SMCT_SK_D840N_IDM_SSCH_TH	0x1fff1fff
++
++/*
++ * zx279133_red_vendor_fixup()、zx279133_tm_vendor_fixup() 写的 RED、QMG、SMCT 字在板级参数（设备树 zte,red-words、zte,qmg-words、zte,smct-words）里的下标；各字的寄存器与缺省值在 zx279133-main.c 的 zx279133_red_words[]、zx279133_qmg_words[]、zx279133_smct_words[]。
++ */
++enum {
++	ZX279133_RED_W_CFG,
++	ZX279133_RED_W_IN_SHARE_MAX,
++	ZX279133_RED_W_ALL_SHARE_MAX,
++	ZX279133_RED_W_UP_IN_SHARE_MAX,
++	ZX279133_RED_W_DOWN_IN_SHARE_MAX,
++	ZX279133_RED_W_ALL_OUT_SHARE_MAX,
++	ZX279133_RED_W_DOWN_OUT_MAX,
++	ZX279133_RED_W_UP_OUT_MAX,
++	ZX279133_RED_W_DESC_WATERMARK,
++	ZX279133_RED_W_IDM_DESC_WATERMARK,
++	ZX279133_RED_W_IDM_IN_SHARE_MAX,
++	ZX279133_RED_W_WOE_IN_SHARE_MAX,
++	ZX279133_RED_W_WOE_OUT_SHARE_MAX,
++	ZX279133_RED_W_NP1_Q0_TH,
++	ZX279133_RED_W_NP1_Q1_TH,
++	ZX279133_RED_W_NP1_DESC_WM,
++	ZX279133_RED_WORDS
++};
++
++#define ZX279133_QMG_WORDS	4
++/* SMCT：SEL_CFG0、COS_TH0..3、MC_TH、NP1_TH、IDM_SSCH_TH 与八个入口门限 INPORT_TH0..7 */
++#define ZX279133_SMCT_WORDS	16
+ 
+ #define ZX279133_ISU_CFG		0x10000
+ #define ZX279133_ISU_INIT_REQ		0x10004
+@@ -1535,6 +1568,10 @@
+ 	int irqs[ZX279133_NUM_IRQS];
+ 	/* IDM 源到中断线的路由，板级（ZX279133_IDM_IRQ_ROUTE_DEFAULT 上方的说明） */
+ 	u32 idm_irq_route[ZX279133_IDM_IRQ_LINES];
++	/* RED、QMG、SMCT 的板级取值，次序同 zx279133-main.c 的 zx279133_red_words[] 等三张表 */
++	u32 red_words[ZX279133_RED_WORDS];
++	u32 qmg_words[ZX279133_QMG_WORDS];
++	u32 smct_words[ZX279133_SMCT_WORDS];
+ };
+ 
+ static inline struct zx279133_netdev_stats *
+--- a/drivers/net/ethernet/zte/zx279133-main.c
++++ b/drivers/net/ethernet/zte/zx279133-main.c
+@@ -293,6 +293,65 @@
+ }
+ 
+ /*
++ * RED、QMG、SMCT 的取值跟着板子的原厂固件走：三张表依次给出 zx279133_red_vendor_fixup()、zx279133_tm_vendor_fixup() 写的每个字的寄存器与缺省值（创维 SK-D840N 原厂的值，出处见 zx279133.h 里各组 ZX279133_*_SK_D840N_* 上方的说明），板级设备树的 zte,red-words（16 个字）、zte,qmg-words（4 个字）、zte,smct-words（16 个字）按表里的次序给出本板的取值（zx279133_board_params_read()）。中兴 F7615MV3 的取值是它原厂系统的现场读数（只读 devmem，zte-f7615mv3 的 captures/20261127-usbroot/vendor-np-regs.txt），写在它的设备树里。
++ * 次序就是写入的次序。
++ */
++static const struct {
++	u32 offset;
++	u32 value;
++} zx279133_red_words[ZX279133_RED_WORDS] = {
++	[ZX279133_RED_W_CFG]		= { ZX279133_RED_CFG,			ZX279133_RED_SK_D840N_CFG },
++	[ZX279133_RED_W_IN_SHARE_MAX]	= { ZX279133_RED_IN_SHARE_MAX,		ZX279133_RED_SK_D840N_IN_SHARE_MAX },
++	[ZX279133_RED_W_ALL_SHARE_MAX]	= { ZX279133_RED_ALL_SHARE_MAX,		ZX279133_RED_SK_D840N_ALL_SHARE_MAX },
++	[ZX279133_RED_W_UP_IN_SHARE_MAX] = { ZX279133_RED_UP_IN_SHARE_MAX,	ZX279133_RED_SK_D840N_UP_IN_SHARE_MAX },
++	[ZX279133_RED_W_DOWN_IN_SHARE_MAX] = { ZX279133_RED_DOWN_IN_SHARE_MAX,	ZX279133_RED_SK_D840N_DOWN_IN_SHARE_MAX },
++	[ZX279133_RED_W_ALL_OUT_SHARE_MAX] = { ZX279133_RED_ALL_OUT_SHARE_MAX,	ZX279133_RED_SK_D840N_ALL_OUT_SHARE_MAX },
++	[ZX279133_RED_W_DOWN_OUT_MAX]	= { ZX279133_RED_DOWN_OUT_MAX,		ZX279133_RED_SK_D840N_DOWN_OUT_MAX },
++	[ZX279133_RED_W_UP_OUT_MAX]	= { ZX279133_RED_UP_OUT_MAX,		ZX279133_RED_SK_D840N_UP_OUT_MAX },
++	[ZX279133_RED_W_DESC_WATERMARK]	= { ZX279133_RED_DESC_WATERMARK,	ZX279133_RED_SK_D840N_DESC_WATERMARK },
++	[ZX279133_RED_W_IDM_DESC_WATERMARK] = { ZX279133_RED_IDM_DESC_WATERMARK, ZX279133_RED_SK_D840N_IDM_DESC_WATERMARK },
++	[ZX279133_RED_W_IDM_IN_SHARE_MAX] = { ZX279133_RED_IDM_IN_SHARE_MAX,	ZX279133_RED_SK_D840N_IDM_IN_SHARE_MAX },
++	[ZX279133_RED_W_WOE_IN_SHARE_MAX] = { ZX279133_RED_WOE_IN_SHARE_MAX,	ZX279133_RED_SK_D840N_WOE_IN_SHARE_MAX },
++	[ZX279133_RED_W_WOE_OUT_SHARE_MAX] = { ZX279133_RED_WOE_OUT_SHARE_MAX,	ZX279133_RED_SK_D840N_WOE_OUT_SHARE_MAX },
++	[ZX279133_RED_W_NP1_Q0_TH]	= { ZX279133_RED_NP1_Q0_TH,		ZX279133_RED_SK_D840N_NP1_Q0_TH },
++	[ZX279133_RED_W_NP1_Q1_TH]	= { ZX279133_RED_NP1_Q1_TH,		ZX279133_RED_SK_D840N_NP1_Q1_TH },
++	[ZX279133_RED_W_NP1_DESC_WM]	= { ZX279133_RED_NP1_DESC_WM,		ZX279133_RED_SK_D840N_NP1_DESC_WM },
++};
++
++static const struct {
++	u32 offset;
++	u32 value;
++} zx279133_qmg_words[ZX279133_QMG_WORDS] = {
++	{ ZX279133_QMG_WATERMARK,	ZX279133_QMG_SK_D840N_WATERMARK },
++	{ ZX279133_QMG_DESC_OUT,	ZX279133_QMG_SK_D840N_DESC_OUT },
++	{ ZX279133_QMG_WOE_OUT,		ZX279133_QMG_SK_D840N_WOE_OUT },
++	{ ZX279133_QMG_DESC_IN,		ZX279133_QMG_SK_D840N_DESC_IN },
++};
++
++static const struct {
++	u32 offset;
++	u32 value;
++} zx279133_smct_words[ZX279133_SMCT_WORDS] = {
++	{ ZX279133_SMCT_SEL_CFG0,	ZX279133_SMCT_SK_D840N_SEL_CFG0 },
++	{ ZX279133_SMCT_COS_TH0,	ZX279133_SMCT_SK_D840N_COS_TH0 },
++	{ ZX279133_SMCT_COS_TH0 + 4,	ZX279133_SMCT_SK_D840N_COS_TH1 },
++	{ ZX279133_SMCT_COS_TH0 + 8,	ZX279133_SMCT_SK_D840N_COS_TH2 },
++	{ ZX279133_SMCT_COS_TH0 + 12,	ZX279133_SMCT_SK_D840N_COS_TH3 },
++	{ ZX279133_SMCT_MC_TH,		ZX279133_SMCT_SK_D840N_MC_TH },
++	{ ZX279133_SMCT_NP1_TH,		ZX279133_SMCT_SK_D840N_NP1_TH },
++	{ ZX279133_SMCT_IDM_SSCH_TH,	ZX279133_SMCT_SK_D840N_IDM_SSCH_TH },
++	/* The eight per-input-port thresholds. */
++	{ ZX279133_SMCT_INPORT_TH0,	ZX279133_SMCT_SK_D840N_INPORT_TH },
++	{ ZX279133_SMCT_INPORT_TH0 + 4,	ZX279133_SMCT_SK_D840N_INPORT_TH },
++	{ ZX279133_SMCT_INPORT_TH0 + 8,	ZX279133_SMCT_SK_D840N_INPORT_TH },
++	{ ZX279133_SMCT_INPORT_TH0 + 12, ZX279133_SMCT_SK_D840N_INPORT_TH },
++	{ ZX279133_SMCT_INPORT_TH0 + 16, ZX279133_SMCT_SK_D840N_INPORT_TH },
++	{ ZX279133_SMCT_INPORT_TH0 + 20, ZX279133_SMCT_SK_D840N_INPORT_TH },
++	{ ZX279133_SMCT_INPORT_TH0 + 24, ZX279133_SMCT_SK_D840N_INPORT_TH },
++	{ ZX279133_SMCT_INPORT_TH0 + 28, ZX279133_SMCT_SK_D840N_INPORT_TH },
++};
++
++/*
+  * The RED, put the way this board's vendor firmware has it.
+  *
+  * The tree's zx279133_tm_prepare() programs the RED for the SR1010 and the
+@@ -303,27 +362,7 @@
+  */
+ static void zx279133_red_vendor_fixup(struct zx279133_eth *eth)
+ {
+-	static const struct {
+-		u32 offset;
+-		u32 value;
+-	} regs[] = {
+-		{ ZX279133_RED_CFG,			ZX279133_RED_VENDOR_CFG },
+-		{ ZX279133_RED_IN_SHARE_MAX,		ZX279133_RED_VENDOR_IN_SHARE_MAX },
+-		{ ZX279133_RED_ALL_SHARE_MAX,		ZX279133_RED_VENDOR_ALL_SHARE_MAX },
+-		{ ZX279133_RED_UP_IN_SHARE_MAX,		ZX279133_RED_VENDOR_UP_IN_SHARE_MAX },
+-		{ ZX279133_RED_DOWN_IN_SHARE_MAX,	ZX279133_RED_VENDOR_DOWN_IN_SHARE_MAX },
+-		{ ZX279133_RED_ALL_OUT_SHARE_MAX,	ZX279133_RED_VENDOR_ALL_OUT_SHARE_MAX },
+-		{ ZX279133_RED_DOWN_OUT_MAX,		ZX279133_RED_VENDOR_DOWN_OUT_MAX },
+-		{ ZX279133_RED_UP_OUT_MAX,		ZX279133_RED_VENDOR_UP_OUT_MAX },
+-		{ ZX279133_RED_DESC_WATERMARK,		ZX279133_RED_VENDOR_DESC_WATERMARK },
+-		{ ZX279133_RED_IDM_DESC_WATERMARK,	ZX279133_RED_VENDOR_IDM_DESC_WATERMARK },
+-		{ ZX279133_RED_IDM_IN_SHARE_MAX,	ZX279133_RED_VENDOR_IDM_IN_SHARE_MAX },
+-		{ ZX279133_RED_WOE_IN_SHARE_MAX,	ZX279133_RED_VENDOR_WOE_IN_SHARE_MAX },
+-		{ ZX279133_RED_WOE_OUT_SHARE_MAX,	ZX279133_RED_VENDOR_WOE_OUT_SHARE_MAX },
+-		{ ZX279133_RED_NP1_Q0_TH,		ZX279133_RED_VENDOR_NP1_Q0_TH },
+-		{ ZX279133_RED_NP1_Q1_TH,		ZX279133_RED_VENDOR_NP1_Q1_TH },
+-		{ ZX279133_RED_NP1_DESC_WM,		ZX279133_RED_VENDOR_NP1_DESC_WM },
+-	};
++	const u32 *w = eth->red_words;
+ 	static const u32 cfg[4] = {
+ 		0xff803fff, 0x0100ff80, 0x00100200, 0x00000020,
+ 	};
+@@ -339,46 +378,47 @@
+ 	 */
+ 	static const struct {
+ 		u32 index;
+-		u32 value;
++		u32 word;
+ 	} saved[] = {
+-		{ ZX279133_RED_SAVED_CFG,			ZX279133_RED_VENDOR_CFG },
+-		{ ZX279133_RED_SAVED_IN_SHARE_MAX,		ZX279133_RED_VENDOR_IN_SHARE_MAX },
+-		{ ZX279133_RED_SAVED_CPU133_CFG,		ZX279133_RED_VENDOR_CPU133_CFG },
+-		{ ZX279133_RED_SAVED_IDM_IN_SHARE_MAX,	ZX279133_RED_VENDOR_IDM_IN_SHARE_MAX },
+-		{ ZX279133_RED_SAVED_WOE_IN_SHARE_MAX,	ZX279133_RED_VENDOR_WOE_IN_SHARE_MAX },
+-		{ ZX279133_RED_SAVED_UP_IN_SHARE_MAX,	ZX279133_RED_VENDOR_UP_IN_SHARE_MAX },
+-		{ ZX279133_RED_SAVED_DOWN_IN_SHARE_MAX,	ZX279133_RED_VENDOR_DOWN_IN_SHARE_MAX },
+-		{ ZX279133_RED_SAVED_UP_OUT_MAX,		ZX279133_RED_VENDOR_UP_OUT_MAX },
+-		{ ZX279133_RED_SAVED_DOWN_OUT_MAX,		ZX279133_RED_VENDOR_DOWN_OUT_MAX },
+-		{ ZX279133_RED_SAVED_ALL_OUT_SHARE_MAX,	ZX279133_RED_VENDOR_ALL_OUT_SHARE_MAX },
+-		{ ZX279133_RED_SAVED_WOE_OUT_SHARE_MAX,	ZX279133_RED_VENDOR_WOE_OUT_SHARE_MAX },
+-		{ ZX279133_RED_SAVED_DESC_WATERMARK,	ZX279133_RED_VENDOR_DESC_WATERMARK },
+-		{ ZX279133_RED_SAVED_IDM_DESC_WATERMARK,	ZX279133_RED_VENDOR_IDM_DESC_WATERMARK },
++		{ ZX279133_RED_SAVED_CFG,			ZX279133_RED_W_CFG },
++		{ ZX279133_RED_SAVED_IN_SHARE_MAX,		ZX279133_RED_W_IN_SHARE_MAX },
++		{ ZX279133_RED_SAVED_IDM_IN_SHARE_MAX,	ZX279133_RED_W_IDM_IN_SHARE_MAX },
++		{ ZX279133_RED_SAVED_WOE_IN_SHARE_MAX,	ZX279133_RED_W_WOE_IN_SHARE_MAX },
++		{ ZX279133_RED_SAVED_UP_IN_SHARE_MAX,	ZX279133_RED_W_UP_IN_SHARE_MAX },
++		{ ZX279133_RED_SAVED_DOWN_IN_SHARE_MAX,	ZX279133_RED_W_DOWN_IN_SHARE_MAX },
++		{ ZX279133_RED_SAVED_UP_OUT_MAX,		ZX279133_RED_W_UP_OUT_MAX },
++		{ ZX279133_RED_SAVED_DOWN_OUT_MAX,		ZX279133_RED_W_DOWN_OUT_MAX },
++		{ ZX279133_RED_SAVED_ALL_OUT_SHARE_MAX,	ZX279133_RED_W_ALL_OUT_SHARE_MAX },
++		{ ZX279133_RED_SAVED_WOE_OUT_SHARE_MAX,	ZX279133_RED_W_WOE_OUT_SHARE_MAX },
++		{ ZX279133_RED_SAVED_DESC_WATERMARK,	ZX279133_RED_W_DESC_WATERMARK },
++		{ ZX279133_RED_SAVED_IDM_DESC_WATERMARK,	ZX279133_RED_W_IDM_DESC_WATERMARK },
+ 	};
+ 	unsigned int i;
+ 	unsigned int q;
+ 
+-	for (i = 0; i < ARRAY_SIZE(regs); i++)
+-		writel(regs[i].value, eth->base + regs[i].offset);
++	for (i = 0; i < ZX279133_RED_WORDS; i++)
++		writel(w[i], eth->base + zx279133_red_words[i].offset);
+ 
+ 	for (i = 0; i < ARRAY_SIZE(saved); i++)
+-		eth->red_saved[saved[i].index] = saved[i].value;
++		eth->red_saved[saved[i].index] = w[saved[i].word];
++	eth->red_saved[ZX279133_RED_SAVED_CPU133_CFG] =
++		ZX279133_RED_SK_D840N_CPU133_CFG;
+ 
+ 	/* And the same for the NP1 thresholds, which have their own array. */
+ 	eth->red_np1_saved[ZX279133_RED_NP1_SAVED_Q0_TH] =
+-		ZX279133_RED_VENDOR_NP1_Q0_TH;
++		w[ZX279133_RED_W_NP1_Q0_TH];
+ 	for (i = 0; i < 5; i++)
+ 		eth->red_np1_saved[ZX279133_RED_NP1_SAVED_Q1_TH + i] =
+-			ZX279133_RED_VENDOR_NP1_Q1_TH;
++			w[ZX279133_RED_W_NP1_Q1_TH];
+ 	eth->red_np1_saved[ZX279133_RED_NP1_SAVED_DESC_WM] =
+-		ZX279133_RED_VENDOR_NP1_DESC_WM;
++		w[ZX279133_RED_W_NP1_DESC_WM];
+ 	for (i = 0; i < 6; i++)
+ 		eth->red_np1_saved[ZX279133_RED_NP1_SAVED_ISU_TH + i] =
+-			ZX279133_RED_VENDOR_NP1_ISU_TH;
++			ZX279133_RED_SK_D840N_NP1_ISU_TH;
+ 
+ 	/* The six NP1 ISU thresholds, q 0..5. */
+ 	for (i = 0; i < 6; i++)
+-		writel(ZX279133_RED_VENDOR_NP1_ISU_TH,
++		writel(ZX279133_RED_SK_D840N_NP1_ISU_TH,
+ 		       eth->base + ZX279133_RED_NP1_ISU_TH + 4 * i);
+ 
+ 	/*
+@@ -389,12 +429,12 @@
+ 	for (q = 0; q < ZX279133_RED_QUEUE_COUNT; q++) {
+ 		u32 word;
+ 
+-		if (q <= ZX279133_RED_VENDOR_UNI_LAST)
+-			word = ZX279133_RED_VENDOR_IN_UNI;
+-		else if (q <= ZX279133_RED_VENDOR_PORT_LAST)
+-			word = ZX279133_RED_VENDOR_IN_PORT;
+-		else if (q == ZX279133_RED_VENDOR_ONE_QUEUE)
+-			word = ZX279133_RED_VENDOR_IN_ONE;
++		if (q <= ZX279133_RED_SK_D840N_UNI_LAST)
++			word = ZX279133_RED_SK_D840N_IN_UNI;
++		else if (q <= ZX279133_RED_SK_D840N_PORT_LAST)
++			word = ZX279133_RED_SK_D840N_IN_PORT;
++		else if (q == ZX279133_RED_SK_D840N_ONE_QUEUE)
++			word = ZX279133_RED_SK_D840N_IN_ONE;
+ 		else
+ 			word = 0;
+ 
+@@ -404,13 +444,13 @@
+ 	for (q = 0; q < ZX279133_RED_QUEUE_COUNT; q++) {
+ 		u32 word;
+ 
+-		if (q <= ZX279133_RED_VENDOR_UNI_LAST)
+-			word = ZX279133_RED_VENDOR_OUT_UNI;
+-		else if (q <= ZX279133_RED_VENDOR_PORT_LAST)
+-			word = ZX279133_RED_VENDOR_OUT_PORT;
+-		else if (q >= ZX279133_RED_VENDOR_OUT_ONE_FIRST &&
+-			 q <= ZX279133_RED_VENDOR_OUT_ONE_LAST)
+-			word = ZX279133_RED_VENDOR_OUT_ONE;
++		if (q <= ZX279133_RED_SK_D840N_UNI_LAST)
++			word = ZX279133_RED_SK_D840N_OUT_UNI;
++		else if (q <= ZX279133_RED_SK_D840N_PORT_LAST)
++			word = ZX279133_RED_SK_D840N_OUT_PORT;
++		else if (q >= ZX279133_RED_SK_D840N_OUT_ONE_FIRST &&
++			 q <= ZX279133_RED_SK_D840N_OUT_ONE_LAST)
++			word = ZX279133_RED_SK_D840N_OUT_ONE;
+ 		else
+ 			word = 0;
+ 
+@@ -441,32 +481,14 @@
+  */
+ static void zx279133_tm_vendor_fixup(struct zx279133_eth *eth)
+ {
+-	static const struct {
+-		u32 offset;
+-		u32 value;
+-	} regs[] = {
+-		{ ZX279133_QMG_WATERMARK,	ZX279133_QMG_VENDOR_WATERMARK },
+-		{ ZX279133_QMG_DESC_OUT,	ZX279133_QMG_VENDOR_DESC_OUT },
+-		{ ZX279133_QMG_WOE_OUT,		ZX279133_QMG_VENDOR_WOE_OUT },
+-		{ ZX279133_QMG_DESC_IN,		ZX279133_QMG_VENDOR_DESC_IN },
+-		{ ZX279133_SMCT_SEL_CFG0,	ZX279133_SMCT_VENDOR_SEL_CFG0 },
+-		{ ZX279133_SMCT_COS_TH0,	ZX279133_SMCT_VENDOR_COS_TH0 },
+-		{ ZX279133_SMCT_COS_TH0 + 4,	ZX279133_SMCT_VENDOR_COS_TH1 },
+-		{ ZX279133_SMCT_COS_TH0 + 8,	ZX279133_SMCT_VENDOR_COS_TH2 },
+-		{ ZX279133_SMCT_COS_TH0 + 12,	ZX279133_SMCT_VENDOR_COS_TH3 },
+-		{ ZX279133_SMCT_MC_TH,		ZX279133_SMCT_VENDOR_MC_TH },
+-		{ ZX279133_SMCT_NP1_TH,		ZX279133_SMCT_VENDOR_NP1_TH },
+-		{ ZX279133_SMCT_IDM_SSCH_TH,	ZX279133_SMCT_VENDOR_IDM_SSCH_TH },
+-	};
+ 	unsigned int i;
+ 
+-	for (i = 0; i < ARRAY_SIZE(regs); i++)
+-		writel(regs[i].value, eth->base + regs[i].offset);
+-
+-	/* The eight per-input-port thresholds. */
+-	for (i = 0; i < 8; i++)
+-		writel(ZX279133_SMCT_VENDOR_INPORT_TH,
+-		       eth->base + ZX279133_SMCT_INPORT_TH0 + 4 * i);
++	for (i = 0; i < ZX279133_QMG_WORDS; i++)
++		writel(eth->qmg_words[i],
++		       eth->base + zx279133_qmg_words[i].offset);
++	for (i = 0; i < ZX279133_SMCT_WORDS; i++)
++		writel(eth->smct_words[i],
++		       eth->base + zx279133_smct_words[i].offset);
+ }
+ 
+ /*
+@@ -847,6 +869,7 @@
+ {
+ 	static const u32 route[ZX279133_IDM_IRQ_LINES] =
+ 		ZX279133_IDM_IRQ_ROUTE_DEFAULT;
++	unsigned int i, present;
+ 	u32 covered;
+ 	int ret;
+ 
+@@ -873,7 +896,33 @@
+ 	if (ret)
+ 		return ret;
+ 
+-	return 0;
++	/*
++	 * RED、QMG、SMCT（zx279133_red_words[] 上方的说明）。三组字要取自同一块板子的原厂固件（zx279133_tm_vendor_fixup() 上方的说明），只写了其中一两组时其余用 SK-D840N 的缺省、混成两块板子的取值，告警但不拦。
++	 */
++	present = of_property_present(eth->dev->of_node, "zte,red-words") +
++		  of_property_present(eth->dev->of_node, "zte,qmg-words") +
++		  of_property_present(eth->dev->of_node, "zte,smct-words");
++	if (present && present < 3)
++		dev_warn(eth->dev,
++			 "only %u of zte,red-words, zte,qmg-words and zte,smct-words are given; the rest keep the SK-D840N defaults\n",
++			 present);
++	for (i = 0; i < ZX279133_RED_WORDS; i++)
++		eth->red_words[i] = zx279133_red_words[i].value;
++	for (i = 0; i < ZX279133_QMG_WORDS; i++)
++		eth->qmg_words[i] = zx279133_qmg_words[i].value;
++	for (i = 0; i < ZX279133_SMCT_WORDS; i++)
++		eth->smct_words[i] = zx279133_smct_words[i].value;
++	ret = zx279133_of_u32_words(eth->dev, "zte,red-words",
++				    eth->red_words, ZX279133_RED_WORDS);
++	if (!ret)
++		ret = zx279133_of_u32_words(eth->dev, "zte,qmg-words",
++					    eth->qmg_words, ZX279133_QMG_WORDS);
++	if (!ret)
++		ret = zx279133_of_u32_words(eth->dev, "zte,smct-words",
++					    eth->smct_words,
++					    ZX279133_SMCT_WORDS);
++
++	return ret;
+ }
+ 
+ static int zx279133_eth_probe(struct platform_device *pdev)

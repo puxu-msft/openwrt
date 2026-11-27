@@ -185,6 +185,49 @@
 	zte,idm-irq-route = <0x0000fdff 0x00ff0000 0x07000000 0x00000200>;
 	/* zte,lan-tx-word6：LAN 发包描述符的字 6（从 0 数，字节偏移 0x18，即 metadata[4]，由 PPU 微码解释）；本机原厂 plat_132.ko 的 cpu_net_tx() 在 LAN 分支写 0x08000000（反汇编 0xc12c–0xc134：字 4、5 清零，字 6 写 0x08000000）。SK-D840N 的缺省 0x003e0000 让发出的帧全在 RED 入口被丢（第十三轮实机），换成本机值后第十四轮收发都通。 */
 	zte,lan-tx-word6 = <0x08000000>;
+	/* zte,red-words、zte,qmg-words、zte,smct-words：驱动 zx279133_red_vendor_fixup()、zx279133_tm_vendor_fixup() 写的 RED、QMG、SMCT 字，取本机原厂系统的现场读数（只读 devmem，captures/20261127-usbroot/vendor-np-regs.txt）；次序是驱动 zx279133-main.c 里 zx279133_red_words[] 等三张表的次序，每个字后面注明 NPPT 偏移与寄存器名。与 SK-D840N 的缺省逐字对照 36 个字里 35 个不同，第十一至十四轮实机都跑在这组值上。 */
+	zte,red-words = <
+		0x0000007e	/* 0x20004 RED_CFG */
+		0x00001400	/* 0x20040 IN_SHARE_MAX */
+		0x0000ffff	/* 0x20050 ALL_SHARE_MAX */
+		0x30001200	/* 0x20060 UP_IN_SHARE_MAX */
+		0x30000400	/* 0x20064 DOWN_IN_SHARE_MAX */
+		0x00004000	/* 0x2006c ALL_OUT_SHARE_MAX */
+		0x40003000	/* 0x20070 DOWN_OUT_MAX */
+		0x40001000	/* 0x20074 UP_OUT_MAX */
+		0x60002000	/* 0x20084 DESC_WATERMARK */
+		0x5e000500	/* 0x20088 IDM_DESC_WATERMARK */
+		0x00000500	/* 0x20344 IDM_IN_SHARE_MAX */
+		0x20000500	/* 0x20348 WOE_IN_SHARE_MAX */
+		0x40003000	/* 0x2034c WOE_OUT_SHARE_MAX */
+		0x00100110	/* 0x20010 NP1_Q0_TH */
+		0x00100110	/* 0x20354 NP1_Q1_TH */
+		0x00000100	/* 0x20368 NP1_DESC_WM */
+	>;
+	zte,qmg-words = <
+		0x2bb82fa0	/* 0x24014 WATERMARK */
+		0x80004e00	/* 0x24018 DESC_OUT */
+		0x80000fa0	/* 0x24020 WOE_OUT */
+		0x40003000	/* 0x24060 DESC_IN */
+	>;
+	zte,smct-words = <
+		0x00001f00	/* 0x0c000 SEL_CFG0 */
+		0x1b001b00	/* 0x0c028 COS_TH0 */
+		0x1b001b00	/* 0x0c02c COS_TH1 */
+		0x1b001b00	/* 0x0c030 COS_TH2 */
+		0x1d001fff	/* 0x0c034 COS_TH3 */
+		0x1fff1c00	/* 0x0c038 MC_TH */
+		0x00001a00	/* 0x0c05c NP1_TH */
+		0x1a001a00	/* 0x0c060 IDM_SSCH_TH */
+		0x1c001c00	/* 0x0c03c INPORT_TH0 */
+		0x1c001c00	/* 0x0c040 INPORT_TH1 */
+		0x1c001c00	/* 0x0c044 INPORT_TH2 */
+		0x1c001c00	/* 0x0c048 INPORT_TH3 */
+		0x1c001d00	/* 0x0c04c INPORT_TH4 */
+		0x1d001c00	/* 0x0c050 INPORT_TH5 */
+		0x1fff1fff	/* 0x0c054 INPORT_TH6 */
+		0x1c001fff	/* 0x0c058 INPORT_TH7 */
+	>;
 	status = "okay";
 
 	fixed-link {
