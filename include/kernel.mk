@@ -100,7 +100,12 @@ endif
 
 KERNEL_MAKE = $(MAKE) $(KERNEL_MAKEOPTS)
 
+# 内核的 Kconfig 不论开没开 Rust、BTF，都按主机上的 rustc 与 pahole 求 RUSTC_VERSION、RUSTC_LLVM_VERSION、PAHOLE_VERSION 写进 .config（init/Kconfig 的这几项与 scripts/Kconfig.include 的 rustc-version、pahole-version）。
+# Kbuild 还把 RUSTC_VERSION_TEXT（$(RUSTC) --version 的输出）记进 include/config/auto.conf.cmd：主机升级或装上它们，下一次 Kbuild 运行时 .config 就变；PAHOLE_HAS_BTF_TAG 还经 include/linux/compiler_types.h 被几乎所有目标文件依赖，装上 pahole 就整批重编。
+# 临时规避（绕行，待办在 homeiot 仓库 devices/openwrt/docs/TASKS.md「临时规避：内核 make 给 RUSTC=false、PAHOLE=false」）：给两者一个必然失败的命令，三个版本恒为 0、RUSTC_VERSION_TEXT 恒为空，内核配置不再随主机变；代价是关掉了内核 Rust 与 BTF。真正的修法是构建自带并钉住这两样 host 工具、版本进内核的输入摘要，到时撤掉这两项。
 KERNEL_MAKE_FLAGS = \
+	RUSTC=false \
+	PAHOLE=false \
 	KCFLAGS="$(call iremap,$(BUILD_DIR),$(notdir $(BUILD_DIR))) $(IREMAP_STAGING_DIR) $(IREMAP_TOOLCHAIN_DIR) $(filter-out -fno-plt,$(call qstrip,$(CONFIG_EXTRA_OPTIMIZATION))) $(call qstrip,$(CONFIG_KERNEL_CFLAGS))" \
 	KAFLAGS="$(call iremap,$(BUILD_DIR),$(notdir $(BUILD_DIR))) $(IREMAP_STAGING_DIR) $(IREMAP_TOOLCHAIN_DIR)" \
 	HOSTCFLAGS="$(HOST_CFLAGS) -Wall -Wmissing-prototypes -Wstrict-prototypes" \
